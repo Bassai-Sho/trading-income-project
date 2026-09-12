@@ -1,0 +1,5 @@
+ACTIVE_PAIR=1
+P1_MODEL_DIR=qwen3.8-27b-int4
+P1_MODEL_ID=qwen3.8:27b
+P2_MODEL_DIR=phi-4-mini-int4
+P2_MODEL_ID=phi-4-mini:int4

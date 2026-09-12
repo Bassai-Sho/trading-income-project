@@ -1003,45 +1003,52 @@ def generate_fallback_report(session_date: str, db_path: str) -> str:
 MODEL_PRESETS: dict[str, dict] = {
     # ── OVMS (recommended) — OpenVINO Model Server via Docker
     # ── OpenVINO GenAI pairs (no Docker, pure .venv) ─────────────────────────
+    # Ranked by: OpenVINO org recency × likes × downloads (Sep 2026)
     # Start with: ./launch_models.sh --pair N
     "nuc-pair1": {
-        # Pair 1: Thinking Quant — DeepSeek-R1-32B (o1-class) + Mistral-Nemo (~26.3GB)
+        # Pair 1: Most Popular — Qwen3.8-27B (♡17, 3.52k dl) + Phi-4-mini (~19GB)
+        # Qwen3.8-27B: highest-liked model in OpenVINO LLM collection (22 days old)
+        # Phi-4 (Microsoft): different family from Qwen — genuine adversarial independence
         "llm_base_url": "http://127.0.0.1:8000/v1",
         "llm_api_key":  "unused",
-        "llm_model":    "deepseek-r1:32b",
+        "llm_model":    "qwen3.8:27b",
         "dac_base_url": "http://127.0.0.1:8001/v1",
         "dac_api_key":  "unused",
-        "dac_model":    "mistral-nemo:12b",
-        "_note": "Deepest reasoning. <think> tokens stripped from response, logged to LOGS/.",
+        "dac_model":    "phi-4-mini:int4",
+        "_note": "Most liked + most downloaded in OpenVINO org. Phi-4 adversary (Microsoft).",
     },
     "nuc-pair2": {
-        # Pair 2: High-Speed — Qwen3-30B-A3B MoE (30+ tok/s) + Mistral-Nemo (~25.2GB)
+        # Pair 2: MoE Speed — Qwen3.6-35B-A3B (♡11, MoE) + Mistral-Nemo (~25GB)
+        # Qwen3.6-35B-A3B: 35B total, 3.6B active per token — 30+ tok/s decode
+        # Mistral-Nemo: SWA architecture, confirmed working, different from Qwen
         "llm_base_url": "http://127.0.0.1:8000/v1",
         "llm_api_key":  "unused",
-        "llm_model":    "qwen3:30b-a3b",
+        "llm_model":    "qwen3.6:35b-a3b",
         "dac_base_url": "http://127.0.0.1:8001/v1",
         "dac_api_key":  "unused",
         "dac_model":    "mistral-nemo:12b",
-        "_note": "Fastest multi-turn tool loops. Best throughput for 8+ tool-call sessions.",
+        "_note": "MoE speed (30+ tok/s). Mistral SWA adversary confirmed working.",
     },
     "nuc-pair3": {
-        # Pair 3: Frontier Heavy — Qwen2.5-32B + Mistral-Small-24B (~33.2GB)
+        # Pair 3: Novel Adversary — Qwen3.6-35B-A3B + LFM2.5-8B-A1B (~23GB)
+        # LFM2.5 (Liquid AI): NOT a transformer — liquid state machine architecture.
+        # Maximum adversarial independence: different inductive biases, different failure modes.
         "llm_base_url": "http://127.0.0.1:8000/v1",
         "llm_api_key":  "unused",
-        "llm_model":    "qwen2.5:32b",
+        "llm_model":    "qwen3.6:35b-a3b",
         "dac_base_url": "http://127.0.0.1:8001/v1",
         "dac_api_key":  "unused",
-        "dac_model":    "mistral-small:24b",
-        "_note": "Peak JSON/tool precision + deepest adversarial critique (24B Mistral).",
+        "dac_model":    "lfm2.5:8b",
+        "_note": "LFM2.5 (Liquid AI) adversary — not a transformer. Maximum architectural divergence.",
     },
     "nuc-ovms": {  # alias for nuc-pair2 (backward compat)
         "llm_base_url": "http://127.0.0.1:8000/v1",
         "llm_api_key":  "unused",
-        "llm_model":    "qwen3:30b-a3b",
+        "llm_model":    "qwen3.6:35b-a3b",
         "dac_base_url": "http://127.0.0.1:8001/v1",
         "dac_api_key":  "unused",
         "dac_model":    "mistral-nemo:12b",
-        "_note": "Alias for nuc-pair2. Use nuc-pair1/2/3 directly.",
+        "_note": "Alias for nuc-pair2.",
     },
     # ── IPEX-LLM Ollama (fallback) — community fork
     "lmstudio-7b": {"llm_base_url":"http://localhost:1234/v1","llm_api_key":"not-needed","llm_model":"local-model","dac_model":None,"_note":"7B via LM Studio. Borderline D-A-C quality."},
