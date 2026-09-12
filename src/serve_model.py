@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 
 try:
     import openvino_genai as ov_genai
+    import openvino as ov
 except ImportError as e:
     raise SystemExit(
         "openvino-genai not installed. Run: pip install openvino-genai"
@@ -55,9 +56,11 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 
 app        = FastAPI(title="OpenVINO GenAI — OpenAI Bridge")
-_pipe:     ov_genai.LLMPipeline | None = None
+_pipe:     ov_genai.LLMPipeline | ov_genai.VLMPipeline | None = None
 _tok:      Any   = None        # tokenizer (for chat template + token count)
 _model_id: str   = "ov-model"
+_is_vlm:   bool  = False       # True for VLM models (e.g. Qwen3.8-27B) → uses VLMPipeline
+_has_mtp:  bool  = False       # True when openvino_mtp_model.xml is present → built-in draft head
 _cache_dir: str  = os.path.expanduser("~/models/.ov_cache")
 
 # ---------------------------------------------------------------------------
@@ -164,9 +167,11 @@ def _build_prompt(req: ChatRequest) -> str:
 def _count_tokens(text: str) -> int:
     """Tokenize text and return token count. Falls back to word-count estimate."""
     try:
-        return len(_tok.encode(text).input_ids)
+        if _tok is not None:
+            return len(_tok.encode(text).input_ids)
     except Exception:
-        return max(1, len(text.split()))
+        pass
+    return max(1, len(text.split()))
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +183,8 @@ def _count_tokens(text: str) -> int:
 # ---------------------------------------------------------------------------
 
 _THINK_RE   = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
-_THINK_LOG: str | None = None  # optionally set at startup via --think-log
+_THINK_LOG:  str | None = None  # optionally set at startup via --think-log
+_MTP_TOKENS: int        = 2     # set at startup from --mtp-tokens
 
 
 def _strip_thinking(text: str) -> tuple[str, str]:
@@ -257,10 +263,20 @@ async def chat_completions(req: ChatRequest):
     config = ov_genai.GenerationConfig()
     config.max_new_tokens = req.max_tokens
     config.temperature    = max(req.temperature, 0.01)
+    if _is_vlm and _has_mtp:
+        # MTP requires greedy decoding and fixed num_assistant_tokens
+        config.do_sample = False
+        config.num_assistant_tokens = _MTP_TOKENS
+        config.assistant_confidence_threshold = 0.0
 
     t0 = time.monotonic()
     try:
-        raw = str(_pipe.generate(prompt, config)).strip()
+        if _is_vlm:
+            # VLMPipeline (e.g. Qwen3.8-27B): text-only mode, no images
+            result = _pipe.generate(prompt, images=[], generation_config=config)
+            raw = str(result.texts[0]).strip() if hasattr(result, "texts") else str(result).strip()
+        else:
+            raw = str(_pipe.generate(prompt, config)).strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation error: {e}") from e
     elapsed = round(time.monotonic() - t0, 3)
@@ -356,6 +372,9 @@ def main() -> None:
                         help="Path to small draft model for speculative decoding. "
                              "Must share tokenizer family with main model. "
                              "Recommended: Qwen3-0.6B for Pair 2, Qwen2.5-1.5B for Pairs 1+3.")
+    parser.add_argument("--mtp-tokens", type=int, default=2,
+                        help="Number of MTP assistant tokens for built-in draft head (default: 2). "
+                             "Ignored for non-VLM models. 2 gives best throughput/acceptance tradeoff.")
     parser.add_argument("--device",     default="GPU",
                         help="OpenVINO device: GPU, CPU, or AUTO")
     parser.add_argument("--cache-dir",
@@ -366,6 +385,7 @@ def main() -> None:
     _model_id  = args.model_id
     _cache_dir = args.cache_dir
     _THINK_LOG = args.think_log
+    _MTP_TOKENS = args.mtp_tokens
     os.makedirs(_cache_dir, exist_ok=True)
 
     print(f"\n[serve_model] Loading '{args.model_id}' onto {args.device}...")
@@ -374,21 +394,52 @@ def main() -> None:
     print(f"  Opts:        LATENCY | KV u8 | CACHE_DIR")
 
     t0 = time.monotonic()
+    import os as _os
+    from pathlib import Path as _Path
+
+    model_dir = _Path(args.model_path)
     pipeline_kwargs = {
         "CACHE_DIR":             _cache_dir,
-        "PERFORMANCE_HINT":      "LATENCY",    # lowest token-to-token dispatch delay
-        "KV_CACHE_PRECISION":    "u8",         # 50% KV memory bandwidth reduction
-        "enable_save_ov_model":  True,         # serialise IR on first run → < 2s subsequent loads
+        "PERFORMANCE_HINT":      "LATENCY",
+        "KV_CACHE_PRECISION":    "u8",
+        "enable_save_ov_model":  True,
     }
 
-    if args.draft_model_path:
-        # Speculative decoding: small GPU draft proposes tokens, large model verifies
-        # 2-3× decode throughput. Draft must share tokenizer family with main model.
-        print(f"  Draft model: {args.draft_model_path} (speculative decoding on {args.device})")
-        draft = ov_genai.draft_model(args.draft_model_path, args.device)
-        _pipe = ov_genai.LLMPipeline(args.model_path, args.device, draft_model=draft, **pipeline_kwargs)
+    # Auto-detect VLM (has vision embeddings model) vs text-only LLM
+    _is_vlm  = (model_dir / "openvino_vision_embeddings_model.xml").exists()
+    _has_mtp = (model_dir / "openvino_mtp_model.xml").exists()
+
+    if _is_vlm:
+        print(f"  Model type:  VLMPipeline (vision-language model detected)")
+        # SchedulerConfig required for MTP on VLMPipeline
+        sched_cfg = ov_genai.SchedulerConfig()
+        sched_cfg.enable_prefix_caching = False       # required for MTP hybrid-attention
+        sched_cfg.max_num_batched_tokens = 2 ** 31    # large batch for prompt + draft window
+        if _has_mtp and not args.draft_model_path:
+            # Use built-in MTP head — point draft_model at the same directory
+            # No separate small draft model needed. 1.5-1.8x throughput gain.
+            print(f"  MTP:         Built-in draft head detected (openvino_mtp_model.xml)")
+            print(f"  MTP tokens:  {args.mtp_tokens} assistant tokens")
+            draft = ov_genai.draft_model(str(model_dir), args.device)
+            _pipe = ov_genai.VLMPipeline(
+                str(model_dir), args.device,
+                draft_model=draft,
+                scheduler_config=sched_cfg,
+                **pipeline_kwargs
+            )
+        else:
+            _pipe = ov_genai.VLMPipeline(str(model_dir), args.device,
+                                          scheduler_config=sched_cfg, **pipeline_kwargs)
+        _tok = None  # VLMPipeline tokenizer access differs; use word-count fallback
     else:
-        _pipe = ov_genai.LLMPipeline(args.model_path, args.device, **pipeline_kwargs)
+        print(f"  Model type:  LLMPipeline (text-only)")
+        if args.draft_model_path:
+            print(f"  Draft model: {args.draft_model_path}")
+            draft = ov_genai.draft_model(args.draft_model_path, args.device)
+            _pipe = ov_genai.LLMPipeline(args.model_path, args.device, draft_model=draft, **pipeline_kwargs)
+        else:
+            _pipe = ov_genai.LLMPipeline(args.model_path, args.device, **pipeline_kwargs)
+        _tok = _pipe.get_tokenizer()
     
     _tok = _pipe.get_tokenizer()
     print(f"  ✓ Ready in {time.monotonic()-t0:.1f}s  →  http://127.0.0.1:{args.port}/v1")

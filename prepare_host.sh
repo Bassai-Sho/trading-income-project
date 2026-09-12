@@ -4,8 +4,7 @@
 # NUC 14 Pro · Intel Core Ultra 5 125H · 58GB iGPU VRAM · Ubuntu 24.04
 # =============================================================================
 # Uses ONLY stock Ubuntu packages — no third-party Intel GPU repositories.
-# Downloads via Python huggingface_hub.snapshot_download — immune to
-# huggingface-cli / hf CLI renames and --exclude flag changes.
+# Downloads via Python huggingface_hub.snapshot_download with HF_XET_HIGH_PERFORMANCE.
 #
 # Model pairs ranked by OpenVINO org: recency × likes × downloads (Sep 2026):
 #   Pair 1: Qwen3.8-27B (♡17, 3.52k dl, 22 days) + Phi-4-mini (♡5, Jul 6)
@@ -56,12 +55,12 @@ done
 # Qwen3-8B-int4-cw: channel-wise INT4 — better accuracy than standard sym INT4.
 # =============================================================================
 declare -A PAIR_LABEL=(
-    [1]='Most Popular    — Qwen3.8-27B-int4 + Phi-4-mini-int4         (~19GB)'
+    [1]='Most Popular    — Qwen3.8-27B-int4 (MTP built-in) + Phi-4-mini (~19GB)'
     [2]='MoE Speed       — Qwen3.6-35B-A3B-int4 + Mistral-Nemo-int4   (~25GB)'
     [3]='Novel Adversary — Qwen3.6-35B-A3B-int4 + LFM2.5-8B-A1B-int4 (~23GB)'
 )
 declare -A PAIR_NOTE=(
-    [1]='Phase 1: ♡17 most-liked, 3.52k downloads, 22 days old. Phase 2: Phi-4 (Microsoft, different family from Qwen)'
+    [1]='Phase 1: Qwen3.8-27B has built-in MTP draft head (openvino_mtp_model.xml) → 1.8x speedup, no extra download. Phase 2: Phi-4 (Microsoft)'
     [2]='Phase 1: MoE 35B/3.6B-active, 30+ tok/s. Phase 2: Mistral NeMo SWA confirmed working'
     [3]='Phase 1: MoE speed. Phase 2: Liquid AI (NOT a transformer — maximum adversarial independence)'
 )
@@ -280,26 +279,44 @@ else
     fi
 fi
 
-
 mkdir -p "$MODELS_DIR"
 
-# Uses Python snapshot_download directly — avoids hf/huggingface-cli
-# naming changes and --exclude flag behaviour differences across versions.
+# Downloads via Python snapshot_download.
+# Verifies the primary language model weights binary exists before marking complete.
 download_model() {
     local hf_repo="$1" local_dir="$2" label="$3"
     local full_path="$MODELS_DIR/$local_dir"
 
-    # Check XML exists AND weights file exists and is >100MB (not a metadata-only download)
-    local xml_ok=false bin_ok=false
-    [[ -f "$full_path/openvino_model.xml" ]] || [[ -f "$full_path/openvino_language_model.xml" ]] && xml_ok=true
-    for bin in "$full_path"/*.bin; do
-        [[ -f "$bin" ]] && [[ $(stat -c%s "$bin" 2>/dev/null || echo 0) -gt 104857600 ]] && bin_ok=true && break
-    done
-    if $xml_ok && $bin_ok; then
+    # Strictly check that the PRIMARY model weights exist, not just auxiliary embedding bins.
+    local model_complete=false
+    if [[ -f "$full_path/openvino_language_model.xml" ]]; then
+        # VLM or multi-component model: primary language model weights must be present
+        for bin in "$full_path"/openvino_language_model*.bin; do
+            if [[ -f "$bin" ]] && [[ $(stat -c%s "$bin" 2>/dev/null || echo 0) -gt 104857600 ]]; then
+                model_complete=true
+                break
+            fi
+        done
+    elif [[ -f "$full_path/openvino_model.xml" ]]; then
+        # Standard OpenVINO LLM: primary model weights must be present
+        for bin in "$full_path"/openvino_model*.bin; do
+            if [[ -f "$bin" ]] && [[ $(stat -c%s "$bin" 2>/dev/null || echo 0) -gt 104857600 ]]; then
+                model_complete=true
+                break
+            fi
+        done
+    fi
+
+    # Ensure no interrupted .incomplete or .tmp files remain
+    if compgen -G "$full_path"/*.incomplete > /dev/null 2>&1 || compgen -G "$full_path"/*.tmp > /dev/null 2>&1; then
+        model_complete=false
+    fi
+
+    if $model_complete; then
         ok "$label: already downloaded"
         return 0
-    elif $xml_ok && ! $bin_ok; then
-        warn "$label: found metadata only (weights missing) — re-downloading"
+    elif [[ -d "$full_path" ]]; then
+        warn "$label: download incomplete or missing primary weights — resuming download"
     fi
 
     echo ""
@@ -310,8 +327,13 @@ download_model() {
     echo ""
 
     python3 - << PYEOF
-from huggingface_hub import snapshot_download
 import os, sys
+
+# Clean up deprecated variable and enable high performance transfer
+os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+
+from huggingface_hub import snapshot_download
 
 # Use token from env if available (set by prepare_host.sh or .env)
 token = os.environ.get("HF_TOKEN") or None
@@ -346,10 +368,15 @@ echo ""
 read -r -p "     Download draft model? [Y/n] " dr
 dr="${dr:-Y}"
 if [[ "$dr" =~ ^[Yy]$ ]]; then
-    download_model "${DRAFT_REPO[$CHOSEN_PAIR]}" "${DRAFT_LOCAL[$CHOSEN_PAIR]}" \
-        "Draft: ${DRAFT_REPO[$CHOSEN_PAIR]}"
-    echo "DRAFT_MODEL_DIR=${DRAFT_LOCAL[$CHOSEN_PAIR]}" >> "$PROJECT_DIR/.model_pair"
-    ok "Draft model ready — launch_models.sh enables speculative decoding automatically"
+    if [[ "$CHOSEN_PAIR" == "1" ]]; then
+        ok "Pair 1 (Qwen3.8-27B): built-in MTP draft head already in model — no separate download needed"
+        ok "serve_model.py auto-detects openvino_mtp_model.xml and enables MTP automatically (1.8x speedup)"
+    else
+        download_model "${DRAFT_REPO[$CHOSEN_PAIR]}" "${DRAFT_LOCAL[$CHOSEN_PAIR]}" \
+            "Draft: ${DRAFT_REPO[$CHOSEN_PAIR]}"
+        echo "DRAFT_MODEL_DIR=${DRAFT_LOCAL[$CHOSEN_PAIR]}" >> "$PROJECT_DIR/.model_pair"
+        ok "Draft model ready — launch_models.sh enables speculative decoding automatically"
+    fi
 else
     info "Skipped. Download later: ./prepare_host.sh --pair $CHOSEN_PAIR --models-only"
 fi
