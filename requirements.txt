@@ -1,0 +1,50 @@
+# Trading Income Project — Python Dependencies
+# Tested on Ubuntu 24, Python 3.12 (NUC 14 Pro)
+# Install: pip install -r requirements.txt --break-system-packages
+# Or inside a venv: pip install -r requirements.txt
+
+# ── Core data ────────────────────────────────────────────────────────────────
+pandas>=2.0
+numpy>=1.26
+pandas-ta>=0.3.14b          # technical indicators (SMA, ATR, VWAP helpers) in toolkit
+scipy>=1.11
+yfinance>=0.2.40            # daily anchor for phantom H/L correction; NOT historical intraday
+
+# ── Alpaca (historical + paper trading) ──────────────────────────────────────
+alpaca-py>=0.20             # free paper account at alpaca.markets
+
+# ── Scheduling (runner.py) ───────────────────────────────────────────────────
+APScheduler>=3.10,<4        # v4 pre-release has breaking API — pin to stable 3.x
+
+# ── Dashboard (trading_dashboard.py) ────────────────────────────────────────
+streamlit>=1.35
+plotly>=5.22
+
+# ── Async HTTP (trading_engine.py live data feed) ────────────────────────────
+aiohttp>=3.9               # async HTTP — used for live Alpaca WebSocket feed
+
+# ── LLM session analyser (session_analyser.py) ──────────────────────────────
+requests>=2.31              # Ollama API calls (local NUC model)
+openai>=1.0                 # Ollama-compatible client (tool calling)
+
+# ── Notifications ────────────────────────────────────────────────────────────
+discord-webhook>=1.3        # Discord EOD alerts
+python-telegram-bot>=21.0   # Telegram notifications (optional)
+
+# ── Monte Carlo / statistics ─────────────────────────────────────────────────
+# scipy already covers stats; no extra dependency needed
+
+# ── Genetic algorithm / gene mixer ───────────────────────────────────────────
+# pure Python, no extra dependency
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv>=1.0          # load .env file
+# pytz removed — Python 3.9+ has zoneinfo in stdlib; APScheduler 3.11+ uses zoneinfo
+
+# ── LLM tool calling (tool_runner.py) ────────────────────────────────────────
+ddgs>=6.0      # web_search — no API key required
+trafilatura>=1.9            # fetch_url — article body extraction
+pandas-market-calendars>=4.3  # US market calendar: early-close, OPEX, holidays
+
+# ── Chat interface ────────────────────────────────────────────────────────────
+open-webui                  # ChatGPT-style local chat UI — pip install only, large (~500MB)
