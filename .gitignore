@@ -1,6 +1,9 @@
 # Environment — never commit credentials
 .env
 
+# Keys
+.webui_secret_key
+
 # Generated databases — too large, contain private data
 DATA/
 LOGS/
@@ -12,6 +15,7 @@ LOGS/
 markov_state.json
 candle_ngram.json
 outcome_mc.json
+.model_pair
 
 # Python
 __pycache__/

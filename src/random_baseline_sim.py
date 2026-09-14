@@ -465,7 +465,7 @@ def _load_sessions(db_path: str, store_db: str | None) -> list[pd.DataFrame]:
     if effective_store is None:
         # Try same directory as db_path
         import pathlib
-        candidate = pathlib.Path(db_path).parent / "market_data.db"
+        candidate = pathlib.Path("DATA/market_data.db")
         if candidate.exists():
             effective_store = str(candidate)
 

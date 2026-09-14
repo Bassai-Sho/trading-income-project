@@ -54,7 +54,7 @@ USAGE
 
   # Correct an entire MarketDataStore (run once after download)
   from data_corrector import correct_store
-  report = correct_store("market_data.db", ticker="SPY",
+  report = correct_store("DATA/market_data.db", ticker="SPY",
                           start=date(2016,1,1), end=date(2022,12,31))
 
   # Check correction summary
@@ -429,7 +429,7 @@ def correct_store(
 
     Usage
     ─────
-      python data_corrector.py --db market_data.db --ticker SPY
+      python data_corrector.py --db DATA/market_data.db --ticker SPY
     """
     from market_data_store import MarketDataStore
 
@@ -628,7 +628,7 @@ if __name__ == "__main__":
     )
 
     p = argparse.ArgumentParser(description="Alpaca bar data correction pipeline")
-    p.add_argument("--db",      default="market_data.db")
+    p.add_argument("--db",      default="DATA/market_data.db")
     p.add_argument("--ticker",  default="SPY")
     p.add_argument("--start",   default="2016-01-01")
     p.add_argument("--end",     default="2022-12-31")

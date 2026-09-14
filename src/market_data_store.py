@@ -197,8 +197,11 @@ class MarketDataStore:
     Thread-safe for read. Write should be single-process.
     """
 
-    def __init__(self, db_path: str = "market_data.db") -> None:
+    def __init__(self, db_path: str = "DATA/market_data.db") -> None:
         self.db_path = db_path
+        dirname = os.path.dirname(self.db_path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
         self._init_schema()
 
     def _conn(self) -> sqlite3.Connection:
@@ -748,7 +751,7 @@ def get_store_or_fetch(
     ticker:    str,
     start:     date,
     end:       date,
-    store_db:  str = "market_data.db",
+    store_db:  str = "DATA/market_data.db",
 ) -> tuple[pd.DataFrame, MarketDataStore]:
     """
     Return bars from local store if available, else download and store.
@@ -789,7 +792,7 @@ if __name__ == "__main__":
     p.add_argument("--ticker",         default="SPY")
     p.add_argument("--start",          default="2016-01-01")
     p.add_argument("--end",            default="2024-12-31")
-    p.add_argument("--db",             default="market_data.db")
+    p.add_argument("--db",             default="DATA/market_data.db")
     args = p.parse_args()
 
     store = MarketDataStore(args.db)

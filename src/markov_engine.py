@@ -64,6 +64,7 @@ USAGE
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
 import statistics
@@ -73,6 +74,7 @@ from typing import Any
 
 import numpy as np
 
+log = logging.getLogger("markov_engine")
 
 # ── State definitions ──────────────────────────────────────────────────────────
 

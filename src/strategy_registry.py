@@ -125,7 +125,7 @@ REGISTRY: dict[str, StrategyVariant] = {
     # any change must go through the WFA gate first.
     "canonical": StrategyVariant(
         name        = "canonical",
-        db_path     = "paper_account.db",
+        db_path     = "DATA/paper_account.db",
         description = (
             "Hybrid ORB 15-min on SPY. Foundation: Zarattini 2024 RVOL filter, "
             "Gao 2018 30-min window (fallback), Maroy 2025 VWAP+Ladder exits. "
@@ -145,7 +145,7 @@ REGISTRY: dict[str, StrategyVariant] = {
     # Parameters swept by AutoResearch within PARAMETER_BOUNDS.
     "orb-30min": StrategyVariant(
         name        = "orb-30min",
-        db_path     = "paper_account_orb30.db",
+        db_path     = "DATA/paper_account_orb30.db",
         description = (
             "30-min ORB window variant. Tests whether wider range definition "
             "improves edge on higher-VIX sessions. Gao 2018 supports 30-min "
@@ -160,7 +160,7 @@ REGISTRY: dict[str, StrategyVariant] = {
 
     "tight-rr": StrategyVariant(
         name        = "tight-rr",
-        db_path     = "paper_account_tightrr.db",
+        db_path     = "DATA/paper_account_tightrr.db",
         description = (
             "1.5:1 R:R variant. Tests whether tighter target improves win rate "
             "enough to offset smaller average winner. Breakeven win rate at 1.5:1 = 40%."
@@ -173,7 +173,7 @@ REGISTRY: dict[str, StrategyVariant] = {
 
     "wide-vwap": StrategyVariant(
         name        = "wide-vwap",
-        db_path     = "paper_account_widevwap.db",
+        db_path     = "DATA/paper_account_widevwap.db",
         description = (
             "Wider VWAP slope gate (range_factor 0.05). Tests whether the "
             "over-filtering flag from SessionLearner is correct — i.e., that "
@@ -187,7 +187,7 @@ REGISTRY: dict[str, StrategyVariant] = {
 
     "commodity-add": StrategyVariant(
         name        = "commodity-add",
-        db_path     = "paper_account_gold.db",
+        db_path     = "DATA/paper_account_gold.db",
         description = (
             "Gold (GC=F) ORB variant with 0.5% risk cap (commodity rule). "
             "Tests whether the ORB strategy generalises to commodities. "
@@ -204,7 +204,7 @@ REGISTRY: dict[str, StrategyVariant] = {
     # ── Phase 4: Tournament variants (LOCKED — far gate) ─────────────────────
     "qqqq-momentum": StrategyVariant(
         name        = "qqqq-momentum",
-        db_path     = "paper_account_qqq.db",
+        db_path     = "DATA/paper_account_qqq.db",
         description = (
             "QQQ intraday momentum variant. Zarattini 2024 SPY momentum "
             "paper showed IWM returned 11.72% vs SPY 6.67% annualised — "

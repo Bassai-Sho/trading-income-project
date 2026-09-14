@@ -261,14 +261,14 @@ def _phase_summary(active: list[StrategyVariant], gates: list[dict], studio_resu
     locked = [name for name, v in REGISTRY.items() if not v.active]
     if locked:
         lines.append(f"Locked variants: {', '.join(locked)}")
+    
+    # Fixed: Use studio_result directly instead of out-of-scope 'report'
     if studio_result and isinstance(studio_result, dict) and 'message' in studio_result:
-        ds = report['design_studio']
-        if 'message' in ds:
-            lines.append('')
-            lines.append('DESIGN STUDIO:')
-            lines.append(f"  {ds['message'][:120]}")
+        lines.append('')
+        lines.append('DESIGN STUDIO:')
+        lines.append(f"  {studio_result['message'][:120]}")
+        
     return "\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # AutoResearch parameter sweep (Phase 3+)
@@ -402,7 +402,7 @@ def _format_report(report: dict) -> str:
 # Save tournament results to DB
 # ---------------------------------------------------------------------------
 
-def save_tournament_results(report: dict, db_path: str = "paper_account.db") -> None:
+def save_tournament_results(report: dict, db_path: str = "DATA/paper_account.db") -> None:
     """Persist tournament report to the canonical DB for dashboard display."""
     try:
         with sqlite3.connect(db_path) as c:

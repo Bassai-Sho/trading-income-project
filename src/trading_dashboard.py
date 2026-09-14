@@ -577,9 +577,13 @@ if st.session_state["journal"]:
 
     df_j = pd.DataFrame(st.session_state["journal"])
     df_j = df_j[["date", "ticker", "direction", "entry", "exit", "actual_r", "outcome"]]
-    st.dataframe(df_j.style.applymap(
-        lambda v: "color:#4ade80" if v == "win" else "color:#f87171" if v == "loss" else "",
-        subset=["outcome"]
-    ), use_container_width=True, hide_index=True)
+    styler = df_j.style
+    map_func = getattr(styler, "map", getattr(styler, "applymap", None))
+    if map_func:
+        styler = map_func(
+            lambda v: "color:#4ade80" if v == "win" else "color:#f87171" if v == "loss" else "",
+            subset=["outcome"]
+        )
+    st.dataframe(styler, use_container_width=True, hide_index=True)
 else:
     st.caption("No trades logged this session.")

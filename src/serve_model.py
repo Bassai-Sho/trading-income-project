@@ -3,29 +3,10 @@
 serve_model.py
 ==============
 Lightweight OpenAI /v1/chat/completions server wrapping OpenVINO GenAI.
-Designed for the Trading Income Project D-A-C pipeline on the NUC 14 Pro
-Intel Arc iGPU (58GB unified VRAM pool).
+Designed for the Trading Income Project on the NUC 14 Pro Intel Arc iGPU.
 
-Optimizations baked in at pipeline init:
-  CACHE_DIR            — persistent compiled Level Zero blobs (< 2s cold start)
-  PERFORMANCE_HINT     — LATENCY mode: lowest token-to-token dispatch delay
-  KV_CACHE_PRECISION   — u8 INT8 KV cache: 50% memory bandwidth reduction
-
-Tool calling:
-  The D-A-C pipeline uses OpenAI tool calling. Since openvino_genai does not
-  natively emit function_call JSON, this server injects tool definitions into
-  the system prompt and parses JSON tool invocations from the model's output.
-  Both Qwen2.5 and Mistral NeMo respond reliably to JSON tool prompting.
-
-Chat templates:
-  Uses the model's own tokenizer.apply_chat_template() so Qwen2.5 (ChatML)
-  and Mistral NeMo ([INST]) are formatted correctly without hardcoding.
-
-Usage:
-    .venv/bin/python3 src/serve_model.py \\
-        --model-path ~/models/qwen2.5-32b \\
-        --model-id  qwen2.5:32b \\
-        --port 8000
+Optimizations:
+  LATENCY mode | INT8 u8 KV cache | KV prefix caching | Live throughput stats
 """
 
 from __future__ import annotations
@@ -34,34 +15,33 @@ import argparse
 import json
 import os
 import re
+import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 try:
     import openvino_genai as ov_genai
-    import openvino as ov
 except ImportError as e:
-    raise SystemExit(
-        "openvino-genai not installed. Run: pip install openvino-genai"
-    ) from e
+    raise SystemExit("openvino-genai not installed. Run: pip install openvino-genai") from e
 
 # ---------------------------------------------------------------------------
-# Global state
+# Global state & Mutex
 # ---------------------------------------------------------------------------
 
-app        = FastAPI(title="OpenVINO GenAI — OpenAI Bridge")
-_pipe:     ov_genai.LLMPipeline | ov_genai.VLMPipeline | None = None
-_tok:      Any   = None        # tokenizer (for chat template + token count)
-_model_id: str   = "ov-model"
-_is_vlm:   bool  = False       # True for VLM models (e.g. Qwen3.8-27B) → uses VLMPipeline
-_has_mtp:  bool  = False       # True when openvino_mtp_model.xml is present → built-in draft head
-_cache_dir: str  = os.path.expanduser("~/models/.ov_cache")
+app         = FastAPI(title="OpenVINO GenAI — OpenAI Bridge")
+_pipe:      ov_genai.LLMPipeline | ov_genai.VLMPipeline | None = None
+_tok:       Any   = None
+_model_id:  str   = "ov-model"
+_is_vlm:    bool  = False
+_has_draft: bool  = False
+_cache_dir: str   = os.path.expanduser("~/models/.ov_cache")
+_infer_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -69,7 +49,7 @@ _cache_dir: str  = os.path.expanduser("~/models/.ov_cache")
 
 class Message(BaseModel):
     role:    str
-    content: str | None = None
+    content: Any = ""
 
 class ToolFunction(BaseModel):
     name:        str
@@ -81,9 +61,8 @@ class Tool(BaseModel):
     function: ToolFunction
 
 class ResponseFormat(BaseModel):
-    type: str = "text"             # "text" | "json_object" | "json_schema"
+    type: str = "text"
     json_schema: dict | None = None
-
 
 class ChatRequest(BaseModel):
     model:           str | None = None
@@ -93,79 +72,77 @@ class ChatRequest(BaseModel):
     max_tokens:      int   = Field(default=2048, ge=1, le=8192)
     temperature:     float = Field(default=0.2,  ge=0.0, le=2.0)
     stream:          bool  = False
-    response_format: ResponseFormat | None = None   # json_object forces JSON output
+    response_format: ResponseFormat | None = None
 
 # ---------------------------------------------------------------------------
-# Prompt construction
+# Prompt formatting
 # ---------------------------------------------------------------------------
 
-TOOL_SYSTEM_PREFIX = """You have access to the following tools. Call a tool by responding ONLY with a JSON object of this exact form (no other text before or after):
-
-{"name": "<tool_name>", "arguments": {<argument key-value pairs>}}
-
-Available tools:
+TOOL_SYSTEM_PREFIX = """You have access to the following tools:
 {tools_json}
 
-If the user request does not require a tool, respond normally as an assistant.
+INSTRUCTIONS FOR TOOL CALLING:
+- To call a tool, respond IMMEDIATELY with ONLY a JSON object:
+{"name": "<tool_name>", "arguments": {<argument key-value pairs>}}
+- Do NOT output any reasoning, chain of thought, or introductory text before the JSON.
+- Start directly with { and end with }.
+- If no tool is needed, respond normally as an assistant.
 """
 
-def _build_prompt(req: ChatRequest) -> str:
-    """
-    Build a formatted prompt using the model's own chat template.
-    Tool definitions are injected into the system message so both Qwen2.5 and
-    Mistral NeMo can handle tool calling via JSON prompting.
-    """
-    messages = [m.model_dump() for m in req.messages]
+def _extract_text_content(content: Any) -> str:
+    if not content:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and "text" in p:
+                parts.append(str(p["text"]))
+            elif isinstance(p, str):
+                parts.append(p)
+        return "".join(parts)
+    return str(content)
 
-    # Inject tool definitions into a system message prepend
+def _build_prompt(req: ChatRequest) -> str:
+    messages = [{"role": m.role, "content": _extract_text_content(m.content)} for m in req.messages]
+
     if req.tools:
         tools_json = json.dumps(
-            [{"name": t.function.name,
-              "description": t.function.description or "",
-              "parameters": t.function.parameters or {}}
-             for t in req.tools],
-            indent=2
+            [{"name": t.function.name, "description": t.function.description or "", "parameters": t.function.parameters or {}}
+             for t in req.tools], indent=2
         )
-        tool_block = TOOL_SYSTEM_PREFIX.format(tools_json=tools_json)
-
-        # Prepend to existing system message or insert new one
+        # Safe string replacement avoids Python format string brace collisions
+        tool_block = TOOL_SYSTEM_PREFIX.replace("{tools_json}", tools_json)
         if messages and messages[0]["role"] == "system":
-            messages[0]["content"] = tool_block + "\n\n" + (messages[0]["content"] or "")
+            messages[0]["content"] = tool_block + "\n\n" + messages[0]["content"]
         else:
             messages.insert(0, {"role": "system", "content": tool_block})
 
-    # JSON output mode — inject instruction when response_format is json_object
     if req.response_format and req.response_format.type in ("json_object", "json_schema"):
         json_instruction = "Respond ONLY with valid JSON. No preamble, no explanation, no markdown."
         if req.response_format.type == "json_schema" and req.response_format.json_schema:
             schema_str = json.dumps(req.response_format.json_schema.get("schema", {}), indent=2)
             json_instruction += f"\nRequired JSON schema:\n{schema_str}"
         if messages and messages[-1]["role"] == "system":
-            messages[-1]["content"] = (messages[-1]["content"] or "") + "\n\n" + json_instruction
+            messages[-1]["content"] += "\n\n" + json_instruction
         else:
             messages.insert(0, {"role": "system", "content": json_instruction})
 
-    # Use the tokenizer's own chat template (handles ChatML, [INST], etc.)
-    try:
-        formatted = _tok.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        return str(formatted)
-    except Exception:
-        # Fallback: basic ChatML (works for Qwen2.5 and most instruct models)
-        lines = []
-        for m in messages:
-            role    = m.get("role", "user")
-            content = m.get("content") or ""
-            lines.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-        lines.append("<|im_start|>assistant\n")
-        return "\n".join(lines)
+    if _tok is not None:
+        try:
+            return str(_tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+        except Exception:
+            pass
 
+    # ChatML fallback
+    lines = []
+    for m in messages:
+        lines.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>")
+    lines.append("<|im_start|>assistant\n")
+    return "\n".join(lines)
 
 def _count_tokens(text: str) -> int:
-    """Tokenize text and return token count. Falls back to word-count estimate."""
     try:
         if _tok is not None:
             return len(_tok.encode(text).input_ids)
@@ -173,70 +150,57 @@ def _count_tokens(text: str) -> int:
         pass
     return max(1, len(text.split()))
 
-
 # ---------------------------------------------------------------------------
-# Tool call parsing
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Thinking token handling (DeepSeek-R1 / QwQ emit <think>...</think> blocks)
+# Output parsing
 # ---------------------------------------------------------------------------
 
 _THINK_RE   = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
-_THINK_LOG:  str | None = None  # optionally set at startup via --think-log
-_MTP_TOKENS: int        = 2     # set at startup from --mtp-tokens
-
+_THINK_LOG:  str | None = None
+_DRAFT_TOKENS: int      = 2
 
 def _strip_thinking(text: str) -> tuple[str, str]:
-    """
-    Separate <think>...</think> reasoning from the final answer.
-    DeepSeek-R1 and QwQ emit large thinking blocks before the answer.
-    These are stripped from content (they overflow max_tokens) and
-    optionally written to LOGS/thinking_<port>.log for inspection.
-    Returns (thinking_content, clean_answer).
-    """
     thoughts = "\n\n".join(_THINK_RE.findall(text))
     answer   = _THINK_RE.sub("", text).strip()
     return thoughts, answer
 
-
-_TOOL_CALL_RE = re.compile(
-    r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}',
-    re.DOTALL,
-)
-
-
 def _parse_tool_call(text: str) -> dict | None:
-    """
-    Detect and parse a tool call JSON from the model's output.
-    Returns a dict with 'name' and 'arguments' or None if not a tool call.
-    """
     stripped = text.strip()
-    # Quick gate: must look like JSON
-    if not stripped.startswith("{"):
+
+    if "```" in stripped:
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
+        if m:
+            stripped = m.group(1).strip()
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        stripped = stripped[start:end+1]
+    else:
         return None
-    m = _TOOL_CALL_RE.search(stripped)
-    if not m:
-        try:
-            obj = json.loads(stripped)
-            if "name" in obj and "arguments" in obj:
-                return obj
-        except json.JSONDecodeError:
-            pass
-        return None
+
     try:
-        args = json.loads(m.group(2))
-    except json.JSONDecodeError:
-        args = {}
-    return {"name": m.group(1), "arguments": args}
-
+        obj = json.loads(stripped)
+        if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+            if isinstance(obj["arguments"], str):
+                try:
+                    obj["arguments"] = json.loads(obj["arguments"])
+                except Exception:
+                    pass
+            return obj
+    except Exception:
+        pass
+    return None
 
 # ---------------------------------------------------------------------------
-# API endpoints
+# Endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": _model_id}
 
 @app.get("/v1/models")
-async def list_models():
+def list_models():
     return {
         "object": "list",
         "data": [{
@@ -247,59 +211,66 @@ async def list_models():
         }],
     }
 
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "model": _model_id}
-
-
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest):
+def chat_completions(req: ChatRequest):
     if _pipe is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialised")
 
     prompt = _build_prompt(req)
+    prompt_tokens = _count_tokens(prompt)
+    print(f"  [{_model_id}] Received request: {prompt_tokens} prompt tokens, max_tokens={req.max_tokens}...")
 
     config = ov_genai.GenerationConfig()
     config.max_new_tokens = req.max_tokens
-    config.temperature    = max(req.temperature, 0.01)
-    if _is_vlm and _has_mtp:
-        # MTP requires greedy decoding and fixed num_assistant_tokens
+
+    if req.temperature > 0.05:
+        config.do_sample = True
+        config.temperature = req.temperature
+        config.top_p = 0.95
+    else:
         config.do_sample = False
-        config.num_assistant_tokens = _MTP_TOKENS
+
+    if _has_draft:
+        config.num_assistant_tokens = _DRAFT_TOKENS
         config.assistant_confidence_threshold = 0.0
 
     t0 = time.monotonic()
     try:
-        if _is_vlm:
-            # VLMPipeline (e.g. Qwen3.8-27B): text-only mode, no images
-            result = _pipe.generate(prompt, images=[], generation_config=config)
-            raw = str(result.texts[0]).strip() if hasattr(result, "texts") else str(result).strip()
-        else:
-            raw = str(_pipe.generate(prompt, config)).strip()
+        with _infer_lock:
+            if _is_vlm:
+                result = _pipe.generate(prompt, images=[], generation_config=config)
+                raw = str(result.texts[0]).strip() if hasattr(result, "texts") else str(result).strip()
+            else:
+                raw = str(_pipe.generate(prompt, config)).strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation error: {e}") from e
-    elapsed = round(time.monotonic() - t0, 3)
 
-    # Extract and log thinking tokens (DeepSeek-R1 / QwQ)
+    elapsed = max(round(time.monotonic() - t0, 3), 0.001)
+
     thinking_content, raw = _strip_thinking(raw)
     if thinking_content and _THINK_LOG:
         try:
             with open(_THINK_LOG, "a") as _tf:
-                _tf.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-                _tf.write(thinking_content + "\n")
+                _tf.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n{thinking_content}\n")
         except Exception:
             pass
 
-    # Strip residual end-of-turn tokens
     for eos in ("<|im_end|>", "</s>", "[/INST]", "<|endoftext|>"):
         raw = raw.replace(eos, "").strip()
 
-    # Check if the model issued a tool call
     tool_call = _parse_tool_call(raw)
+    comp_tokens = _count_tokens(raw)
+    tok_per_sec = round(comp_tokens / elapsed, 1)
 
-    prompt_tokens = _count_tokens(prompt)
-    comp_tokens   = _count_tokens(raw)
+    print(f"  [{_model_id}] Completed in {elapsed:.1f}s | {comp_tokens} tokens ({tok_per_sec} tok/s)")
+
+    usage_stats = {
+        "prompt_tokens":          prompt_tokens,
+        "completion_tokens":      comp_tokens,
+        "total_tokens":           prompt_tokens + comp_tokens,
+        "inference_duration_sec": elapsed,
+        "tokens_per_second":      tok_per_sec,
+    }
 
     if tool_call and req.tools:
         call_id = f"call_{uuid.uuid4().hex[:8]}"
@@ -324,12 +295,7 @@ async def chat_completions(req: ChatRequest):
                 },
                 "finish_reason": "tool_calls",
             }],
-            "usage": {
-                "prompt_tokens":     prompt_tokens,
-                "completion_tokens": comp_tokens,
-                "total_tokens":      prompt_tokens + comp_tokens,
-                "inference_duration_sec": elapsed,
-            },
+            "usage": usage_stats,
         }
 
     return {
@@ -342,106 +308,94 @@ async def chat_completions(req: ChatRequest):
             "message": {"role": "assistant", "content": raw},
             "finish_reason": "stop",
         }],
-        "usage": {
-            "prompt_tokens":     prompt_tokens,
-            "completion_tokens": comp_tokens,
-            "total_tokens":      prompt_tokens + comp_tokens,
-            "inference_duration_sec": elapsed,
-        },
+        "usage": usage_stats,
     }
 
-
 # ---------------------------------------------------------------------------
-# Startup
+# Server Startup
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _pipe, _tok, _model_id, _cache_dir
+    global _pipe, _tok, _model_id, _cache_dir, _is_vlm, _has_draft, _THINK_LOG, _DRAFT_TOKENS
 
-    parser = argparse.ArgumentParser(
-        description="OpenVINO GenAI — OpenAI /v1 Bridge Server"
-    )
-    parser.add_argument("--model-path", required=True,
-                        help="Local directory containing OpenVINO model files")
-    parser.add_argument("--model-id",   required=True,
-                        help="Model identifier returned by /v1/models")
+    parser = argparse.ArgumentParser(description="OpenVINO GenAI — OpenAI Bridge Server")
+    parser.add_argument("--model-path", required=True, help="Local directory with OpenVINO model")
+    parser.add_argument("--model-id",   required=True, help="Model ID for /v1/models")
     parser.add_argument("--port",       type=int, default=8000)
-    parser.add_argument("--think-log",  default=None,
-                        help="Log file for <think> tokens (DeepSeek-R1/QwQ). Optional.")
+    parser.add_argument("--think-log",  default=None)
     parser.add_argument("--draft-model-path", default=None,
-                        help="Path to small draft model for speculative decoding. "
-                             "Must share tokenizer family with main model. "
-                             "Recommended: Qwen3-0.6B for Pair 2, Qwen2.5-1.5B for Pairs 1+3.")
-    parser.add_argument("--mtp-tokens", type=int, default=2,
-                        help="Number of MTP assistant tokens for built-in draft head (default: 2). "
-                             "Ignored for non-VLM models. 2 gives best throughput/acceptance tradeoff.")
-    parser.add_argument("--device",     default="GPU",
-                        help="OpenVINO device: GPU, CPU, or AUTO")
-    parser.add_argument("--cache-dir",
-                        default=os.path.expanduser("~/models/.ov_cache"),
-                        help="Directory for compiled Level Zero kernel blobs")
+                        help="Optional separate small draft model directory (contains openvino_model.xml)")
+    parser.add_argument("--draft-tokens", type=int, default=2)
+    parser.add_argument("--device",     default="GPU")
+    parser.add_argument("--cache-dir",  default=os.path.expanduser("~/models/.ov_cache"))
     args = parser.parse_args()
 
-    _model_id  = args.model_id
-    _cache_dir = args.cache_dir
-    _THINK_LOG = args.think_log
-    _MTP_TOKENS = args.mtp_tokens
+    _model_id     = args.model_id
+    _cache_dir    = args.cache_dir
+    _THINK_LOG    = args.think_log
+    _DRAFT_TOKENS = args.draft_tokens
     os.makedirs(_cache_dir, exist_ok=True)
 
     print(f"\n[serve_model] Loading '{args.model_id}' onto {args.device}...")
     print(f"  Model path:  {args.model_path}")
     print(f"  Cache dir:   {_cache_dir}")
-    print(f"  Opts:        LATENCY | KV u8 | CACHE_DIR")
+    print(f"  Opts:        LATENCY | KV u8 | CACHE_DIR | PREFIX_CACHING")
 
     t0 = time.monotonic()
-    import os as _os
-    from pathlib import Path as _Path
+    model_dir = Path(args.model_path)
+    _is_vlm = (model_dir / "openvino_vision_embeddings_model.xml").exists()
 
-    model_dir = _Path(args.model_path)
-    pipeline_kwargs = {
-        "CACHE_DIR":             _cache_dir,
-        "PERFORMANCE_HINT":      "LATENCY",
-        "KV_CACHE_PRECISION":    "u8",
-        "enable_save_ov_model":  True,
-    }
-
-    # Auto-detect VLM (has vision embeddings model) vs text-only LLM
-    _is_vlm  = (model_dir / "openvino_vision_embeddings_model.xml").exists()
-    _has_mtp = (model_dir / "openvino_mtp_model.xml").exists()
+    draft = None
+    if args.draft_model_path:
+        draft_path = Path(args.draft_model_path)
+        if (draft_path / "openvino_model.xml").exists():
+            print(f"  Speculative: Draft model enabled ({draft_path})")
+            draft = ov_genai.draft_model(str(draft_path), args.device)
+            _has_draft = True
+        else:
+            print(f"  ⚠ Draft model path missing openvino_model.xml — running standard decode")
 
     if _is_vlm:
-        print(f"  Model type:  VLMPipeline (vision-language model detected)")
-        # SchedulerConfig required for MTP on VLMPipeline
+        print(f"  Architecture: VLMPipeline (vision-language model)")
+        _pipe = ov_genai.VLMPipeline(
+            str(model_dir),
+            args.device,
+            CACHE_DIR=_cache_dir
+        )
+    else:
+        print(f"  Architecture: LLMPipeline (text-only)")
+        llm_kwargs = {
+            "CACHE_DIR":          _cache_dir,
+            "PERFORMANCE_HINT":   "LATENCY",
+            "KV_CACHE_PRECISION": "u8",
+        }
         sched_cfg = ov_genai.SchedulerConfig()
-        sched_cfg.enable_prefix_caching = False       # required for MTP hybrid-attention
-        sched_cfg.max_num_batched_tokens = 2 ** 31    # large batch for prompt + draft window
-        if _has_mtp and not args.draft_model_path:
-            # Use built-in MTP head — point draft_model at the same directory
-            # No separate small draft model needed. 1.5-1.8x throughput gain.
-            print(f"  MTP:         Built-in draft head detected (openvino_mtp_model.xml)")
-            print(f"  MTP tokens:  {args.mtp_tokens} assistant tokens")
-            draft = ov_genai.draft_model(str(model_dir), args.device)
-            _pipe = ov_genai.VLMPipeline(
-                str(model_dir), args.device,
+        sched_cfg.enable_prefix_caching = True
+
+        if draft is not None:
+            _pipe = ov_genai.LLMPipeline(
+                str(model_dir),
+                args.device,
                 draft_model=draft,
                 scheduler_config=sched_cfg,
-                **pipeline_kwargs
+                **llm_kwargs
             )
         else:
-            _pipe = ov_genai.VLMPipeline(str(model_dir), args.device,
-                                          scheduler_config=sched_cfg, **pipeline_kwargs)
-        _tok = None  # VLMPipeline tokenizer access differs; use word-count fallback
-    else:
-        print(f"  Model type:  LLMPipeline (text-only)")
-        if args.draft_model_path:
-            print(f"  Draft model: {args.draft_model_path}")
-            draft = ov_genai.draft_model(args.draft_model_path, args.device)
-            _pipe = ov_genai.LLMPipeline(args.model_path, args.device, draft_model=draft, **pipeline_kwargs)
-        else:
-            _pipe = ov_genai.LLMPipeline(args.model_path, args.device, **pipeline_kwargs)
+            _pipe = ov_genai.LLMPipeline(
+                str(model_dir),
+                args.device,
+                scheduler_config=sched_cfg,
+                **llm_kwargs
+            )
+
+    try:
         _tok = _pipe.get_tokenizer()
-    
-    _tok = _pipe.get_tokenizer()
+    except Exception:
+        try:
+            _tok = ov_genai.Tokenizer(str(model_dir))
+        except Exception:
+            _tok = None
+
     print(f"  ✓ Ready in {time.monotonic()-t0:.1f}s  →  http://127.0.0.1:{args.port}/v1")
 
     uvicorn.run(

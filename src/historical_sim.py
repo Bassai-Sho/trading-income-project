@@ -686,7 +686,7 @@ def run_simulation(
     target_rr:  float = 2.0,
     risk_pct:   float = 0.01,
     account:    float = 10_000.0,
-    db_path:    str   = "paper_account.db",
+    db_path:    str   = "DATA/paper_account.db",
     use_alpaca: bool  = True,
     max_sessions: int | None = None,
     dry_run_mode: bool = False,  # True = skip bootstrap (testing)
@@ -706,7 +706,7 @@ def run_simulation(
 
     # Fetch data
     # ── Prefer local SQLite store over live API pull ──────────────────────
-    store_db = store_path or os.path.join(os.path.dirname(db_path), "market_data.db")
+    store_db = store_path or "DATA/market_data.db"
     if HAS_DATA_STORE:
         log.info("Checking market_data_store at %s...", store_db)
         store_obj = MarketDataStore(store_db)
@@ -748,7 +748,7 @@ def run_simulation(
     vix_map: dict[str, float] = {}
     try:
         from fred_store import FredDataStore
-        _fstore_path = store_path or os.path.join(os.path.dirname(db_path), "market_data.db")
+        _fstore_path = store_path or "DATA/market_data.db"
         _fred = FredDataStore(_fstore_path)
         _rows = _fred.get_series("VIXCLS", str(start), str(end))
         vix_map = {r["date"]: r["value"] for r in _rows if r["value"] is not None}
@@ -930,7 +930,7 @@ if __name__ == "__main__":
     p.add_argument("--target-rr",  type=float, default=2.0)
     p.add_argument("--risk",       type=float, default=0.01)
     p.add_argument("--account",    type=float, default=10_000.0)
-    p.add_argument("--db",         default="paper_account.db")
+    p.add_argument("--db",         default="DATA/paper_account.db")
     p.add_argument("--no-alpaca",  action="store_true",
                    help="Use yfinance 5-min bars instead of Alpaca 1-min")
     p.add_argument("--quick",      action="store_true",

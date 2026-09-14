@@ -38,7 +38,7 @@ USAGE
   from gene_mixer import breed_new_variant, extract_chromosome, GeneMixer
 
   # After tournament evaluation:
-  mixer = GeneMixer(db_path="paper_account.db", cfg=CONFIG)
+  mixer = GeneMixer(db_path="DATA/paper_account.db", cfg=CONFIG)
   result = mixer.run_design_studio_cycle(
       ranked_variants=tournament_report["ranked"],
       registry=REGISTRY,
@@ -707,7 +707,7 @@ if __name__ == "__main__":
     print(f"Validation: {valid} — {msg}")
 
     # Attribution
-    attr = attribute_winning_genes(chr_a, chr_b, "paper_account.db", "paper_account_orb30.db")
+    attr = attribute_winning_genes(chr_a, chr_b, "DATA/paper_account.db", "DATA/paper_account_orb30.db")
     print(f"Attribution: {attr['explanation']}")
 
     # Machine psychology

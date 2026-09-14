@@ -37,7 +37,8 @@ for arg in "$@"; do
     esac
 done
 
-PASS=0; FAIL=0
+PASS=0
+FAIL=0
 
 echo -e "\n${BOLD}Trading Income Project — Verification Suite${RESET}"
 
@@ -52,20 +53,20 @@ if $P1_UP; then
     MODEL=$(curl -s http://127.0.0.1:8000/v1/models 2>/dev/null \
         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'])" 2>/dev/null || echo "unknown")
     ok "Port 8000 — READY  (model: $MODEL)"
-    (( PASS++ ))
+    (( PASS += 1 ))
 else
     fail "Port 8000 — not responding. Run: ./launch_models.sh"
-    (( FAIL++ ))
+    (( FAIL += 1 ))
 fi
 
 if $P2_UP; then
     MODEL=$(curl -s http://127.0.0.1:8001/v1/models 2>/dev/null \
         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'])" 2>/dev/null || echo "unknown")
     ok "Port 8001 — READY  (model: $MODEL)"
-    (( PASS++ ))
+    (( PASS += 1 ))
 else
     fail "Port 8001 — not responding. Run: ./launch_models.sh"
-    (( FAIL++ ))
+    (( FAIL += 1 ))
 fi
 
 $P1_UP || { echo ""; warn "Cannot continue without Port 8000. Start servers first."; exit 1; }
@@ -88,7 +89,7 @@ RESP=$(curl -sf http://127.0.0.1:8000/v1/chat/completions \
 
 if [[ -z "$RESP" ]]; then
     fail "Phase 1 inference: no response"
-    (( FAIL++ ))
+    (( FAIL += 1 ))
 else
     CONTENT=$(echo "$RESP" | python3 -c "
 import sys, json
@@ -100,17 +101,16 @@ except Exception as e:
     print(f'PARSE_ERROR: {e}')
 " 2>/dev/null || echo "PARSE_ERROR")
 
-    # Verify thinking tokens were stripped
     if echo "$CONTENT" | grep -q "<think>"; then
         fail "Phase 1: <think> tokens NOT stripped from response content"
-        (( FAIL++ ))
+        (( FAIL += 1 ))
     elif [[ "$CONTENT" == *PARSE_ERROR* ]] || [[ -z "$CONTENT" ]]; then
         fail "Phase 1: response malformed — $CONTENT"
-        (( FAIL++ ))
+        (( FAIL += 1 ))
     else
         ok "Phase 1 inference: clean output"
         info "Response: ${CONTENT:0:120}..."
-        (( PASS++ ))
+        (( PASS += 1 ))
     fi
 fi
 
@@ -124,16 +124,16 @@ if [[ "$PHASE1_MODEL" == *deepseek* ]] || [[ "$PHASE1_MODEL" == *qwq* ]]; then
         ok "Thinking log: $THINK_LOG ($LINES lines)"
         info "Last 3 lines of thinking log:"
         tail -3 "$THINK_LOG" | while IFS= read -r line; do info "  $line"; done
-        (( PASS++ ))
+        (( PASS += 1 ))
     else
         warn "Thinking log empty or missing: $THINK_LOG"
         info "(Populated after first inference — run Step 2 first)"
-        (( PASS++ ))  # not a failure on first run
+        (( PASS += 1 ))
     fi
 else
-    info "Pair uses $PHASE1_MODEL — no thinking tokens expected (Qwen/Mistral)"
-    info "Thinking log only applies to DeepSeek-R1 / QwQ models"
-    (( PASS++ ))
+    info "Pair uses $PHASE1_MODEL — standard chat template active"
+    info "Thinking log only captures DeepSeek-R1 / QwQ models"
+    (( PASS += 1 ))
 fi
 
 # =============================================================================
@@ -164,11 +164,11 @@ except: print('PARSE_ERROR')
 
     if [[ "$CONTENT2" == *PARSE_ERROR* ]] || [[ -z "$CONTENT2" ]]; then
         fail "Phase 2 inference failed"
-        (( FAIL++ ))
+        (( FAIL += 1 ))
     else
         ok "Phase 2 adversarial ($PHASE2_MODEL): responding"
         info "Response: ${CONTENT2:0:120}..."
-        (( PASS++ ))
+        (( PASS += 1 ))
     fi
 else
     warn "Phase 2 server not running — skipping"
@@ -182,10 +182,10 @@ if $QUICK; then
 elif ! [[ -d "$ROOT_DIR/.venv" ]]; then
     warn "No .venv found — skipping session analyser test"
 else
-    # Determine preset from active pair
     ACTIVE_PAIR=1
-    [[ -f "$ROOT_DIR/.model_pair" ]] && \
+    if [[ -f "$ROOT_DIR/.model_pair" ]]; then
         ACTIVE_PAIR=$(grep '^ACTIVE_PAIR=' "$ROOT_DIR/.model_pair" | cut -d= -f2 || echo 1)
+    fi
     PRESET="nuc-pair${ACTIVE_PAIR}"
 
     DATE_ARG=""
@@ -205,10 +205,10 @@ else
     if "$ROOT_DIR/.venv/bin/python3" "$ROOT_DIR/src/session_analyser.py" \
         --preset "$PRESET" $DATE_ARG --no-llm 2>&1 | tail -5; then
         ok "session_analyser.py launched successfully (--no-llm mode)"
-        (( PASS++ ))
+        (( PASS += 1 ))
     else
         warn "session_analyser.py exited non-zero (may be expected if no data for date)"
-        (( PASS++ ))
+        (( PASS += 1 ))
     fi
 fi
 
@@ -217,11 +217,10 @@ hdr "Step 6 — Open WebUI (optional)"
 
 if curl -sf http://127.0.0.1:8080 >/dev/null 2>&1; then
     ok "Open WebUI running at http://localhost:8080"
-    (( PASS++ ))
+    (( PASS += 1 ))
 else
     info "Open WebUI not running (optional — start with: ./launch_models.sh --with-webui)"
-    info "Or standalone: source .venv/bin/activate && open-webui serve"
-    (( PASS++ ))   # not a failure — optional component
+    (( PASS += 1 ))
 fi
 
 # =============================================================================
@@ -232,13 +231,9 @@ echo -e "${BOLD}${CYAN}═══════════════════
 echo ""
 
 if (( FAIL > 0 )); then
-    echo -e "  ${RED}Some checks failed. Common fixes:${RESET}"
-    echo -e "  Server not running:  ${CYAN}./launch_models.sh${RESET}"
-    echo -e "  Models not found:    ${CYAN}./prepare_host.sh --pair 1 --models-only${RESET}"
-    echo ""
+    echo -e "  ${RED}Some checks failed.${RESET}"
     exit 1
 else
     echo -e "  ${GREEN}All checks passed.${RESET}"
-    echo -e "  Full D-A-C run:  ${CYAN}python src/session_analyser.py --preset nuc-pair1${RESET}"
-    echo ""
+    echo -e "  Full D-A-C run:  ${CYAN}python src/session_analyser.py --preset nuc-pair1${RESET}\n"
 fi

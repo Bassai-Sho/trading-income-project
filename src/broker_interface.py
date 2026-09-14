@@ -27,7 +27,7 @@ USAGE IN TRADING ENGINE
 -----------------------
 # Paper trading (current default):
     data    = YFinanceDataProvider(ticker="SPY", interval="5m")
-    broker  = PaperBrokerClient(db_path="paper_account.db",
+    broker  = PaperBrokerClient(db_path="DATA/paper_account.db",
                                  account=10_000, risk_pct=0.01)
     engine  = TradingEngine(data=data, broker=broker, cfg=CONFIG)
     engine.run()

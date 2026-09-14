@@ -316,12 +316,14 @@ def tool_run_script(script_alias: str, extra_args: dict | None = None) -> str:
 
     def _run():
         try:
+            # Set working directory to project root so DATA/ paths resolve correctly
+            project_root = Path(__file__).parent.parent
             result = subprocess.run(
                 cmd_args,
                 capture_output=True,
                 text=True,
-                timeout=60,   # scripts can take up to 60s
-                cwd=str(Path(__file__).parent),
+                timeout=60,
+                cwd=str(project_root),
             )
             out = (result.stdout or "").strip()
             err = (result.stderr or "").strip()
@@ -671,7 +673,7 @@ def dispatch_tool(name: str, args: dict, cfg: dict) -> str:
 
     Returns a string result (never raises — errors returned as readable text).
     """
-    db_path  = cfg.get("db_path", "paper_account.db")
+    db_path  = cfg.get("db_path", "DATA/paper_account.db")
     n_web    = cfg.get("web_search_results", WEB_N_RESULTS)
 
     try:

@@ -1,50 +1,53 @@
 # Trading Income Project
 
-Systematic, evidence-based day trading system built around the Opening Range Breakout (ORB) strategy, validated against academic benchmarks before any live capital is deployed.
+Systematic, evidence-based day trading system built around the Opening Range Breakout (ORB) strategy on SPY, validated against academic benchmarks before live capital deployment.
 
-**Hardware:** Intel NUC 14 Pro · Core Ultra 5 125H · 64GB DDR5 · Intel Arc iGPU (58GB VRAM pool) · Ubuntu 24.04  
-**Academic foundation:** Zarattini, Barbon & Aziz 2024 (SSRN 4729284) — ORB + RVOL filter, Sharpe 2.81
+**Hardware:** Intel NUC 14 Pro · Core Ultra 5 125H · 64GB DDR5 · Intel Arc iGPU (58GB VRAM pool) · Ubuntu 24.04 LTS  
+**Academic foundation:** Zarattini, Barbon & Aziz 2024 (SSRN 4729284) — ORB + RVOL filter, Sharpe 2.81  
+**Runtime:** OpenVINO GenAI in-process `.venv` (Level Zero / OneAPI) — dual-port architecture with Open WebUI
 
 ---
 
 ## What this does
 
-Trades SPY once per session using a 15-minute ORB signal with VWAP confirmation. Every decision is logged, analysed nightly by a local LLM D-A-C pipeline (Phase 1: director analysis → Phase 2: adversarial stress-test using a different model architecture), and validated weekly against walk-forward criteria. The system cannot deploy live capital until it clears a statistical gate (100 paper trades, WFE ≥ 0.50). The edge is verified by running the same IS sessions through seven academic strategy replications and a 10,000-path vectorised random-trader Monte Carlo benchmark.
+Trades SPY once per session using a 15-minute ORB signal with VWAP slope confirmation. Every decision is logged to an SQLite ledger, analysed post-market by a local LLM D-A-C pipeline (Phase 1: Lead Quant Reasoner → Phase 2: Adversarial Risk Auditor), and evaluated weekly in an evolutionary strategy tournament. 
+
+The system cannot deploy live capital until it clears a strict statistical gate (100 paper trades, WFE ≥ 0.50, DSR > 80%). The edge is verified by running all in-sample sessions through seven academic strategy replications and a 10,000-path vectorised random-trader Monte Carlo benchmark.
 
 ---
 
 ## Architecture
 
-```
+```text
 Startup
-  prepare_host.sh   Intel Arc drivers (stock Ubuntu only), OpenVINO GenAI, model download
-  launch_models.sh  Start Phase 1 server (Port 8000) + Phase 2 server (Port 8001)
-  setup.sh          Python deps, DATA/ directory, .env, health check
-  verify.sh         5-step post-setup verification
+  prepare_host.sh     Intel Arc drivers (stock Ubuntu), OpenVINO GenAI nightly, model downloader
+  launch_models.sh    Start Phase 1 server (Port 8000), Phase 2 server (Port 8001), WebUI (Port 8080)
+  setup.sh            Self-healing directory creation (DATA/, LOGS/), .env, health check
+  verify.sh           7-step pre-flight verification suite
 
-Daily (automated via runner.py)
-  09:00  morning_brief.py     VIX (FRED), yield curve, CBOE P/C, CFTC, OPEX, GO/NO-GO
-  09:25  markov_engine.py     Regime chain refresh from FRED VIXCLS
-  09:28  trading_engine.py    60s signal loop: ORB → VWAP gate → retest → entry
-  15:35  session_analyser.py  D-A-C: Phase 1 (Port 8000) → Phase 2 adversarial (Port 8001)
-  16:30  market_data_store.py Append today's 1-min bars to SQLite
-  16:35  fred_store.py        Update FRED macro series (VIX, rates, spreads, CPI)
+Daily (Automated via runner.py)
+  09:00  morning_brief.py     Pre-market CLI: VIX (FRED), yield curves, CBOE P/C, CFTC, OPEX, GO/NO-GO
+  09:25  markov_engine.py     Regime transition matrix refresh from local FRED VIXCLS
+  09:28  trading_engine.py    60s signal poll: ORB → VWAP slope gate → execution fill simulation
+  15:35  session_analyser.py  Staged Dossier D-A-C: Python Ingestion (<0.05s) → Macro Scout (Port 8001)
+                              → Quant Reasoner (Port 8000) → Adversarial Audit (Port 8001)
+  15:40  monte_carlo_ext.py   Galton board forward equity forecast & risk-of-ruin update
+  16:30  market_data_store.py Ingest today's 1-min SPY bars into SQLite
+  16:35  fred_store.py        Update FRED macro observations (VIX, rates, spreads, CPI)
   16:40  sentiment_store.py   Scrape CBOE P/C today + refresh CFTC COT current year
-  Sat    tournament_evaluator.py  Weekly WFE/Sharpe comparison, Design Studio
+  Sat    tournament_eval.py   Weekly WFE/Sharpe comparison, Design Studio genetic mixer
 
-LLM inference — OpenVINO GenAI in .venv (no Docker, no Ollama registry)
-  Port 8000  Phase 1 director model   (selected at prepare_host.sh time)
-  Port 8001  Phase 2 adversarial model (different architecture from Phase 1)
-  serve_model.py wraps openvino_genai.LLMPipeline with OpenAI /v1 API + tool calling
+LLM Inference — OpenVINO GenAI in .venv (Dual-Port Co-Residency in 58GB VRAM)
+  Port 8000  Phase 1 Lead Quant Reasoner   (Qwen3.8-27B MTP or Qwen3.6-35B MoE)
+  Port 8001  Phase 2 Adversarial Auditor   (Phi-4-mini or Mistral-Nemo-12B)
+  Port 8080  Open WebUI                    (ChatGPT-style browser interface)
+  serve_model.py wraps openvino_genai with OpenAI-compatible /v1 endpoints & telemetry
 
-Data stores — all DATA/market_data.db unless noted
-  market_bars         Alpaca 1-min SPY bars  2016-2024
-  session_context     PDH/PDL, VIX regime, ORB range per session
-  fred_observations   7 FRED series: VIXCLS DGS2 DGS10 T10YIE BAMLH0A0HYM2 FEDFUNDS CPIAUCSL
-  cboe_pc_daily       CBOE equity put/call ratio  2006+
-  cftc_cot_weekly     CFTC COT S&P 500 leveraged + asset manager net  2016+
-  (DATA/paper_account.db)  sim_trades, dac_findings, confirmed_patterns, wfa_results,
-                            random_baseline_summary, academic_replication_results
+Data Stores — All consolidated under DATA/
+  DATA/market_data.db    market_bars (1-min SPY), session_context, fred_observations,
+                         cboe_pc_daily, cftc_cot_weekly
+  DATA/paper_account.db  positions, orders, decisions, sessions, wfa_results,
+                         llm_analysis, confirmed_patterns, monte_carlo_forecasts
 ```
 
 Full deployment guide → [`docs/SETUP.md`](docs/SETUP.md)
@@ -53,189 +56,81 @@ Full deployment guide → [`docs/SETUP.md`](docs/SETUP.md)
 
 ## Prerequisites
 
-| Requirement | Where | Notes |
+| Requirement | Source | Purpose |
 |---|---|---|
-| Alpaca paper account | [alpaca.markets](https://alpaca.markets) | Free, no funding required |
-| FRED API key | [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html) | Free, instant |
-| Brave Search API key | [api.search.brave.com](https://api.search.brave.com) | Free 2,000 queries/month. Credit card required (fraud prevention only) |
-| Python 3.10+, Ubuntu 24.04 | — | NUC 14 Pro recommended |
-| OpenVINO GenAI | `./prepare_host.sh` | Installed into `.venv` — no Docker, no third-party repos |
+| Alpaca Paper Account | [alpaca.markets](https://alpaca.markets) (Free) | Market data and paper order simulation |
+| FRED API Key | [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html) (Free) | Authoritative CBOE VIX, yield curves, spreads |
+| Brave Search API Key | [api.search.brave.com](https://api.search.brave.com) (Free 2k/mo) | Independent macro news search (DDG fallback) |
+| Intel Arc Compute Stack | Stock Ubuntu 24.04 packages (`libze-intel-gpu1`) | Level Zero GPU runtime (no 3rd-party repos) |
+| OpenVINO GenAI Nightly | `pip install --pre -U openvino openvino-genai` | Native Arc matrix vectorization & MTP support |
 
 ---
 
-## Quick start
+## Quick Start
 
 ```bash
-# 1. Host setup and model download (once — choose a model pair)
+# 1. Host setup and model pair download
 chmod +x prepare_host.sh launch_models.sh setup.sh verify.sh git_setup.sh
-./prepare_host.sh           # interactive: pair 1 / 2 / 3 | drivers + venv + download
+./prepare_host.sh             # interactive pair selector (Pair 1 or 2 recommended)
 
-# 2. Start LLM servers
-./launch_models.sh          # starts both ports. First run: ~45s compile. After: <10s.
+# 2. Start model servers & Open WebUI
+./launch_models.sh --with-webui
 
-# 3. Fill in API keys
-nano .env                   # ALPACA_API_KEY, ALPACA_SECRET_KEY, FRED_API_KEY, BRAVE_SEARCH_API_KEY
+# 3. Environment configuration
+cp .env.example .env && nano .env
+# Fill in: ALPACA_API_KEY, ALPACA_SECRET_KEY, FRED_API_KEY, BRAVE_SEARCH_API_KEY
 
-# 4. Python env + data download (once — ~2-3 hours, see docs/SETUP.md)
+# 4. Project setup & one-time data bootstrap
 ./setup.sh
-python src/market_data_store.py --download --tickers SPY \
-  --start 2016-01-01 --end 2024-12-31 --db DATA/market_data.db
-python src/fred_store.py      --download --db DATA/market_data.db
-python src/sentiment_store.py --download --db DATA/market_data.db
+python3 src/market_data_store.py --download --tickers SPY --start 2016-01-01 --end 2024-12-31 --db DATA/market_data.db
+python3 src/fred_store.py        --download --db DATA/market_data.db
+python3 src/sentiment_store.py   --download --db DATA/market_data.db
 
-# 5. Correct, bootstrap, and validate
-python src/data_corrector.py  --db DATA/market_data.db --ticker SPY \
-  --start 2016-01-01 --end 2022-12-31
-python src/historical_sim.py  --start 2016-01-01 --end 2022-12-31 \
-  --db DATA/paper_account.db
-# ↑ auto-triggers 10,000-path random baseline + 7-strategy academic comparison
+# 5. Algorithmic bar correction & simulation bootstrap
+python3 src/data_corrector.py    --db DATA/market_data.db --ticker SPY --start 2016-01-01 --end 2022-12-31
+python3 src/historical_sim.py    --start 2016-01-01 --end 2022-12-31 --db DATA/paper_account.db
+# ↑ Automatically seeds WFA, Markov chains, 10,000-path random baseline & 7-strategy comparison
 
-# 6. Verify everything works
-./verify.sh                 # 5-step check: servers, inference, thinking log, adversarial, session analyser
+# 6. Verify full stack
+./verify.sh                   # 7-step pre-flight verification
 
-# 7. Run
-python src/runner.py --ticker SPY --orb 15min --account 10000
-streamlit run src/trading_dashboard.py   # separate terminal
+# 7. Start live operations
+python3 src/runner.py         # single command daily orchestrator
+streamlit run src/trading_dashboard.py   # live trading cockpit (separate terminal)
 ```
 
 ---
 
-## Pushing to GitHub
+## Model Pairs (OpenVINO GenAI — Co-Resident in 58GB VRAM)
 
-```bash
-./git_setup.sh
-```
+Both models reside in the Arc iGPU memory pool simultaneously, completely eliminating model swap latency during post-session D-A-C reviews.
 
-Interactive: initialises git, verifies `.env` and `DATA/` are excluded, creates the first commit, pushes. Full guide → [`docs/GITHUB_SETUP.md`](docs/GITHUB_SETUP.md)
-
----
-
-## Source files (23 Python · 18,661 lines)
-
-### Core system
-| File | Lines | Purpose |
-|---|---|---|
-| `runner.py` | 615 | Entry point — APScheduler daily orchestration |
-| `trading_engine.py` | 1,568 | ORB signal gates, position management, fill simulation |
-| `trading_dashboard.py` | 585 | 6-tab Streamlit cockpit |
-| `morning_brief.py` | 392 | Pre-market CLI: VIX, macro, CBOE P/C, CFTC, OPEX, GO/NO-GO |
-| `session_analyser.py` | 1,296 | D-A-C pipeline, presets for all three model pairs, tool calling |
-| `broker_interface.py` | 395 | DataProvider / BrokerClient abstraction |
-| `serve_model.py` | 376 | OpenVINO GenAI OpenAI /v1 bridge — tool calling, thinking token strip |
-
-### Strategy and evolution
-| File | Lines | Purpose |
-|---|---|---|
-| `strategy_registry.py` | 334 | 6 strategy variants, phase gate enforcement |
-| `tournament_evaluator.py` | 483 | Weekly WFE/Sharpe comparison, Design Studio |
-| `gene_mixer.py` | 731 | Evolutionary engine: crossover, mutate, D-A-C validate |
-
-### Statistical and ML
-| File | Lines | Purpose |
-|---|---|---|
-| `markov_engine.py` | 832 | Regime Markov chain, outcome chain, candle N-gram |
-| `monte_carlo_extended.py` | 574 | Galton board paths, risk-of-ruin, Kelly |
-| `trade_journal_extended.py` | 654 | 50-field journal, psychology flags, correlations |
-| `trading_quant_toolkit_v2_4.py` | 3,682 | Core maths: EV, Kelly, WFA, DSR, Monte Carlo |
-
-### Data pipeline
-| File | Lines | Purpose |
-|---|---|---|
-| `market_data_store.py` | 850 | Alpaca 1-min bar store with 5 quality checks |
-| `data_corrector.py` | 660 | Phantom H/L, stale bars, OHLC integrity, early-close trim |
-| `historical_sim.py` | 971 | IS backtest + SimBootstrapper (seeds all learning) |
-| `fred_store.py` | 527 | FRED macro: VIX, yield curve, HY spread, CPI (7 series) |
-| `sentiment_store.py` | 564 | CBOE put/call (2006+) + CFTC COT S&P 500 (2016+) |
-
-### Validation and intelligence
-| File | Lines | Purpose |
-|---|---|---|
-| `tool_runner.py` | 709 | Brave Search primary + DDG fallback, fetch_url, 8 LLM tools |
-| `findings_store.py` | 336 | D-A-C findings persistence → confirmed patterns → morning brief |
-| `random_baseline_sim.py` | 751 | 10,000-path vectorised random-trader Monte Carlo benchmark |
-| `academic_replications.py` | 776 | 7-strategy academic comparison (long-only + no-retest included) |
-
----
-
-## Model pairs (OpenVINO GenAI — all run in 58GB iGPU pool)
-
-Select a pair at `./prepare_host.sh` time. Both models remain resident in VRAM simultaneously (zero swap latency between D-A-C phases).
-
-| Pair | Phase 1 — Port 8000 | Phase 2 — Port 8001 | VRAM | Best for |
+| Pair | Phase 1 (Port 8000) | Phase 2 (Port 8001) | Static VRAM | Characteristics |
 |---|---|---|---|---|
-| **1 — Thinking Quant** | DeepSeek-R1-Distill-32B INT4 | Mistral-Nemo-12B INT4 | ~26GB | o1-class step-by-step reasoning, quantitative audit |
-| **2 — High-Speed Agentic** | Qwen3-30B-A3B MoE INT4 | Mistral-Nemo-12B INT4 | ~25GB | 30+ tok/s, fast multi-turn tool loops |
-| **3 — Frontier Heavyweight** | Qwen2.5-32B-Instruct INT4 | Mistral-Small-24B INT4 | ~33GB | Peak JSON/tool precision + deep adversarial critique |
+| **1 — Most Popular** | Qwen3.8-27B INT4 (MTP built-in) | Phi-4-mini INT4 (3.8B) | ~19GB | Dense mathematical reasoning + fast auditor |
+| **2 — High-Speed MoE** | Qwen3.6-35B-A3B MoE INT4 | Mistral-Nemo-12B INT4 | ~25GB | **30+ tok/s throughput**, SWA independent critic |
+| **3 — Novel Adversary** | Qwen3.6-35B-A3B MoE INT4 | LFM2.5-8B-A1B INT4 | ~23GB | Liquid AI state machine (non-transformer) auditor |
 
-**Recommended: Pair 1.** DeepSeek-R1's `<think>` reasoning chain is well-suited to multi-step quantitative analysis (checks its own maths before committing). Thinking tokens are stripped from the response and logged to `LOGS/thinking_8000.log` for audit.
-
-**Architectural independence:** All Phase 2 adversarial models (Mistral family) use Sliding Window Attention and a different tokeniser from Phase 1 (Qwen/DeepSeek), breaking intra-family confirmation bias.
-
-**Why OpenVINO GenAI over IPEX-LLM Ollama:**
-- Intel archived IPEX-LLM January 2026. OpenVINO is Intel's active production framework.
-- No third-party display driver repositories — `prepare_host.sh` uses only stock Ubuntu 24.04 packages, eliminating the GDM3 black-screen risk.
-- No Ollama registry version checks — no Error 412.
-- Native INT4 symmetric quantisation compiled 1:1 into Arc DP4a vector engines: ~1.5-1.8× faster than llama.cpp Vulkan.
-
-**Switch pairs without reinstalling drivers:**
+**Switch pairs without reinstalling host drivers:**
 ```bash
-./prepare_host.sh --pair 2 --models-only   # download pair 2 models
-./launch_models.sh --pair 2                # start pair 2
+./prepare_host.sh --pair 2 --models-only   # downloads pair 2
+./launch_models.sh --pair 2 --with-webui   # launches pair 2
 ```
 
 ---
 
-## Web search
+## Data Partitions (Enforced in Code)
 
-`tool_runner.py` uses **Brave Search API as primary** (independent index, reliable JSON API, 2,000 free queries/month) with DuckDuckGo as automatic fallback when `BRAVE_SEARCH_API_KEY` is absent or the request fails. Get a free key at `api.search.brave.com`.
-
----
-
-## Academic foundation
-
-| Paper | Strategy | Result | Used in |
-|---|---|---|---|
-| Zarattini et al. 2024 (SSRN 4729284) | ORB + RVOL filter on Stocks in Play | Sharpe 2.81, alpha 36% | Signal design |
-| Zarattini et al. 2024 (SSRN 4824172) | VWAP intraday momentum on SPY | Sharpe 1.33, 19.6% p.a. | Exit design, SPY validation |
-| Gao, Han, Li, Zhou 2018 (JFE) | First/last 30-min ETF momentum | Significant after fees | Academic comparison floor |
-| Maroy 2025 (SSRN 5095349) | VWAP + ladder exits | Sharpe 3.0+ | Phase 3 exit enhancement |
-| Barber et al. 2011 (Taiwan, 15yr) | Retail day trading outcomes | 84% lose, <1% positive net of fees | Risk framing |
-| Chague et al. 2019 (Brazil) | Retail day trading outcomes | 97% lose, no learning curve | Risk framing |
-
-**7-strategy academic comparison** (ranked by expected IS Sharpe — run automatically after bootstrap):
-
-| Rank | Strategy | Basis | Elimination rule |
-|---|---|---|---|
-| 1 | Random bidirectional | Null hypothesis | — |
-| 2 | Gao first/last 30-min | JFE 2018 | Floor: must beat this |
-| 3 | Zarattini 5-min ORB (SPY proxy) | SSRN 4729284 | — |
-| 4 | Zarattini VWAP momentum | SSRN 4824172 | If hybrid < this: simplify to VWAP |
-| 5 | Long-only 15-min ORB | Independent review | If > bidirectional: prune shorts |
-| 6 | 15-min ORB no-retest | Adverse selection test | If > with-retest: remove Scarface mechanic |
-| 7 (target) | Hybrid 15-min ORB + VWAP | Our system | Must beat rank 4 |
-
----
-
-## Data boundaries
-
-| Window | Dates | Status |
+| Window | Dates | Operational Rule |
 |---|---|---|
-| In-sample | 2016–2022 | Training. `SealedDataError` raised in code if crossed. |
-| Validation | 2023–2024 | Walk-forward OOS — untouched until Phase 3 |
-| Sealed | 2025–present | Never touched. Final live-capital evaluation only. |
+| **In-Sample** | 2016-01-01 → 2022-12-31 | Training only. `SealedDataError` raised if crossed during exploratory testing. |
+| **Validation** | 2023-01-01 → 2024-12-31 | Walk-Forward Analysis (WFA) out-of-sample window. Untouched until Phase 3 gate. |
+| **Sealed** | 2025-01-01 → Present | Never touched. Reserved exclusively for final live capital evaluation. |
 
 ---
 
-## Phase gates
+## Phase Gates
 
-| Gate | Condition |
-|---|---|
-| Phase 2 → 3 | 100 live paper trades, WFE ≥ 0.50 on live data |
-| Phase 3 → 4 | 3 months positive EV, Deflated Sharpe Ratio > 0 |
-| Phase 4 → 5 | Live capital deployed, 6-month track record |
-
----
-
-## UK residents
-
-FCA-regulated spread betting (IG, CMC Markets, Spreadex) is classified as gambling under UK law and is exempt from Capital Gains Tax and Income Tax on profits (ITTOIA 2005 ss.6 & 10; TCGA 1992). Executing the same systematic strategy via a spread bet API delivers a 20–45% post-tax advantage over a US broker account. Consult a UK tax adviser before live deployment.
+* **Phase 2 → 3:** 100 live paper trades, WFE ≥ 0.50, Monte Carlo pass rate ≥ 85%, DSR > 80%.
+* **Phase 3 → 4:** 3 consecutive rolling 20-trade windows with positive EV on live paper execution.
+* **Phase 4 → 5:** Live capital deployment, Sharpe ≥ 1.0 sustained over 3 consecutive months.

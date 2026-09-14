@@ -82,7 +82,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "account":          10_000.0,
     "risk_pct":         0.01,
     "db_path":          "DATA/paper_account.db",
-    "llm_preset":       "nuc-balanced",
+    "llm_preset":       os.environ.get("LLM_PRESET", "nuc-pair1"),
     "discord_webhook":  "",
     "telegram_token":   "",
     "telegram_chat_id": "",
@@ -341,7 +341,7 @@ def launch_session_analyser(session_date: str = "") -> None:
     cmd = [sys.executable, str(script),
            "--date",   date_str,
            "--db",     cfg["db_path"],
-           "--preset", cfg.get("llm_preset", "nuc-balanced")]
+           "--preset", cfg.get("llm_preset", "nuc-pair1")]
     if cfg.get("discord_webhook"):
         cmd += ["--discord", cfg["discord_webhook"]]
     if cfg.get("telegram_token"):
