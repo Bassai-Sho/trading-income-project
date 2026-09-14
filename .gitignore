@@ -1,5 +1,6 @@
 # Environment — never commit credentials
 .env
+kernel.errors.txt
 
 # Keys
 .webui_secret_key

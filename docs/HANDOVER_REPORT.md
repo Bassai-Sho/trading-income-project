@@ -57,12 +57,12 @@ The project migrated from IPEX-LLM Ollama to native **OpenVINO GenAI (`.venv`)**
 
 Following empirical latency testing on the NUC 14 Pro, the multi-turn ReAct agent loop in `session_analyser.py` was replaced with the **Staged Dossier Pipeline**:
 
-{bt}text
+```text
 [ SQLite Ingestion ] ──────► Python builds complete session dossier (< 0.05s)
 [ Macro Extraction ] ──────► Phi-4-mini synthesizes web news into 2 bullets (~2.0s)
 [ Quant Reasoning  ] ──────► Qwen3.8-27B analyzes dossier in single pass with <think> (~30s)
 [ Adversarial Audit] ──────► Phi-4-mini stress-tests report and enforces Rule 17 (~12s)
-{bt}
+```
 
 **Total runtime dropped from >300 seconds (with timeout errors) to <45 seconds.**
 
@@ -93,7 +93,7 @@ The Adversarial Validator enforces this hard rule:
 | **6** | `launch_models.sh` | Unclosed quotes around `--with-webui` output broke bash parsing. | Cleaned quoting, added PID management for WebUI. |
 | **7** | `launch_models.sh` | Background process crashes caused launcher to wait 180s in vain. | Added PID liveness polling to fail fast and dump logs immediately. |
 | **8** | `serve_model.py` | `max_num_batched_tokens = 2**31` integer overflow in `SchedulerConfig`. | Removed invalid scheduler config; loaded as clean `LLMPipeline`. |
-| **9** | `serve_model.py` | `TOOL_SYSTEM_PREFIX` contained unescaped `{ and end with }` causing `KeyError`. | Replaced `.format()` with literal `.replace("{{tools_json}}", ...)`. |
+| **9** | `serve_model.py` | `TOOL_SYSTEM_PREFIX` contained unescaped `{ and end with }` causing `KeyError`. | Replaced `.format()` with literal `.replace("{tools_json}", ...)`. |
 | **10** | `serve_model.py` | `async def` endpoints starved the asyncio event loop during GPU compute. | Converted routes to synchronous `def` protected by `threading.Lock()`. |
 | **11** | `verify.sh` | Bash arithmetic post-increment `(( PASS++ ))` returned 0, triggering `set -e` abort. | Replaced all instances with `(( PASS += 1 ))` and `(( FAIL += 1 ))`. |
 | **12** | `session_analyser.py` | Multi-turn ReAct loop exceeded client timeout (120s) on 27B model. | Replaced with single-pass Staged Dossier; bumped client timeout to 600s. |

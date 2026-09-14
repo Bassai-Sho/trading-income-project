@@ -119,25 +119,19 @@ RULES:
 """
 
 def fetch_and_distill_macro(session_date: str, cfg: dict) -> str:
-    raw_snippets = []
+    """Extracts raw web news (Brave Search primary) and distills it via the small scout model."""
     try:
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            from duckduckgo_search import DDGS
-
+        from tool_runner import tool_web_search
         query = f"S&P 500 SPY stock market close {session_date}"
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=3):
-                raw_snippets.append(f"[{r.get('title','')}] {r.get('body','')}")
+        raw_text = tool_web_search(query, n_results=3)
     except Exception as e:
         log.warning("Web search unavailable: %s", e)
         return "Macro search unavailable — relying strictly on local database."
 
-    if not raw_snippets:
+    if not raw_text or "No results" in raw_text:
         return "No specific macroeconomic catalysts reported."
 
-    raw_text = "\n\n".join(raw_snippets)[:3000]
+    # Extract verified numbers deterministically to prevent hallucination
     num_pattern = r"(?:[\+\-]?\d+(?:\.\d+)?%|\b\d+\s*bps\b|\$[\d,]+(?:\.\d+)?)"
     anchors = list(dict.fromkeys(re.findall(num_pattern, raw_text)))[:6]
 
@@ -147,14 +141,14 @@ def fetch_and_distill_macro(session_date: str, cfg: dict) -> str:
             model=cfg["scout_model"],
             messages=[
                 {"role": "system", "content": SCOUT_PROMPT},
-                {"role": "user", "content": f"Verified Numbers: {anchors}\n\nRaw Context:\n{raw_text}"}
+                {"role": "user", "content": f"Verified Numbers: {anchors}\n\nRaw Context:\n{raw_text[:3000]}"}
             ],
             max_tokens=150,
             temperature=0.0,
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        log.warning("Scout model unavailable (%s) — returning raw snippets", e)
+        log.warning("Scout model distillation failed (%s) — using raw snippet", e)
         return raw_text[:300] + "..."
 
 # ---------------------------------------------------------------------------
