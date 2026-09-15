@@ -3,35 +3,19 @@ trading_dashboard.py
 ====================
 Standalone Streamlit desktop dashboard for the Trading Income Project.
 
-ARCHITECTURE PRINCIPLE: This app complements the trading_quant_toolkit but
-is NOT dependent on it. It imports toolkit functions where convenient but
-contains its own fallbacks and can run standalone. The toolkit is the
-computational truth layer; this dashboard is the real-time cockpit.
-
-Sections
---------
-SIDEBAR     -- Session controls: account balance, ticker, risk mode
-PRE-MARKET  -- Stocks in Play scanner + VIX regime + PDH/PDL
-ORB SETUP   -- Live ORB range (5/15/30min), VWAP slope, breakout signal
-SIGNAL GATE -- AND-gate visual status (ORB / VWAP / Retest)
-POSITION    -- Size calculator (fixed%, Kelly) + stop/target/trailing
-RISK STATE  -- Session P&L, consecutive losses, daily stop check
-JOURNAL     -- Log trades inline, rolling stats table
-SETTINGS    -- Universe watchlist, refresh interval
-
-Run:  streamlit run trading_dashboard.py
+Theme: Fully adaptive to Streamlit Light and Dark modes.
+Run:   streamlit run src/trading_dashboard.py
 """
 
 from __future__ import annotations
-import re
 
 import os
+import re
 import sys
 import time
 import math
 import statistics
-import tempfile
-from datetime import datetime, time as Time, date, timedelta
+from datetime import datetime, time as Time, date, timedelta, timezone
 from typing import Any
 
 import streamlit as st
@@ -39,7 +23,7 @@ import pandas as pd
 import yfinance as yf
 
 # ---------------------------------------------------------------------------
-# Optional toolkit import — graceful fallback if path differs
+# Optional toolkit import
 # ---------------------------------------------------------------------------
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,7 +33,7 @@ except ImportError:
     TOOLKIT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Page config — must be first Streamlit call
+# Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="ORB Trading Cockpit",
@@ -59,76 +43,131 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# CSS — trading terminal aesthetic
-# Dark base, phosphor-green signals, amber warnings, crisp monospace data
+# CSS — Adaptive Light / Dark Theme Styling
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
-/* Base */
-[data-testid="stAppViewContainer"] { background: #0d0d0f; }
-[data-testid="stSidebar"] { background: #111116; border-right: 1px solid #222230; }
-section[data-testid="stSidebarContent"] { padding: 1rem; }
+/* Base Typography */
+html, body, [class*="css"] { 
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; 
+}
 
-/* Typography */
-html, body, [class*="css"] { font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; }
-h1 { font-size: 1.1rem; letter-spacing: 0.12em; color: #c8ccd4; font-weight: 500;
-     text-transform: uppercase; border-bottom: 1px solid #1e1e2e; padding-bottom: 0.4rem; }
-h2 { font-size: 0.8rem; letter-spacing: 0.18em; color: #6b7280;
-     text-transform: uppercase; margin: 1.2rem 0 0.5rem; }
-h3 { font-size: 0.75rem; color: #9ca3af; letter-spacing: 0.1em; }
-p, label, div { color: #c8ccd4; font-size: 0.82rem; }
+/* Header Bar */
+.cockpit-header {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 6px;
+    padding: 0.75rem 1.25rem;
+    margin-bottom: 1.25rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+.header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+.header-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--text-color);
+}
+.header-badge {
+    background: rgba(59, 130, 246, 0.15);
+    color: #3b82f6;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+.status-pill {
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+}
+.pill-open { background: rgba(34, 197, 94, 0.15); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.3); }
+.pill-pre  { background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); }
+.pill-post { background: rgba(128, 128, 128, 0.15); color: #888888; border: 1px solid rgba(128, 128, 128, 0.3); }
 
-/* Signal cards */
-.sig-card { background: #111116; border: 1px solid #1e1e2e; border-radius: 4px;
-             padding: 0.75rem 1rem; margin: 0.25rem 0; }
-.sig-go    { border-left: 3px solid #22c55e; }
-.sig-no    { border-left: 3px solid #ef4444; }
-.sig-wait  { border-left: 3px solid #f59e0b; }
+/* Section Headers */
+h2 {
+    font-size: 0.85rem !important;
+    letter-spacing: 0.14em !important;
+    text-transform: uppercase !important;
+    color: rgba(128, 128, 128, 0.85) !important;
+    margin: 1.4rem 0 0.6rem !important;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.15);
+    padding-bottom: 0.3rem;
+}
 
-/* Metric overrides */
-[data-testid="metric-container"] { background: #111116; border: 1px solid #1e1e2e;
-    border-radius: 4px; padding: 0.6rem 0.8rem; }
-[data-testid="metric-container"] label { color: #6b7280 !important; font-size: 0.7rem;
-    letter-spacing: 0.12em; text-transform: uppercase; }
-[data-testid="metric-container"] [data-testid="stMetricValue"] { color: #e2e8f0 !important;
-    font-size: 1.3rem; font-weight: 600; }
-[data-testid="metric-container"] [data-testid="stMetricDelta"] { font-size: 0.75rem; }
+/* Signal Cards */
+.sig-card {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(128, 128, 128, 0.18);
+    border-radius: 5px;
+    padding: 0.8rem 1rem;
+    margin: 0.25rem 0;
+}
+.sig-go   { border-left: 4px solid #22c55e; }
+.sig-no   { border-left: 4px solid #ef4444; }
+.sig-wait { border-left: 4px solid #f59e0b; }
 
-/* Status badge */
-.badge-green  { display:inline-block; background:#14532d; color:#4ade80;
-                padding:2px 8px; border-radius:3px; font-size:0.72rem; font-weight:600; }
-.badge-red    { display:inline-block; background:#450a0a; color:#f87171;
-                padding:2px 8px; border-radius:3px; font-size:0.72rem; font-weight:600; }
-.badge-amber  { display:inline-block; background:#451a03; color:#fbbf24;
-                padding:2px 8px; border-radius:3px; font-size:0.72rem; font-weight:600; }
-.badge-grey   { display:inline-block; background:#1e1e2e; color:#6b7280;
-                padding:2px 8px; border-radius:3px; font-size:0.72rem; }
+/* Status Badges */
+.badge-green { display:inline-block; background:rgba(34, 197, 94, 0.15); color:#22c55e; border:1px solid rgba(34, 197, 94, 0.3); padding:2px 7px; border-radius:3px; font-size:0.72rem; font-weight:600; }
+.badge-red   { display:inline-block; background:rgba(239, 68, 68, 0.15); color:#ef4444; border:1px solid rgba(239, 68, 68, 0.3); padding:2px 7px; border-radius:3px; font-size:0.72rem; font-weight:600; }
+.badge-amber { display:inline-block; background:rgba(245, 158, 11, 0.15); color:#f59e0b; border:1px solid rgba(245, 158, 11, 0.3); padding:2px 7px; border-radius:3px; font-size:0.72rem; font-weight:600; }
+.badge-grey  { display:inline-block; background:rgba(128, 128, 128, 0.15); color:var(--text-color); border:1px solid rgba(128, 128, 128, 0.25); padding:2px 7px; border-radius:3px; font-size:0.72rem; }
 
-/* Table */
-.dataframe { background:#111116 !important; color:#c8ccd4 !important; font-size:0.75rem; }
-.dataframe th { background:#1e1e2e !important; color:#9ca3af !important; }
+/* Metrics Containers */
+[data-testid="metric-container"] {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(128, 128, 128, 0.18);
+    border-radius: 5px;
+    padding: 0.6rem 0.85rem;
+}
+[data-testid="metric-container"] label {
+    font-size: 0.7rem !important;
+    letter-spacing: 0.1em !important;
+    text-transform: uppercase !important;
+}
 
-/* Input widgets */
-.stSelectbox > div > div, .stNumberInput > div > div > input,
-.stTextInput > div > div > input { background:#1a1a24 !important; color:#e2e8f0 !important;
-    border: 1px solid #2a2a3e !important; font-family: inherit; font-size: 0.8rem; }
-.stButton > button { background:#1a2744; color:#93c5fd; border:1px solid #1e3a5f;
-    border-radius:3px; font-size:0.78rem; letter-spacing:0.08em; padding:0.4rem 0.9rem; }
-.stButton > button:hover { background:#1e3a5f; }
-
-/* Divider */
-hr { border-color: #1e1e2e; margin: 0.8rem 0; }
-
-/* Session banner */
-.session-banner { background:#1a1a24; border:1px solid #2a2a3e; border-radius:4px;
-    padding:0.5rem 1rem; margin-bottom:0.8rem; display:flex; justify-content:space-between;
-    align-items:center; }
+/* Master Gate Banner */
+.gate-banner {
+    margin-top: 0.75rem;
+    padding: 0.75rem 1rem;
+    border-radius: 5px;
+    text-align: center;
+    font-size: 0.95rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+}
+.gate-open {
+    background: rgba(34, 197, 94, 0.15);
+    border: 1px solid #22c55e;
+    color: #22c55e;
+}
+.gate-closed {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid #ef4444;
+    color: #ef4444;
+}
 </style>
 """, unsafe_allow_html=True)
 
-
 # ---------------------------------------------------------------------------
-# Session state initialisation
+# Session state initialization
 # ---------------------------------------------------------------------------
 def _init_state():
     defaults = {
@@ -142,8 +181,6 @@ def _init_state():
         "stop_session":     False,
         "pause":            False,
         "trade_count":      0,
-        "last_refresh":     0.0,
-        "cached_data":      {},
         "psych_confirmed":  False,
     }
     for k, v in defaults.items():
@@ -151,7 +188,6 @@ def _init_state():
             st.session_state[k] = v
 
 _init_state()
-
 
 # ---------------------------------------------------------------------------
 # Data helpers
@@ -164,7 +200,6 @@ def _fetch(ticker: str, period: str, interval: str) -> pd.DataFrame:
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
     return df
 
-
 def _vwap_series(df: pd.DataFrame) -> pd.Series:
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
     pv = tp * df["Volume"]
@@ -175,10 +210,11 @@ def _vwap_series(df: pd.DataFrame) -> pd.Series:
         vwap[mask] = (pv[mask].cumsum() / cv.replace(0, float("nan"))).values
     return vwap
 
-
 def _orb_range(df: pd.DataFrame, method: str) -> dict:
     end_map = {"5min": Time(9, 34), "15min": Time(9, 44), "30min": Time(9, 55)}
     end_t = end_map.get(method, Time(9, 44))
+    if df.empty:
+        return {}
     today = df.index[-1].date()
     mask = (df.index.date == today) & (df.index.time >= Time(9, 30)) & (df.index.time <= end_t)
     bars = df[mask]
@@ -191,7 +227,6 @@ def _orb_range(df: pd.DataFrame, method: str) -> dict:
         "bars_used": len(bars),
     }
 
-
 def _vwap_slope(vwap: pd.Series, lookback: int = 3) -> dict:
     clean = vwap.dropna()
     if len(clean) < lookback:
@@ -202,14 +237,12 @@ def _vwap_slope(vwap: pd.Series, lookback: int = 3) -> dict:
     direction = "up" if slope > thresh else "down" if slope < -thresh else "flat"
     return {"slope": round(slope, 5), "direction": direction}
 
-
 def _kelly(win_rate: float, avg_win: float, avg_loss: float = 1.0) -> float:
     if win_rate <= 0 or win_rate >= 1 or avg_win <= 0 or avg_loss <= 0:
         return 0.0
     r = avg_win / avg_loss
     k = win_rate - (1.0 - win_rate) / r
-    return max(0.0, min(round(k * 0.5, 4), 0.25))   # half-Kelly, capped 25%
-
+    return max(0.0, min(round(k * 0.5, 4), 0.25))
 
 def _rolling_stats(journal: list[dict]) -> dict:
     if not journal:
@@ -219,7 +252,7 @@ def _rolling_stats(journal: list[dict]) -> dict:
     wins = [r for r in rs if r > 0]
     losses = [r for r in rs if r < 0]
     wr = len(wins) / n
-    aw = statistics.mean(wins)   if wins   else 0.0
+    aw = statistics.mean(wins) if wins else 0.0
     al = abs(statistics.mean(losses)) if losses else 0.0
     ev = (wr * aw) - ((1 - wr) * al)
     sharpe = None
@@ -229,20 +262,19 @@ def _rolling_stats(journal: list[dict]) -> dict:
             sharpe = round(statistics.mean(rs) / sd, 3)
     return {"n": n, "wr": wr, "aw": aw, "al": al, "ev": ev, "sharpe": sharpe}
 
-
 def _badge(text: str, colour: str) -> str:
     return f'<span class="badge-{colour}">{text}</span>'
-
 
 def _sig_card(label: str, status: str, detail: str) -> str:
     css = {"GO": "go", "NO": "no", "WAIT": "wait"}.get(status, "wait")
     icon = {"GO": "✓", "NO": "✕", "WAIT": "⊙"}.get(status, "—")
     badge_col = {"GO": "green", "NO": "red", "WAIT": "amber"}.get(status, "grey")
-    return (f'<div class="sig-card sig-{css}">'
-            f'<b style="color:#9ca3af;font-size:0.72rem;letter-spacing:.1em">{label}</b>&nbsp;&nbsp;'
-            f'{_badge(f"{icon} {status}", badge_col)}'
-            f'<br><span style="color:#6b7280;font-size:0.75rem">{detail}</span></div>')
-
+    return (
+        f'<div class="sig-card sig-{css}">'
+        f'<b style="font-size:0.75rem;letter-spacing:0.08em">{label}</b>&nbsp;&nbsp;'
+        f'{_badge(f"{icon} {status}", badge_col)}'
+        f'<br><span style="opacity:0.75;font-size:0.75rem">{detail}</span></div>'
+    )
 
 # ---------------------------------------------------------------------------
 # SIDEBAR
@@ -251,7 +283,7 @@ with st.sidebar:
     st.markdown("## ⬡ SESSION SETUP")
     st.session_state["account"] = st.number_input(
         "Account (£)", value=st.session_state["account"],
-        min_value=100.0, step=100.0, format="%.0f")
+        min_value=100.0, step=500.0, format="%.0f")
     st.session_state["ticker"] = st.text_input(
         "Primary ticker", value=st.session_state["ticker"]).upper()
     st.session_state["orb_method"] = st.selectbox(
@@ -264,14 +296,13 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("## ☰ SESSION CONTROLS")
-
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("↺ Refresh"):
+        if st.button("↺ Refresh", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
     with col2:
-        if st.button("⏹ Reset Session"):
+        if st.button("⏹ Reset", use_container_width=True):
             st.session_state["session_pnl"]   = 0.0
             st.session_state["consec_losses"]  = 0
             st.session_state["stop_session"]   = False
@@ -280,45 +311,42 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
-    st.markdown("## ✓ PRE-SESSION CHECKLIST")
+    st.markdown("## ✓ DISCIPLINE CHECKLIST")
     st.session_state["psych_confirmed"] = st.checkbox(
-        "Discipline script read",
+        "Pre-market script read",
         value=st.session_state["psych_confirmed"])
-    st.caption("PDH/PDL marked  ·  VIX checked  ·  Gap assessed")
-
-    st.markdown("---")
-    st.markdown(
-        '<span style="color:#374151;font-size:0.65rem">'
-        'v2.1.0 · ORB Trading Cockpit · Not financial advice</span>',
-        unsafe_allow_html=True)
-
+    st.caption("PDH/PDL marked  ·  VIX assessed  ·  Gap identified")
 
 # ---------------------------------------------------------------------------
-# MAIN LAYOUT
+# TOP COCKPIT HEADER BAR
 # ---------------------------------------------------------------------------
-
-# Session banner
-now_est = datetime.utcnow() - timedelta(hours=5)   # approx EST
+now_est = datetime.now(timezone.utc) - timedelta(hours=5)
 session_ok = Time(9, 30) <= now_est.time() <= Time(11, 0)
-market_str = "MARKET OPEN — ORB WINDOW ACTIVE" if session_ok else (
-    "PRE-MARKET" if now_est.time() < Time(9, 30) else "POST ORB WINDOW")
-banner_col = "#14532d" if session_ok else "#1a1a24"
-st.markdown(
-    f'<div class="session-banner" style="border-color:{banner_col}">'
-    f'<span style="color:#9ca3af;font-size:0.72rem;letter-spacing:.15em">'
-    f'{market_str}</span>'
-    f'<span style="color:#4b5563;font-size:0.7rem">'
-    f'{now_est.strftime("%H:%M:%S EST")}</span></div>',
-    unsafe_allow_html=True)
+is_pre = now_est.time() < Time(9, 30)
 
-# ── Fetch data ──
+status_label = "MARKET OPEN (ORB ACTIVE)" if session_ok else ("PRE-MARKET (OPENS 09:30 EST)" if is_pre else "POST-ORB WINDOW")
+status_css   = "pill-open" if session_ok else ("pill-pre" if is_pre else "pill-post")
+
+st.markdown(f"""
+<div class="cockpit-header">
+    <div class="header-left">
+        <span class="header-title">📈 ORB TRADING COCKPIT</span>
+        <span class="header-badge">{st.session_state["ticker"]} · {st.session_state["orb_method"].upper()}</span>
+    </div>
+    <div class="header-right">
+        <span class="status-pill {status_css}">{status_label}</span>
+        <span style="font-size:0.75rem;font-weight:600;opacity:0.8;">{now_est.strftime("%H:%M:%S EST")}</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Data Ingestion ──
 ticker = st.session_state["ticker"]
-df_5m = _fetch(ticker, "2d", "5m")
-df_1d = _fetch(ticker, "20d", "1d")
+df_5m  = _fetch(ticker, "2d", "5m")
+df_1d  = _fetch(ticker, "20d", "1d")
 
-# ── SECTION 1: PRE-MARKET INTELLIGENCE ──────────────────────────────────────
-st.markdown("## PRE-MARKET")
-
+# ── 1. PRE-MARKET INTELLIGENCE ──────────────────────────────────────────────
+st.markdown("## PRE-MARKET INTELLIGENCE")
 col_vix, col_pdh, col_pdl, col_gap, col_regime = st.columns(5)
 
 try:
@@ -328,55 +356,54 @@ try:
               else "ELEVATED" if vix_val > 18 else "NORMAL")
     size_mod = (0.25 if vix_val > 35 else 0.50 if vix_val > 25
                 else 0.75 if vix_val > 18 else 1.00)
-    vix_col = "inverse" if vix_val > 25 else "normal"
     col_vix.metric("VIX", f"{vix_val:.1f}", f"{regime}")
-    col_regime.metric("Size modifier", f"{size_mod:.0%}", "of planned size")
+    col_regime.metric("Size Modifier", f"{size_mod:.0%}", "Risk budget scale")
 except Exception:
     col_vix.metric("VIX", "—")
-    regime = "UNKNOWN"; size_mod = 1.0
+    col_regime.metric("Size Modifier", "100%")
+    vix_val = 20.0
+    size_mod = 1.0
 
 if len(df_1d) >= 2:
     pdh = float(df_1d["High"].iloc[-2])
     pdl = float(df_1d["Low"].iloc[-2])
     prev_close = float(df_1d["Close"].iloc[-2])
-    col_pdh.metric("PDH", f"${pdh:.2f}")
-    col_pdl.metric("PDL", f"${pdl:.2f}")
+    col_pdh.metric("PDH (Prev High)", f"${pdh:.2f}")
+    col_pdl.metric("PDL (Prev Low)",  f"${pdl:.2f}")
     if not df_5m.empty:
         today_open = float(df_5m["Open"].iloc[0])
         gap_pct = (today_open - prev_close) / prev_close * 100
         gap_dir = "↑" if gap_pct > 0.1 else "↓" if gap_pct < -0.1 else "→"
-        gap_col = "#22c55e" if gap_pct > 0.1 else "#ef4444" if gap_pct < -0.1 else "#f59e0b"
-        col_gap.metric("Gap", f"{gap_pct:+.2f}%", gap_dir)
+        col_gap.metric("Overnight Gap", f"{gap_pct:+.2f}%", gap_dir)
 else:
-    col_pdh.metric("PDH", "—"); col_pdl.metric("PDL", "—"); col_gap.metric("Gap", "—")
+    col_pdh.metric("PDH", "—")
+    col_pdl.metric("PDL", "—")
+    col_gap.metric("Gap", "—")
 
-# ── SECTION 2: ORB + VWAP ───────────────────────────────────────────────────
-st.markdown("## ORB SETUP")
+# ── 2. ORB & VWAP SETUP ─────────────────────────────────────────────────────
+st.markdown("## ORB & VWAP SETUP")
+
+orb = _orb_range(df_5m, st.session_state["orb_method"]) if not df_5m.empty else {}
+vwap = _vwap_series(df_5m) if not df_5m.empty else pd.Series()
+vs = _vwap_slope(vwap, lookback=3)
+
+col_orb1, col_orb2, col_orb3, col_vwap, col_vs = st.columns(5)
+if orb:
+    col_orb1.metric("ORB High", f"${orb['orb_high']:.2f}")
+    col_orb2.metric("ORB Low",  f"${orb['orb_low']:.2f}")
+    col_orb3.metric("Range Size", f"${orb['orb_size']:.2f}", f"{orb['bars_used']} bars")
+else:
+    col_orb1.metric("ORB High", "Forming…")
+    col_orb2.metric("ORB Low",  "Forming…")
+    col_orb3.metric("Range Size", "—")
 
 if not df_5m.empty:
-    vwap = _vwap_series(df_5m)
-    orb  = _orb_range(df_5m, st.session_state["orb_method"])
-    vs   = _vwap_slope(vwap, lookback=3)
-
-    col_orb1, col_orb2, col_orb3, col_vwap, col_vs = st.columns(5)
-    if orb:
-        col_orb1.metric("ORB High", f"${orb['orb_high']:.2f}")
-        col_orb2.metric("ORB Low",  f"${orb['orb_low']:.2f}")
-        col_orb3.metric("Range",    f"${orb['orb_size']:.2f}",
-                        f"{orb['bars_used']} bars")
-    else:
-        col_orb1.metric("ORB High", "Building…")
-        col_orb2.metric("ORB Low",  "Building…")
-        col_orb3.metric("Range",    "—")
-
     last_close = float(df_5m["Close"].dropna().iloc[-1])
     last_vwap  = float(vwap.dropna().iloc[-1]) if not vwap.dropna().empty else 0.0
     col_vwap.metric("VWAP", f"${last_vwap:.2f}")
-    slope_col = "#22c55e" if vs["direction"] == "up" else "#ef4444" if vs["direction"] == "down" else "#f59e0b"
-    col_vs.metric("VWAP slope", vs["direction"].upper(),
-                  f"{vs['slope']:+.4f}/bar")
+    col_vs.metric("VWAP Slope", vs["direction"].upper(), f"{vs['slope']:+.4f}/bar")
 
-    # Breakout signal
+    # Breakout check
     if orb:
         if last_close > orb["orb_high"]:
             breakout_signal = "long"
@@ -386,36 +413,31 @@ if not df_5m.empty:
             breakout_signal = None
     else:
         breakout_signal = None
+else:
+    last_close = 100.0
+    breakout_signal = None
 
-# ── SECTION 3: AND-GATE SIGNAL STATUS ───────────────────────────────────────
-st.markdown("## SIGNAL GATE")
+# ── 3. SIGNAL AND-GATE ──────────────────────────────────────────────────────
+st.markdown("## SIGNAL AND-GATE")
 
 if df_5m.empty or not orb:
-    st.info("Waiting for data…")
+    st.info("Waiting for market open and ORB range formation (09:30 EST)…")
 else:
-    # Gate 1: ORB breakout
     if breakout_signal == "long":
-        g1_status, g1_detail = "GO",   f"Close ${last_close:.2f} > ORB High ${orb['orb_high']:.2f}"
+        g1_status, g1_detail = "GO", f"Close ${last_close:.2f} > ORB High ${orb['orb_high']:.2f}"
     elif breakout_signal == "short":
-        g1_status, g1_detail = "GO",   f"Close ${last_close:.2f} < ORB Low ${orb['orb_low']:.2f}"
+        g1_status, g1_detail = "GO", f"Close ${last_close:.2f} < ORB Low ${orb['orb_low']:.2f}"
     else:
-        g1_status, g1_detail = "WAIT", f"Close ${last_close:.2f} inside range [{orb['orb_low']:.2f}–{orb['orb_high']:.2f}]"
+        g1_status, g1_detail = "WAIT", f"Price inside range [${orb['orb_low']:.2f} – ${orb['orb_high']:.2f}]"
 
-    # Gate 2: VWAP slope aligned with breakout direction
-    if breakout_signal == "long"  and vs["direction"] == "up":
-        g2_status, g2_detail = "GO",   "VWAP sloping up ↑ — confirms long"
+    if breakout_signal == "long" and vs["direction"] == "up":
+        g2_status, g2_detail = "GO", "VWAP sloping UP ↑ — confirms long breakout"
     elif breakout_signal == "short" and vs["direction"] == "down":
-        g2_status, g2_detail = "GO",   "VWAP sloping down ↓ — confirms short"
+        g2_status, g2_detail = "GO", "VWAP sloping DOWN ↓ — confirms short breakout"
     elif vs["direction"] == "flat":
-        g2_status, g2_detail = "NO",   f"VWAP flat — insufficient institutional momentum"
+        g2_status, g2_detail = "NO", "VWAP flat — insufficient institutional momentum"
     else:
-        g2_status, g2_detail = "NO",   f"VWAP {vs['direction']} conflicts with {breakout_signal or 'no'} signal"
-
-    # Gate 3: Retest (user confirmation)
-    g3_status = "WAIT"
-    g3_detail = "Awaiting manual retest confirmation"
-
-    and_gate = (g1_status == "GO" and g2_status == "GO" and g3_status == "GO")
+        g2_status, g2_detail = "NO", f"VWAP {vs['direction']} conflicts with {breakout_signal or 'no'} breakout"
 
     gc1, gc2, gc3 = st.columns(3)
     with gc1:
@@ -423,131 +445,107 @@ else:
     with gc2:
         st.markdown(_sig_card("② VWAP SLOPE", g2_status, g2_detail), unsafe_allow_html=True)
     with gc3:
-        retest_confirmed = st.checkbox("③ Retest confirmed", value=False)
+        retest_confirmed = st.checkbox("Retest confirmed", value=False)
         g3_status = "GO" if retest_confirmed else "WAIT"
-        g3_detail = "Level held, confirmation candle closed" if retest_confirmed else "Waiting for retest + candle close"
-        st.markdown(_sig_card("③ RETEST", g3_status, g3_detail), unsafe_allow_html=True)
+        g3_detail = "Level held & closed away" if retest_confirmed else "Waiting for level touch & confirmation"
+        st.markdown(_sig_card("③ RETEST MECHANIC", g3_status, g3_detail), unsafe_allow_html=True)
 
     and_gate = (g1_status == "GO" and g2_status == "GO" and g3_status == "GO")
-    gate_html = (
-        '<div style="margin-top:0.6rem;padding:0.6rem 1rem;'
-        f'background:{"#14532d" if and_gate else "#450a0a"};'
-        'border-radius:4px;text-align:center">'
-        f'<b style="font-size:0.95rem;letter-spacing:.15em;color:{"#4ade80" if and_gate else "#f87171"}">'
-        f'{"✓  AND-GATE OPEN — ENTRY PERMITTED" if and_gate else "✕  AND-GATE CLOSED — NO ENTRY"}'
-        '</b></div>'
-    )
-    st.markdown(gate_html, unsafe_allow_html=True)
+    gate_cls = "gate-open" if and_gate else "gate-closed"
+    gate_txt = "✓  AND-GATE OPEN — EXECUTION PERMITTED" if and_gate else "✕  AND-GATE CLOSED — NO ENTRY"
+    st.markdown(f'<div class="gate-banner {gate_cls}">{gate_txt}</div>', unsafe_allow_html=True)
 
-    in_orb_window = (Time(9, 30) <= now_est.time() <= Time(11, 0))
-    if not in_orb_window:
-        st.warning("⏰ Outside ORB window (09:30–11:00 EST). No new entries.")
-
-# ── SECTION 4: POSITION CALCULATOR ──────────────────────────────────────────
+# ── 4. POSITION CALCULATOR ──────────────────────────────────────────────────
 st.markdown("## POSITION CALCULATOR")
 
-pc1, pc2 = st.columns([1, 1])
+pc1, pc2 = st.columns(2)
 with pc1:
-    entry_price = st.number_input("Entry price ($)", value=float(last_close) if not df_5m.empty else 100.0, step=0.01, format="%.2f")
-    stop_price  = st.number_input("Stop price ($)",  value=round(entry_price * 0.995, 2), step=0.01, format="%.2f")
-    target_rr   = st.slider("Target R:R", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
+    entry_price = st.number_input("Planned Entry ($)", value=float(last_close), step=0.05, format="%.2f")
+    stop_price  = st.number_input("Stop Price ($)", value=round(entry_price * 0.995, 2), step=0.05, format="%.2f")
+    target_rr   = st.slider("Target R:R Ratio", min_value=1.0, max_value=4.0, value=2.0, step=0.5)
 
 with pc2:
     account = st.session_state["account"]
     risk_mode = st.session_state["risk_mode"]
     risk_dist = abs(entry_price - stop_price)
 
-    # Risk fraction
     if risk_mode == "Fixed 1%":
         risk_frac = 0.01
     elif risk_mode == "Fixed 0.5% (commodity)":
         risk_frac = 0.005
     else:
-        # Half-Kelly from journal
         stats = _rolling_stats(st.session_state["journal"])
-        if stats.get("n", 0) >= 50:
-            risk_frac = _kelly(stats["wr"], stats["aw"], stats["al"])
-        else:
-            risk_frac = 0.01
-            st.caption(f"⚠ Kelly needs 50+ trades ({stats.get('n',0)} logged). Using 1%.")
+        risk_frac = _kelly(stats.get("wr", 0.45), stats.get("aw", 2.0), stats.get("al", 1.0)) if stats.get("n", 0) >= 50 else 0.01
 
-    # Apply VIX modifier
     effective_risk = risk_frac * size_mod
     risk_amount    = account * effective_risk
-    units = risk_amount / risk_dist if risk_dist > 1e-6 else 0.0
+    units          = risk_amount / risk_dist if risk_dist > 1e-6 else 0.0
 
-    # Target & breakeven
-    is_long = stop_price < entry_price
-    reward_dist = risk_dist * target_rr
+    is_long      = stop_price < entry_price
+    reward_dist  = risk_dist * target_rr
     target_price = round((entry_price + reward_dist) if is_long else (entry_price - reward_dist), 2)
     be_price     = round((entry_price + reward_dist * 0.5) if is_long else (entry_price - reward_dist * 0.5), 2)
 
+    col_u, col_r, col_t, col_be = st.columns(4)
+    col_u.metric("Position Units", f"{units:.0f} shs")
+    col_r.metric("Capital at Risk", f"£{risk_amount:.0f}", f"{effective_risk:.2%} eff.")
+    col_t.metric("Target Price", f"${target_price:.2f}", f"{target_rr:.1f}R reward")
+    col_be.metric("Breakeven Trigger", f"${be_price:.2f}", "Move stop here")
+
     # Ladder targets
     ladders = []
-    for r in [1.0, 2.0, 3.0]:
-        p = round((entry_price + r * risk_dist) if is_long else (entry_price - r * risk_dist), 2)
-        ladders.append({"R": f"{r:.0f}R", "Price": f"${p:.2f}", "Exit": "33%"})
+    for r_lvl in [1.0, 2.0, 3.0]:
+        p = round((entry_price + r_lvl * risk_dist) if is_long else (entry_price - r_lvl * risk_dist), 2)
+        ladders.append({"Target": f"{r_lvl:.0f}R", "Price": f"${p:.2f}", "Scale Out": "33%"})
 
-    col_u, col_r, col_t, col_be = st.columns(4)
-    col_u.metric("Units",           f"{units:.0f}")
-    col_r.metric("£ at risk",       f"£{risk_amount:.0f}",  f"{effective_risk:.1%} eff.")
-    col_t.metric("Target",          f"${target_price:.2f}", f"2:1 → {target_rr:.1f}R")
-    col_be.metric("Breakeven move", f"${be_price:.2f}",     "move stop here")
-
-    st.markdown("**Ladder exits (VWAP + Ladder):**")
+    st.caption("Partial Scale-Out Ladder (VWAP + Ladder Rule):")
     st.dataframe(pd.DataFrame(ladders), hide_index=True, use_container_width=True)
 
-# ── SECTION 5: RISK STATE ────────────────────────────────────────────────────
-st.markdown("## SESSION RISK")
+# ── 5. SESSION RISK MONITOR ─────────────────────────────────────────────────
+st.markdown("## SESSION RISK STATE")
 
 rs1, rs2, rs3, rs4 = st.columns(4)
-session_pnl_pct = st.session_state["session_pnl"] / account * 100
-rs1.metric("Session P&L", f"£{st.session_state['session_pnl']:.0f}",
-           f"{session_pnl_pct:+.1f}%")
-rs2.metric("Consec. losses", str(st.session_state["consec_losses"]),
-           "pause if 3" if st.session_state["consec_losses"] < 3 else "⏸ PAUSE NOW")
-rs3.metric("Trades today", str(st.session_state["trade_count"]))
-rs4.metric("Daily limit", "£300 (3%)", f"£{account * 0.03:.0f} max loss")
+session_pnl_pct = (st.session_state["session_pnl"] / max(account, 1)) * 100
+rs1.metric("Session P&L", f"£{st.session_state['session_pnl']:.0f}", f"{session_pnl_pct:+.2f}%")
+rs2.metric("Consecutive Losses", str(st.session_state["consec_losses"]), "Pause if 3" if st.session_state["consec_losses"] < 3 else "⏸ PAUSE NOW")
+rs3.metric("Trades Taken", str(st.session_state["trade_count"]))
+rs4.metric("Daily Max Loss", f"£{account * 0.03:.0f}", "3% hard limit")
 
 if st.session_state["stop_session"]:
-    st.error("🛑 SESSION STOPPED — daily loss limit hit. Close the platform.")
+    st.error("🛑 SESSION HALTED — Daily loss limit reached. Stand down.")
 elif st.session_state["pause"]:
-    st.warning("⏸ PAUSE 30 MINUTES — 3 consecutive losses. No new entries.")
+    st.warning("⏸ MANDATORY 30-MIN PAUSE — 3 consecutive losses.")
 elif not st.session_state["psych_confirmed"]:
-    st.warning("⚠ Read the pre-session discipline script before trading.")
+    st.info("ℹ️ Confirm the pre-session checklist in the sidebar to authorize entries.")
 else:
-    st.success("✅ Trading permitted.")
+    st.success("✅ Operational risk within parameters.")
 
-# ── SECTION 6: TRADE JOURNAL ─────────────────────────────────────────────────
+# ── 6. TRADE JOURNAL ────────────────────────────────────────────────────────
 st.markdown("## TRADE JOURNAL")
 
-with st.expander("Log a trade", expanded=False):
+with st.expander("📝 Log a Completed Trade", expanded=False):
     lc1, lc2, lc3 = st.columns(3)
     log_ticker  = lc1.text_input("Ticker", value=ticker, key="log_ticker").upper()
     log_dir     = lc1.selectbox("Direction", ["long", "short"], key="log_dir")
-    log_entry   = lc2.number_input("Entry ($)", value=entry_price, key="log_entry")
-    log_stop    = lc2.number_input("Stop ($)",  value=stop_price,  key="log_stop")
-    log_exit    = lc3.number_input("Exit ($)",  value=entry_price, key="log_exit")
+    log_entry   = lc2.number_input("Fill Entry ($)", value=entry_price, key="log_entry")
+    log_stop    = lc2.number_input("Fill Stop ($)", value=stop_price, key="log_stop")
+    log_exit    = lc3.number_input("Fill Exit ($)", value=entry_price, key="log_exit")
     log_outcome = lc3.selectbox("Outcome", ["win", "loss", "breakeven"], key="log_outcome")
-    log_notes   = st.text_input("Notes", key="log_notes")
+    log_notes   = st.text_input("Session Notes", key="log_notes")
 
-    if st.button("Log trade"):
+    if st.button("Commit Trade to Journal", use_container_width=True):
         risk_d = abs(log_entry - log_stop)
-        if risk_d > 1e-6:
-            actual_r = round((log_exit - log_entry) / risk_d *
-                              (1 if log_dir == "long" else -1), 3)
-        else:
-            actual_r = 0.0
+        actual_r = round((log_exit - log_entry) / risk_d * (1 if log_dir == "long" else -1), 3) if risk_d > 1e-6 else 0.0
         trade = {
-            "date":     str(date.today()),
-            "ticker":   log_ticker,
+            "date":      str(date.today()),
+            "ticker":    log_ticker,
             "direction": log_dir,
-            "entry":    log_entry,
-            "stop":     log_stop,
-            "exit":     log_exit,
-            "actual_r": actual_r,
-            "outcome":  log_outcome,
-            "notes":    log_notes,
+            "entry":     log_entry,
+            "stop":      log_stop,
+            "exit":      log_exit,
+            "actual_r":  actual_r,
+            "outcome":   log_outcome,
+            "notes":     log_notes,
         }
         st.session_state["journal"].append(trade)
         st.session_state["session_pnl"] += actual_r * risk_amount
@@ -558,32 +556,29 @@ with st.expander("Log a trade", expanded=False):
             st.session_state["consec_losses"] = 0
         if st.session_state["session_pnl"] / account <= -0.03:
             st.session_state["stop_session"] = True
-        st.session_state["pause"] = (st.session_state["consec_losses"] >= 3
-                                      and not st.session_state["stop_session"])
+        st.session_state["pause"] = (st.session_state["consec_losses"] >= 3 and not st.session_state["stop_session"])
         st.success(f"Logged: {actual_r:+.2f}R")
         st.rerun()
 
-# Rolling stats
+# Journal Stats & History Table
 if st.session_state["journal"]:
     stats = _rolling_stats(st.session_state["journal"])
     sc1, sc2, sc3, sc4 = st.columns(4)
-    sc1.metric("Win rate",     f"{stats.get('wr', 0):.1%}",
-               "▲" if stats.get("wr", 0) > 0.34 else "▼ below breakeven")
-    sc2.metric("EV/trade",     f"{stats.get('ev', 0):+.3f}R",
-               "positive" if stats.get("ev", 0) > 0 else "negative")
-    sc3.metric("Sharpe",       str(stats.get("sharpe", "—")))
-    sc4.metric("Trades logged", str(stats.get("n", 0)),
-               f"{max(0, 100 - stats.get('n',0))} to milestone")
+    sc1.metric("Win Rate", f"{stats.get('wr', 0):.1%}", "Target > 40%")
+    sc2.metric("EV per Trade", f"{stats.get('ev', 0):+.3f}R", "Positive EV required")
+    sc3.metric("Sharpe Ratio", str(stats.get("sharpe", "—")))
+    sc4.metric("Logged Trades", str(stats.get("n", 0)), f"{max(0, 100 - stats.get('n', 0))} to milestone")
 
-    df_j = pd.DataFrame(st.session_state["journal"])
-    df_j = df_j[["date", "ticker", "direction", "entry", "exit", "actual_r", "outcome"]]
+    df_j = pd.DataFrame(st.session_state["journal"])[["date", "ticker", "direction", "entry", "exit", "actual_r", "outcome"]]
+
+    # Pandas 2.2+ safe Styler map
     styler = df_j.style
     map_func = getattr(styler, "map", getattr(styler, "applymap", None))
     if map_func:
         styler = map_func(
-            lambda v: "color:#4ade80" if v == "win" else "color:#f87171" if v == "loss" else "",
+            lambda v: "color:#22c55e;font-weight:600;" if v == "win" else ("color:#ef4444;font-weight:600;" if v == "loss" else ""),
             subset=["outcome"]
         )
     st.dataframe(styler, use_container_width=True, hide_index=True)
 else:
-    st.caption("No trades logged this session.")
+    st.caption("No trades logged in current session.")

@@ -1,192 +1,188 @@
-# GitHub Setup Guide
+# Trading Income Project — GitHub Setup & Deployment Guide
 
-## 1. Create the repository on GitHub
-
-Go to [github.com/new](https://github.com/new) and fill in:
-
-| Field | Value |
-|---|---|
-| Repository name | `trading-income-project` (or your preferred name) |
-| Visibility | **Private** (recommended — trading strategies are sensitive) |
-| Initialise with README | **No** — we already have one |
-| Add .gitignore | **No** — we already have one |
-| Choose a licence | Up to you |
-
-Click **Create repository**. GitHub will show you the empty repo page — leave it open.
+This guide details how to version-control the codebase, safeguard private credentials and databases, and deploy the system onto a fresh Intel NUC machine.
 
 ---
 
-## 2. Set up Git on the NUC (first time only)
+## 1. Create the Repository on GitHub
+
+1. Go to [github.com/new](https://github.com/new).
+2. Set the repository details:
+
+| Field | Value |
+|---|---|
+| **Repository name** | `trading-income-project` |
+| **Visibility** | **Private** (Recommended — trading strategies and logs contain proprietary alpha) |
+| **Initialize with README** | **No** (The project already contains an updated `README.md`) |
+| **Add .gitignore** | **No** (The project already contains a customized `.gitignore`) |
+| **Choose a license** | None / Private |
+
+3. Click **Create repository**. Keep the resulting GitHub page open.
+
+---
+
+## 2. Option A: Automated Git Setup (Recommended)
+
+The project includes an interactive setup helper that validates security exclusions before pushing:
 
 ```bash
-# Install git if needed
-sudo apt install git -y
+chmod +x git_setup.sh
+./git_setup.sh
+```
 
-# Set your identity (shown in commit history)
+### What `git_setup.sh` Does:
+1. Verifies that `.env`, `DATA/*.db`, `~/models/`, and `.venv/` are excluded by `.gitignore`.
+2. Initializes Git and sets the default branch to `main`.
+3. Creates the initial baseline commit.
+4. Prompts for your GitHub repository URL (HTTPS or SSH) and pushes the codebase.
+
+---
+
+## 3. Option B: Manual Git Setup & First Push
+
+If you prefer running Git commands manually:
+
+### Step 1: Configure Git Identity (First time only)
+```bash
 git config --global user.name  "Your Name"
 git config --global user.email "your@email.com"
 ```
 
----
-
-## 3. Authenticate with GitHub
-
-**Option A — Personal Access Token (simplest, works immediately)**
-
-1. Go to GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
-2. Click **Generate new token (classic)**
-3. Scopes: tick `repo` (full control of private repos)
-4. Copy the token — you only see it once
-
-When Git asks for a password, paste the token.
-
-To avoid entering it every time:
-```bash
-git config --global credential.helper store
-# After your first push, credentials are saved to ~/.git-credentials
-```
-
-**Option B — SSH key (more secure, no token expiry)**
+### Step 2: Initialize, Commit, and Link Remote
+Run from your project root:
 
 ```bash
-# Generate a key
-ssh-keygen -t ed25519 -C "your@email.com"
-
-# Copy the public key
-cat ~/.ssh/id_ed25519.pub
-
-# Paste it into GitHub → Settings → SSH and GPG keys → New SSH key
-
-# Test the connection
-ssh -T git@github.com
-```
-
-If using SSH, replace the remote URL in Step 4 with the SSH form:
-`git@github.com:YOUR_USERNAME/trading-income-project.git`
-
----
-
-## 4. Initialise and push
-
-Run these from inside the project directory (where `README.md` lives):
-
-```bash
-cd ~/trading/trading-income-project    # adjust path if different
+cd ~/github/trading-income-project
 
 git init
-git add .
-git commit -m "Initial commit — trading income project v1"
-
-# Replace YOUR_USERNAME with your GitHub username
-git remote add origin https://github.com/YOUR_USERNAME/trading-income-project.git
-
 git branch -M main
+
+# Verify sensitive files are ignored before staging
+git status
+
+# Stage source code, tests, and documentation
+git add .
+git commit -m "Initial commit — Trading Income Project v2.4"
+
+# Link your remote repository (replace with your GitHub username)
+git remote add origin https://github.com/<YOUR_USERNAME>/trading-income-project.git
+
+# Push to GitHub
 git push -u origin main
 ```
 
-On success you'll see something like:
+---
+
+## 4. GitHub Authentication
+
+### Option 1: Personal Access Token (HTTPS)
+1. Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**.
+2. Click **Generate new token (classic)**.
+3. Select scope: **`repo`** (Full control of private repositories).
+4. Copy the generated token (`ghp_...`).
+5. When Git prompts for your password in the terminal, **paste the token**.
+
+To avoid typing the token on every push:
+```bash
+git config --global credential.helper store
 ```
-Enumerating objects: 29, done.
-Counting objects: 100% (29/29), done.
-Branch 'main' set up to track remote branch 'main' from 'origin'.
+
+### Option 2: SSH Key (Recommended & Permanent)
+```bash
+# 1. Generate SSH key
+ssh-keygen -t ed25519 -C "your@email.com"
+
+# 2. Copy the public key
+cat ~/.ssh/id_ed25519.pub
+
+# 3. Add to GitHub: Settings → SSH and GPG keys → New SSH key
+
+# 4. Test connection
+ssh -T git@github.com
+
+# 5. Set origin to SSH URL
+git remote set-url origin git@github.com:<YOUR_USERNAME>/trading-income-project.git
 ```
 
 ---
 
-## 5. What the .gitignore protects
+## 5. What `.gitignore` Protects (Security Boundaries)
 
-The `.gitignore` already excludes everything sensitive:
+The project's `.gitignore` enforces strict separation between application source code and private runtime data:
 
-| Excluded | Why |
+| Excluded Pattern | Why It Is Excluded |
 |---|---|
-| `.env` | Contains API keys — never commit this |
-| `DATA/` | SQLite databases — large and contain private trade data |
-| `*.db` | All database files |
-| `LOGS/` | Log files |
-| `markov_state.json` | Generated model state — rebuilt automatically |
-| `candle_ngram.json` | Generated — rebuilt by historical_sim |
-| `outcome_mc.json` | Generated — rebuilt by historical_sim |
-| `__pycache__/` | Python bytecode |
-| `venv/`, `.venv/` | Virtual environments |
+| `.env`, `.env.*` | Contains API keys (`ALPACA_SECRET_KEY`, `FRED_API_KEY`, Discord webhooks) |
+| `DATA/*.db`, `*.db-wal` | Local SQLite stores containing real execution records and trade journals |
+| `~/models/`, `.ov_cache/` | Heavy model binaries (`.bin`, `.xml`) — downloaded directly from Hugging Face |
+| `LOGS/`, `*.log` | Runtime execution logs and PID trackers |
+| `.venv/`, `venv/` | Python virtual environment binaries |
+| `__pycache__/` | Compiled Python bytecode |
 
-**Always verify before pushing:**
-```bash
-git status    # should show only src/*.py, docs/, and config files
-```
+**Sanity Check:**
+Before pushing, run `git status`. It should only list files inside `src/`, `docs/`, shell scripts, `README.md`, `requirements.txt`, and `.env.example`.
 
 ---
 
-## 6. Day-to-day workflow
+## 6. Day-to-Day Development Workflow
 
 ```bash
-# After making changes to a file
-git add src/trading_engine.py          # stage a specific file
-git add src/                           # stage all changes in src/
-git commit -m "Fix VWAP slope calculation in morning brief"
+# 1. Check modified files
+git status
+
+# 2. Stage changes
+git add src/session_analyser.py
+# Or stage all code updates:
+git add src/ docs/
+
+# 3. Commit with a descriptive message
+git commit -m "Update Staged Dossier pipeline with live tok/s telemetry"
+
+# 4. Push to GitHub
 git push
-
-# Pull changes from another machine
-git pull
-```
-
-**Good commit message format:**
-```
-Add fred_store.py with FRED macro data download
-Fix: correct ORB range calculation on early-close days
-Update: wire sentiment_store into runner.py daily schedule
 ```
 
 ---
 
-## 7. Useful Git commands
+## 7. Deploying to a Fresh NUC or Second Host
+
+To replicate this environment on another machine:
 
 ```bash
-git status            # what's changed but not committed
-git diff              # show exact changes line by line
-git log --oneline     # compact commit history
-git log --oneline -10 # last 10 commits
-
-git stash             # temporarily shelve uncommitted changes
-git stash pop         # restore shelved changes
-
-# If you accidentally add something you shouldn't have
-git reset HEAD .env   # unstage a file
-git rm --cached DATA/ # stop tracking a directory (also add to .gitignore)
-```
-
----
-
-## 8. Pull the latest version to another machine
-
-```bash
-# On a second machine (e.g. your laptop)
-git clone https://github.com/YOUR_USERNAME/trading-income-project.git
+# 1. Clone repository
+git clone https://github.com/<YOUR_USERNAME>/trading-income-project.git
 cd trading-income-project
 
-# Run setup
+# 2. Run the unified setup (handles drivers, .venv, keys, models, and data bootstrap)
+chmod +x setup.sh launch_models.sh verify.sh
 ./setup.sh
 
-# Create and fill in your .env (this is machine-specific, never in git)
-cp .env.example .env
-nano .env
+# 3. Launch model servers & Open WebUI
+./launch_models.sh --with-webui
+
+# 4. Run verification suite
+./verify.sh
+
+# 5. Start automated master runner
+python3 src/runner.py
 ```
 
 ---
 
-## 9. Branch strategy (optional, for disciplined development)
+## 8. Feature Branch Workflow
+
+For disciplined strategy and quant development:
 
 ```bash
-# Create a feature branch before making changes
-git checkout -b feature/ladder-exits
+# 1. Create a feature branch
+git checkout -b feature/vwap-trailing-stop
 
-# Work, commit, test
+# 2. Develop, test, and commit
 git add src/trading_engine.py
-git commit -m "Add ladder exit mechanic at 1R/2R/3R"
+git commit -m "Enhance VWAP trailing stop with ladder exit levels"
 
-# Merge back to main when ready
+# 3. Merge back to main when verified
 git checkout main
-git merge feature/ladder-exits
+git merge feature/vwap-trailing-stop
 git push
 ```
-
-This keeps `main` always in a known-good state.

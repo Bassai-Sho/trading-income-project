@@ -8,11 +8,11 @@
 
 ## 1. System Overview
 
-The Trading Income Project is an automated, evidence-based intraday trading system designed to trade SPY (S&P 500 ETF) on a 15-minute Opening Range Breakout (ORB) strategy with VWAP confirmation. 
+The Trading Income Project is an automated, evidence-based intraday trading system designed to trade SPY (S&P 500 ETF) on a 15-minute Opening Range Breakout (ORB) strategy with VWAP confirmation.
 
-The architecture enforces strict separation between:
-1. **Deterministic Execution:** Real-time signal generation, fill simulation, risk throttling, and database logging (pure Python/SQLite, zero LLM dependency).
-2. **Cognitive Audit (D-A-C Pipeline):** Nightly post-market review using a two-model local architecture (Lead Strategist + Independent Adversary) running on the local Intel Arc GPU.
+The system is designed around two principles:
+1. **Single-Command Orchestration:** `runner.py` (or the `trading-runner` systemd daemon) manages the entire daily lifecycle automatically according to the US market clock.
+2. **Deterministic Execution + Cognitive Review:** Real-time signal execution is 100% deterministic (pure Python/SQLite, zero LLM latency). Nightly post-market review uses a dual-model local LLM architecture (Lead Quant Reasoner + Independent Adversary) running on the local Intel Arc GPU.
 
 ---
 
@@ -85,9 +85,9 @@ The Adversarial Validator enforces this hard rule:
 
 | # | Component | Root Cause | Resolution |
 | :--- | :--- | :--- | :--- |
-| **1** | `prepare_host.sh` | Heuristic `.bin > 100MB` check flagged incomplete downloads as finished. | Replaced with native `ov.Core().read_model()` graph integrity inspection. |
-| **2** | `prepare_host.sh` | `hf_transfer` deprecated in `huggingface_hub`. | Removed `hf_transfer` and enabled `HF_XET_HIGH_PERFORMANCE=1`. |
-| **3** | `prepare_host.sh` | Model card opset-16 mismatch on Qwen3.8 caused `SIGSEGV` exit 139. | Added OpenVINO GenAI nightly wheel index to host setup. |
+| **1** | `prepare_host.sh` / `setup.sh` | Heuristic `.bin > 100MB` check flagged incomplete downloads as finished. | Replaced with native `ov.Core().read_model()` graph integrity inspection. Merged into unified `setup.sh`. |
+| **2** | `setup.sh` | `hf_transfer` deprecated in `huggingface_hub`. | Removed `hf_transfer` and enabled `HF_XET_HIGH_PERFORMANCE=1`. |
+| **3** | `setup.sh` | Model card opset-16 mismatch on Qwen3.8 caused `SIGSEGV` exit 139. | Added OpenVINO GenAI nightly wheel index to host setup. |
 | **4** | `setup.sh` | Unbound variable `$OLLAMA_INSTALLED` triggered crash under `set -u`. | Removed variable and validated OpenVINO ports 8000/8001 directly. |
 | **5** | `setup.sh` | Missing `LOGS/pids` directory caused process manager failures. | Added `LOGS/pids` to self-healing directory creation list. |
 | **6** | `launch_models.sh` | Unclosed quotes around `--with-webui` output broke bash parsing. | Cleaned quoting, added PID management for WebUI. |
@@ -108,9 +108,8 @@ The Adversarial Validator enforces this hard rule:
 
 ---
 
-## 6. Current Operational Checklist
+## 6. Operational Execution
 
-1. **Verify Services:** `./launch_models.sh --status` confirms ports 8000, 8001, and 8080 are `READY`.
-2. **Pre-Market (09:00 EST):** `python3 src/morning_brief.py --ticker SPY` outputs regime and Go/No-Go score.
-3. **Execution Window (09:30–11:00 EST):** `python3 src/runner.py` handles live 60-second polling and execution simulation.
-4. **Post-Market (15:35 EST):** `python3 src/session_analyser.py --preset nuc-pair1` compiles the session dossier and writes verified findings to `DATA/paper_account.db`.
+* **Unified Bootstrap:** `./setup.sh` handles host runtime, virtual environment, API keys, model downloads, and one-shot data bootstrap.
+* **Server Verification:** `./launch_models.sh --with-webui` and `./verify.sh` confirm all endpoints and display live `tok/s` metrics (7/7 passed).
+* **Automated Master Loop:** `python3 src/runner.py` or `sudo systemctl start trading-runner` handles daily scheduling and execution automatically.

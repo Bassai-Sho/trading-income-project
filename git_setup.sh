@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Trading Income Project — GitHub Setup
+# Trading Income Project — Automated Git Setup & Push
 # =============================================================================
-# Run once, from the project root, after unzipping the package.
-# Initialises git, creates the first commit, and pushes to GitHub.
-#
-# Prerequisites:
-#   1. Create an empty GitHub repository at github.com/new (no README)
-#   2. Have your GitHub Personal Access Token ready (or SSH key configured)
+# Run once from project root to initialise git, apply security guardrails,
+# create the initial baseline commit, and push to GitHub.
 #
 # Usage:
 #   chmod +x git_setup.sh
@@ -21,20 +17,23 @@ RESET="\033[0m"
 
 ok()   { echo -e "  ${GREEN}✓${RESET}  $*"; }
 warn() { echo -e "  ${YELLOW}⚠${RESET}  $*"; }
+fail() { echo -e "  ${RED}✗${RESET}  $*"; }
 info() { echo -e "  ${DIM}    $*${RESET}"; }
 hdr()  { echo -e "\n${BOLD}${CYAN}── $* ${RESET}"; }
 
-# ── Must run from project root ─────────────────────────────────────────────
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
 [[ -f "README.md" && -d "src" ]] || {
-    echo -e "${RED}Run this from the project root (where README.md lives).${RESET}"
+    fail "Run this from the project root (where README.md lives)."
     exit 1
 }
 
 echo -e "\n${BOLD}Trading Income Project — GitHub Setup${RESET}"
-echo -e "${DIM}Initialises git and pushes to your GitHub repository.${RESET}"
+echo -e "${DIM}Initialises git, verifies security boundaries, and pushes to GitHub.${RESET}"
 
-# ── Check git is installed ─────────────────────────────────────────────────
-hdr "Checking git"
+# ── 1. Check Git Installation ────────────────────────────────────────────────
+hdr "1 / 5  Checking Git Installation"
 if ! command -v git &>/dev/null; then
     warn "Git not found"
     read -r -p "     Install git now? (sudo required) [Y/n] " reply
@@ -42,159 +41,177 @@ if ! command -v git &>/dev/null; then
     if [[ "$reply" =~ ^[Yy]$ ]]; then
         sudo apt-get install -y git
     else
-        echo "Install git manually: sudo apt install git"
+        fail "Git is required. Install with: sudo apt install git"
         exit 1
     fi
 fi
-ok "Git $(git --version | grep -oP '[\d.]+')"
+ok "Git $(git --version | grep -oP '[\d.]+' | head -n1) available"
 
-# ── Git identity ───────────────────────────────────────────────────────────
-hdr "Git identity"
-CURRENT_NAME=$(git config --global user.name  2>/dev/null || echo "")
+# ── 2. Configure Git Identity ─────────────────────────────────────────────────
+hdr "2 / 5  Git Identity Configuration"
+CURRENT_NAME=$(git config --global user.name 2>/dev/null || echo "")
 CURRENT_EMAIL=$(git config --global user.email 2>/dev/null || echo "")
 
 if [[ -n "$CURRENT_NAME" && -n "$CURRENT_EMAIL" ]]; then
     ok "Identity: $CURRENT_NAME <$CURRENT_EMAIL>"
 else
     warn "Git identity not set"
-    read -r -p "     Your name (shown in commits): "  GIT_NAME
-    read -r -p "     Your email: "                    GIT_EMAIL
-    git config --global user.name  "$GIT_NAME"
+    read -r -p "     Enter your Git Name (shown in commits): " GIT_NAME
+    read -r -p "     Enter your Git Email: " GIT_EMAIL
+    git config --global user.name "$GIT_NAME"
     git config --global user.email "$GIT_EMAIL"
+    CURRENT_EMAIL="$GIT_EMAIL"
     ok "Identity set: $GIT_NAME <$GIT_EMAIL>"
 fi
 
-# ── Initialise git repo ────────────────────────────────────────────────────
-hdr "Initialising repository"
+# ── 3. Hardened .gitignore Enforcement ────────────────────────────────────────
+hdr "3 / 5  Enforcing Security Guardrails (.gitignore)"
 
-if [[ -d ".git" ]]; then
-    ok "Git already initialised"
+if [[ ! -f ".gitignore" ]] || ! grep -q "DATA/" .gitignore; then
+    cat << 'EOF' > .gitignore
+# ── Environment & Credentials (NEVER COMMIT) ──────────────────────────────────
+.env
+.env.*
+!.env.example
+.webui_secret_key
+kernel.errors.txt
+
+# ── Generated Databases & Working Data ───────────────────────────────────────
+DATA/
+*.db
+*.db-shm
+*.db-wal
+
+# ── Model Weights & OpenVINO Cache ───────────────────────────────────────────
+*.bin
+*.xml
+.ov_cache/
+models/
+~/models/
+
+# ── Runtime State & Logs ──────────────────────────────────────────────────────
+LOGS/
+*.log
+*.tmp
+*.bak
+.model_pair
+markov_state.json
+candle_ngram.json
+outcome_mc.json
+
+# ── Open WebUI Local State ───────────────────────────────────────────────────
+.webui/
+webui/
+
+# ── Python & Environments ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Streamlit & IDEs ─────────────────────────────────────────────────────────
+.streamlit/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+EOF
+    ok "Created hardened .gitignore (excludes API keys, models, and databases)"
 else
-    git init
-    ok "Git initialised"
+    ok ".gitignore security rules verified"
 fi
 
-# Set default branch to main
-git symbolic-ref HEAD refs/heads/main 2>/dev/null || true
+# ── 4. Initialise & Stage ─────────────────────────────────────────────────────
+hdr "4 / 5  Initialising & Committing Codebase"
 
-# ── Safety check: nothing sensitive staged ─────────────────────────────────
-hdr "Safety check"
-if [[ -f ".env" ]] && git ls-files --error-unmatch .env &>/dev/null 2>&1; then
-    warn ".env is tracked! Removing from git now..."
-    git rm --cached .env
-    ok ".env removed from tracking"
+if [[ ! -d ".git" ]]; then
+    git init -b main
+    ok "Git repository initialised on branch 'main'"
 else
-    ok ".env not tracked (good — it contains your API keys)"
+    ok "Git repository already initialised"
+    git branch -M main 2>/dev/null || true
 fi
 
-# Verify DATA/ is excluded
-if git check-ignore -q DATA/ 2>/dev/null; then
-    ok "DATA/ excluded by .gitignore (SQLite databases stay local)"
-else
-    warn "DATA/ is not excluded — checking .gitignore..."
-    echo "DATA/" >> .gitignore
-    ok "Added DATA/ to .gitignore"
-fi
-
-# ── First commit ───────────────────────────────────────────────────────────
-hdr "Creating first commit"
+# Untrack any accidentally cached sensitive files
+for sensitive in .env DATA/ LOGS/; do
+    if git ls-files --error-unmatch "$sensitive" >/dev/null 2>&1; then
+        git rm -r --cached "$sensitive" >/dev/null 2>&1 || true
+        warn "Removed $sensitive from git staging (protected by .gitignore)"
+    fi
+done
 
 git add .
-STAGED=$(git diff --cached --name-only | wc -l)
-ok "$STAGED files staged"
+STAGED_COUNT=$(git diff --cached --name-only | wc -l)
 
-echo ""
-info "Files that will be committed:"
-git diff --cached --name-only | head -20 | while read f; do info "  $f"; done
-echo ""
+if (( STAGED_COUNT > 0 )); then
+    git commit -m "Initial commit — Trading Income Project v2.4 (OpenVINO GenAI, Staged Dossier D-A-C, 58GB VRAM)"
+    ok "Committed $STAGED_COUNT files cleanly"
+else
+    info "No unstaged changes to commit"
+fi
 
-git commit -m "Initial commit — trading income project v1" 2>/dev/null || {
-    warn "Nothing new to commit (already committed)"
-}
-ok "Commit created"
-
-# ── Remote repository ──────────────────────────────────────────────────────
-hdr "GitHub remote"
+# ── 5. Remote Repository & Push ───────────────────────────────────────────────
+hdr "5 / 5  GitHub Remote Setup & Push"
 
 EXISTING_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
 
-if [[ -n "$EXISTING_REMOTE" ]]; then
-    ok "Remote already configured: $EXISTING_REMOTE"
-else
+if [[ -z "$EXISTING_REMOTE" ]]; then
     echo ""
-    echo -e "  ${DIM}Create an empty repository at github.com/new first.${RESET}"
-    echo -e "  ${DIM}Set visibility to Private. Do not add README or .gitignore.${RESET}"
+    info "Create an empty private repository at https://github.com/new"
+    info "(Do NOT initialize with a README, license, or .gitignore)"
     echo ""
-    read -r -p "     Your GitHub username: "         GH_USER
-    read -r -p "     Repository name [trading-income-project]: " GH_REPO
-    GH_REPO="${GH_REPO:-trading-income-project}"
+    read -r -p "     Enter GitHub Remote URL (HTTPS or SSH, or press Enter to skip): " REMOTE_URL
 
-    echo ""
-    echo -e "  ${BOLD}Authentication method:${RESET}"
-    echo -e "  ${CYAN}1${RESET}  HTTPS with Personal Access Token ${DIM}(simpler)${RESET}"
-    echo -e "  ${CYAN}2${RESET}  SSH key ${DIM}(more secure, no token expiry)${RESET}"
-    echo ""
-    read -r -p "     Choose [1/2, default=1]: " AUTH_CHOICE
-    AUTH_CHOICE="${AUTH_CHOICE:-1}"
+    if [[ -n "$REMOTE_URL" ]]; then
+        git remote add origin "$REMOTE_URL"
+        ok "Added remote origin: $REMOTE_URL"
 
-    if [[ "$AUTH_CHOICE" == "2" ]]; then
-        REMOTE_URL="git@github.com:${GH_USER}/${GH_REPO}.git"
-        echo ""
-        info "Make sure your SSH key is added to GitHub:"
-        info "  cat ~/.ssh/id_ed25519.pub   (then paste into GitHub → Settings → SSH keys)"
-        info "  ssh-keygen -t ed25519 -C \"${CURRENT_EMAIL}\"  (if you need to create one)"
+        # Enable credential caching for HTTPS
+        if [[ "$REMOTE_URL" == https://* ]]; then
+            git config --global credential.helper store
+            info "HTTPS credential storage enabled"
+        fi
+
+        read -r -p "     Push to origin/main now? [Y/n] " push_reply
+        push_reply="${push_reply:-Y}"
+        if [[ "$push_reply" =~ ^[Yy]$ ]]; then
+            echo ""
+            git push -u origin main && ok "Pushed to GitHub successfully" || {
+                warn "Push failed. If using HTTPS, ensure you use a Personal Access Token (PAT) with 'repo' scope."
+            }
+        fi
     else
-        REMOTE_URL="https://github.com/${GH_USER}/${GH_REPO}.git"
-        echo ""
-        info "You'll need a Personal Access Token (not your password):"
-        info "  GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)"
-        info "  Scopes: tick 'repo'. Copy the token and use it as your password when prompted."
-        echo ""
-        # Enable credential storage so you don't have to enter it every push
-        git config --global credential.helper store
-        info "Credentials will be saved after first push (credential.helper=store)"
+        info "Remote configuration skipped. Add anytime via: git remote add origin <url>"
     fi
-
-    git remote add origin "$REMOTE_URL"
-    ok "Remote added: $REMOTE_URL"
-fi
-
-# ── Push ───────────────────────────────────────────────────────────────────
-hdr "Pushing to GitHub"
-
-git branch -M main
-echo ""
-read -r -p "     Push to GitHub now? [Y/n] " reply
-reply="${reply:-Y}"
-
-if [[ "$reply" =~ ^[Yy]$ ]]; then
-    echo ""
-    git push -u origin main && ok "Pushed to GitHub successfully" || {
-        warn "Push failed. Common fixes:"
-        info "  • Check your Personal Access Token has 'repo' scope"
-        info "  • Verify the repository exists: $(git remote get-url origin 2>/dev/null)"
-        info "  • For HTTPS: ensure credential.helper is set: git config --global credential.helper store"
-        info "  • For SSH: test connection: ssh -T git@github.com"
-        exit 1
-    }
 else
-    warn "Skipped. Push manually when ready:"
-    info "  git push -u origin main"
+    ok "Remote already linked: $EXISTING_REMOTE"
+    read -r -p "     Push latest updates to GitHub now? [Y/n] " push_reply
+    push_reply="${push_reply:-Y}"
+    if [[ "$push_reply" =~ ^[Yy]$ ]]; then
+        git push -u origin main && ok "Pushed updates to GitHub" || warn "Push failed — check authentication/permissions"
+    fi
 fi
 
-# ── Summary ────────────────────────────────────────────────────────────────
+# ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-echo -e "${BOLD} Repository ready${RESET}"
-echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+echo -e "${BOLD}${GREEN} Git Repository Ready${RESET}"
+echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 echo ""
-REMOTE=$(git remote get-url origin 2>/dev/null || echo "not configured")
-echo -e "  Remote: ${DIM}$REMOTE${RESET}"
+CURRENT_ORIGIN=$(git remote get-url origin 2>/dev/null || echo "Not configured")
+echo -e "  ${BOLD}Remote URL:${RESET}  ${CYAN}$CURRENT_ORIGIN${RESET}"
+echo -e "  ${BOLD}Branch:${RESET}      main"
 echo ""
-echo -e "${BOLD}  Day-to-day workflow:${RESET}"
-echo "  git add src/changed_file.py"
-echo "  git commit -m 'Brief description of change'"
-echo "  git push"
-echo ""
-echo -e "  ${DIM}Full guide: docs/GITHUB_SETUP.md${RESET}"
+echo -e "  ${BOLD}Day-to-day workflow:${RESET}"
+echo "    git status"
+echo "    git add src/ docs/"
+echo "    git commit -m 'Descriptive update message'"
+echo "    git push"
 echo ""

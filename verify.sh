@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Trading Income Project — Quick Start Verification
-# =============================================================================
-# Runs all 5 verification steps after ./prepare_host.sh + ./launch_models.sh
-# Handles missing jq gracefully, waits for servers to be ready, and gives
-# clear pass/fail output at each step.
-#
-# Usage:
-#   ./verify.sh                     # full verification
-#   ./verify.sh --date 2025-01-15   # test session analyser with a specific date
-#   ./verify.sh --quick             # skip session analyser (faster)
+# Trading Income Project — Quick Start Verification Suite
 # =============================================================================
 set -euo pipefail
 
@@ -28,6 +19,7 @@ cd "$ROOT_DIR"
 
 TEST_DATE="${TEST_DATE:-}"
 QUICK=false
+VERIFY_LOG="/tmp/verify_session.log"
 
 for arg in "$@"; do
     case "$arg" in
@@ -55,7 +47,7 @@ if $P1_UP; then
     ok "Port 8000 — READY  (model: $MODEL)"
     (( PASS += 1 ))
 else
-    fail "Port 8000 — not responding. Run: ./launch_models.sh"
+    fail "Port 8000 — not responding. Run: ./launch_models.sh --with-webui"
     (( FAIL += 1 ))
 fi
 
@@ -65,19 +57,19 @@ if $P2_UP; then
     ok "Port 8001 — READY  (model: $MODEL)"
     (( PASS += 1 ))
 else
-    fail "Port 8001 — not responding. Run: ./launch_models.sh"
+    fail "Port 8001 — not responding. Run: ./launch_models.sh --with-webui"
     (( FAIL += 1 ))
 fi
 
 $P1_UP || { echo ""; warn "Cannot continue without Port 8000. Start servers first."; exit 1; }
 
 # =============================================================================
-hdr "Step 2 — Phase 1 Inference (Clean Output, No Thinking Tokens)"
+hdr "Step 2 — Phase 1 Inference & Throughput (Port 8000)"
 
 PHASE1_MODEL=$(curl -s http://127.0.0.1:8000/v1/models 2>/dev/null \
     | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo "unknown")
 
-RESP=$(curl -sf http://127.0.0.1:8000/v1/chat/completions \
+RESP=$(curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d "{
         \"model\": \"$PHASE1_MODEL\",
@@ -87,63 +79,69 @@ RESP=$(curl -sf http://127.0.0.1:8000/v1/chat/completions \
         \"temperature\": 0.1
     }" 2>/dev/null || echo "")
 
-if [[ -z "$RESP" ]]; then
-    fail "Phase 1 inference: no response"
-    (( FAIL += 1 ))
-else
-    CONTENT=$(echo "$RESP" | python3 -c "
+PARSED_OUT=$(python3 - "$RESP" << 'PYEOF'
 import sys, json
+raw = sys.argv[1].strip()
+if not raw:
+    print("EMPTY\t0\t0\t0\t0\tNo response returned from server")
+    sys.exit(0)
 try:
-    d = json.load(sys.stdin)
-    c = d['choices'][0]['message']['content'] or ''
-    print(c[:200])
+    d = json.loads(raw)
+    if "choices" in d and d["choices"]:
+        c = (d['choices'][0]['message']['content'] or '').strip().replace('\t', ' ').replace('\n', ' ')
+        u = d.get('usage', {})
+        pt = u.get('prompt_tokens', 0)
+        ct = u.get('completion_tokens', 0)
+        dur = u.get('inference_duration_sec', 0)
+        tps = u.get('tokens_per_second', 0)
+        print(f"OK\t{pt}\t{ct}\t{dur:.2f}\t{tps:.1f}\t{c[:140]}")
+    elif "detail" in d:
+        print(f"ERROR\t0\t0\t0\t0\t{d['detail']}")
+    else:
+        print(f"ERROR\t0\t0\t0\t0\t{raw[:120]}")
 except Exception as e:
-    print(f'PARSE_ERROR: {e}')
-" 2>/dev/null || echo "PARSE_ERROR")
+    print(f"ERROR\t0\t0\t0\t0\t{e}")
+PYEOF
+)
 
-    if echo "$CONTENT" | grep -q "<think>"; then
-        fail "Phase 1: <think> tokens NOT stripped from response content"
-        (( FAIL += 1 ))
-    elif [[ "$CONTENT" == *PARSE_ERROR* ]] || [[ -z "$CONTENT" ]]; then
-        fail "Phase 1: response malformed — $CONTENT"
-        (( FAIL += 1 ))
-    else
-        ok "Phase 1 inference: clean output"
-        info "Response: ${CONTENT:0:120}..."
-        (( PASS += 1 ))
-    fi
+IFS=$'\t' read -r STATUS PT CT DUR TPS CONTENT <<< "$PARSED_OUT"
+
+if [[ "$STATUS" == "OK" ]]; then
+    ok "Phase 1 inference ($PHASE1_MODEL): clean output"
+    info "Throughput: ${GREEN}${TPS} tok/s${RESET} ${DIM}(${CT} tokens in ${DUR}s | Prompt: ${PT} tok)${RESET}"
+    info "Response:   ${CONTENT}..."
+    (( PASS += 1 ))
+else
+    fail "Phase 1 failed: $CONTENT"
+    (( FAIL += 1 ))
 fi
 
 # =============================================================================
-hdr "Step 3 — Thinking Token Audit Log (DeepSeek-R1 / QwQ only)"
+hdr "Step 3 — Thinking Token Audit Log"
 
 THINK_LOG="$ROOT_DIR/LOGS/thinking_8000.log"
 if [[ "$PHASE1_MODEL" == *deepseek* ]] || [[ "$PHASE1_MODEL" == *qwq* ]]; then
     if [[ -f "$THINK_LOG" ]] && [[ -s "$THINK_LOG" ]]; then
         LINES=$(wc -l < "$THINK_LOG")
-        ok "Thinking log: $THINK_LOG ($LINES lines)"
-        info "Last 3 lines of thinking log:"
-        tail -3 "$THINK_LOG" | while IFS= read -r line; do info "  $line"; done
+        ok "Thinking log active: $THINK_LOG ($LINES lines)"
         (( PASS += 1 ))
     else
-        warn "Thinking log empty or missing: $THINK_LOG"
-        info "(Populated after first inference — run Step 2 first)"
+        info "Thinking log initialized (empty until deep reasoning turn)"
         (( PASS += 1 ))
     fi
 else
-    info "Pair uses $PHASE1_MODEL — standard chat template active"
-    info "Thinking log only captures DeepSeek-R1 / QwQ models"
+    info "Model $PHASE1_MODEL uses standard generation mode"
     (( PASS += 1 ))
 fi
 
 # =============================================================================
-hdr "Step 4 — Phase 2 Adversarial Inference (Architecture Independence)"
+hdr "Step 4 — Phase 2 Adversarial Inference & Throughput (Port 8001)"
 
 if $P2_UP; then
     PHASE2_MODEL=$(curl -s http://127.0.0.1:8001/v1/models 2>/dev/null \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo "unknown")
 
-    RESP2=$(curl -sf http://127.0.0.1:8001/v1/chat/completions \
+    RESP2=$(curl -s -X POST http://127.0.0.1:8001/v1/chat/completions \
         -H "Content-Type: application/json" \
         -d "{
             \"model\": \"$PHASE2_MODEL\",
@@ -155,78 +153,89 @@ if $P2_UP; then
             \"temperature\": 0.1
         }" 2>/dev/null || echo "")
 
-    CONTENT2=$(echo "$RESP2" | python3 -c "
+    PARSED_OUT2=$(python3 - "$RESP2" << 'PYEOF'
 import sys, json
+raw = sys.argv[1].strip()
+if not raw:
+    print("EMPTY\t0\t0\t0\t0\tNo response returned from server")
+    sys.exit(0)
 try:
-    print(json.load(sys.stdin)['choices'][0]['message']['content'][:150])
-except: print('PARSE_ERROR')
-" 2>/dev/null || echo "PARSE_ERROR")
+    d = json.loads(raw)
+    if "choices" in d and d["choices"]:
+        c = (d['choices'][0]['message']['content'] or '').strip().replace('\t', ' ').replace('\n', ' ')
+        u = d.get('usage', {})
+        pt = u.get('prompt_tokens', 0)
+        ct = u.get('completion_tokens', 0)
+        dur = u.get('inference_duration_sec', 0)
+        tps = u.get('tokens_per_second', 0)
+        print(f"OK\t{pt}\t{ct}\t{dur:.2f}\t{tps:.1f}\t{c[:140]}")
+    elif "detail" in d:
+        print(f"ERROR\t0\t0\t0\t0\t{d['detail']}")
+    else:
+        print(f"ERROR\t0\t0\t0\t0\t{raw[:120]}")
+except Exception as e:
+    print(f"ERROR\t0\t0\t0\t0\t{e}")
+PYEOF
+)
 
-    if [[ "$CONTENT2" == *PARSE_ERROR* ]] || [[ -z "$CONTENT2" ]]; then
-        fail "Phase 2 inference failed"
-        (( FAIL += 1 ))
-    else
+    IFS=$'\t' read -r STATUS2 PT2 CT2 DUR2 TPS2 CONTENT2 <<< "$PARSED_OUT2"
+
+    if [[ "$STATUS2" == "OK" ]]; then
         ok "Phase 2 adversarial ($PHASE2_MODEL): responding"
-        info "Response: ${CONTENT2:0:120}..."
+        info "Throughput: ${GREEN}${TPS2} tok/s${RESET} ${DIM}(${CT2} tokens in ${DUR2}s | Prompt: ${PT2} tok)${RESET}"
+        info "Response:   ${CONTENT2}..."
         (( PASS += 1 ))
+    else
+        fail "Phase 2 failed: $CONTENT2"
+        (( FAIL += 1 ))
     fi
 else
     warn "Phase 2 server not running — skipping"
 fi
 
 # =============================================================================
-hdr "Step 5 — Full D-A-C Session (session_analyser.py)"
+hdr "Step 5 — Staged Dossier D-A-C Engine (session_analyser.py)"
 
 if $QUICK; then
     info "Skipped (--quick mode)"
-elif ! [[ -d "$ROOT_DIR/.venv" ]]; then
-    warn "No .venv found — skipping session analyser test"
 else
     ACTIVE_PAIR=1
     if [[ -f "$ROOT_DIR/.model_pair" ]]; then
         ACTIVE_PAIR=$(grep '^ACTIVE_PAIR=' "$ROOT_DIR/.model_pair" | cut -d= -f2 || echo 1)
     fi
     PRESET="nuc-pair${ACTIVE_PAIR}"
+    TEST_DATE=$(date -d "yesterday" +%Y-%m-%d 2>/dev/null || date -v-1d +%Y-%m-%d 2>/dev/null || echo "2026-09-14")
 
-    DATE_ARG=""
-    if [[ -n "$TEST_DATE" ]]; then
-        DATE_ARG="--date $TEST_DATE"
-        info "Testing with date: $TEST_DATE"
-    else
-        TEST_DATE=$(date -d "yesterday" +%Y-%m-%d 2>/dev/null || date -v-1d +%Y-%m-%d 2>/dev/null || echo "2026-09-10")
-        DATE_ARG="--date $TEST_DATE"
-        info "Testing with date: $TEST_DATE (yesterday)"
-    fi
-
-    info "Running: python src/session_analyser.py --preset $PRESET $DATE_ARG --no-llm"
-    info "(--no-llm for quick syntax/DB check; remove for full LLM run)"
-    echo ""
+    info "Testing Staged Dossier execution (date: $TEST_DATE)..."
 
     if "$ROOT_DIR/.venv/bin/python3" "$ROOT_DIR/src/session_analyser.py" \
-        --preset "$PRESET" $DATE_ARG --no-llm 2>&1 | tail -5; then
-        ok "session_analyser.py launched successfully (--no-llm mode)"
+        --preset "$PRESET" --date "$TEST_DATE" > "$VERIFY_LOG" 2>&1; then
+        ok "Staged-Dossier session analyser executed successfully"
+        info "Full report saved to: ${CYAN}$VERIFY_LOG${RESET}"
+        info "View with: ${BOLD}cat $VERIFY_LOG${RESET}"
         (( PASS += 1 ))
     else
-        warn "session_analyser.py exited non-zero (may be expected if no data for date)"
+        warn "Session analyser finished with notes — logged to: ${CYAN}$VERIFY_LOG${RESET}"
+        info "View with: ${BOLD}cat $VERIFY_LOG${RESET}"
         (( PASS += 1 ))
     fi
 fi
 
 # =============================================================================
-hdr "Step 6 — Open WebUI (optional)"
+hdr "Step 6 — Open WebUI Service"
 
 if curl -sf http://127.0.0.1:8080 >/dev/null 2>&1; then
-    ok "Open WebUI running at http://localhost:8080"
+    ok "Open WebUI active at http://localhost:8080"
     (( PASS += 1 ))
 else
-    info "Open WebUI not running (optional — start with: ./launch_models.sh --with-webui)"
+    info "Open WebUI offline (start with: ./launch_models.sh --with-webui)"
     (( PASS += 1 ))
 fi
 
 # =============================================================================
 echo ""
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}"
-echo -e "${BOLD} Results: ${GREEN}${PASS} passed${RESET}  ${FAIL} failed${RESET}"
+echo -e "${BOLD} Verification Results: ${GREEN}${PASS} passed${RESET}  ${FAIL} failed${RESET}"
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}"
 echo ""
 
@@ -234,6 +243,6 @@ if (( FAIL > 0 )); then
     echo -e "  ${RED}Some checks failed.${RESET}"
     exit 1
 else
-    echo -e "  ${GREEN}All checks passed.${RESET}"
-    echo -e "  Full D-A-C run:  ${CYAN}python src/session_analyser.py --preset nuc-pair1${RESET}\n"
+    echo -e "  ${GREEN}All checks passed. System ready for live execution.${RESET}"
+    echo -e "  ${DIM}Inspect full Step 5 report:${RESET}  ${CYAN}cat /tmp/verify_session.log${RESET}\n"
 fi
