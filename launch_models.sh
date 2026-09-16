@@ -188,6 +188,7 @@ DRAFT_ARGS=()
 [[ -n "$DRAFT_MODEL_PATH" ]] && DRAFT_ARGS=(--draft-model-path "$DRAFT_MODEL_PATH")
 
 info "Starting Port $P1_PORT ($ID_P1)..."
+
 "$VENV/bin/python3" "$SERVE_SCRIPT" \
     --model-path "$MODEL_P1" --model-id "$ID_P1" \
     --port "$P1_PORT" --device GPU "${THINK_ARGS[@]}" "${DRAFT_ARGS[@]}" \
@@ -197,6 +198,7 @@ echo "$P1_PID_VAL" > "$P1_PID"
 
 # ── Launch Phase 2 ────────────────────────────────────────────────────────────
 info "Starting Port $P2_PORT ($ID_P2)..."
+
 "$VENV/bin/python3" "$SERVE_SCRIPT" \
     --model-path "$MODEL_P2" --model-id "$ID_P2" \
     --port "$P2_PORT" --device GPU \
@@ -212,6 +214,25 @@ if $WITH_WEBUI; then
         info "Starting Open WebUI on port $WEBUI_PORT..."
         export OPENAI_API_BASE_URLS="http://127.0.0.1:$P1_PORT/v1;http://127.0.0.1:$P2_PORT/v1"
         export WEBUI_PORT="$WEBUI_PORT"
+        # Fixed secret key — prevents browser token invalidation on restart
+        export WEBUI_SECRET_KEY="$(cat "$ROOT_DIR/.webui_secret_key" 2>/dev/null || echo 'trading-income-local-secret-key')"
+        # Disable Ollama (not running, causes model list errors)
+        export ENABLE_OLLAMA_API="false"
+        # Disable background tasks that fire concurrent inference requests
+        # while the main generation is holding _infer_lock
+        export ENABLE_TITLE_GENERATION="false"
+        export ENABLE_TAGS_GENERATION="false"
+        export ENABLE_FOLLOW_UP_GENERATION="false"
+        # v0.11.x bug: ORJSON serialization drops SSE lines containing
+        # certain characters, causing empty responses. Disable it.
+        export ENABLE_ORJSON="false"
+        # Disable WebSocket — fall back to HTTP polling which works reliably
+        # with local pip-installed OpenWebUI. WebSocket fails on direct connections.
+        export ENABLE_WEBSOCKET_SUPPORT="false"
+        # Increase timeouts for slow local models (2-3 tok/s = long generations)
+        export AIOHTTP_CLIENT_TIMEOUT="600"
+        export AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT="600"
+        export AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST="10"
         "$VENV/bin/open-webui" serve > "$WEBUI_LOG" 2>&1 &
         echo "$!" > "$WEBUI_PID"
         ok "Open WebUI launched (PID $!)"

@@ -15,6 +15,7 @@ alpaca-py>=0.20             # free paper account at alpaca.markets
 
 # ── Scheduling (runner.py) ───────────────────────────────────────────────────
 APScheduler>=3.10,<4        # v4 pre-release has breaking API — pin to stable 3.x
+exchange-calendars>=4.0          # NYSE market calendar — holiday and early-close detection (P1-008)
 
 # ── Dashboard (trading_dashboard.py) ────────────────────────────────────────
 streamlit>=1.35

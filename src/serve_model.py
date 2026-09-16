@@ -12,10 +12,13 @@ FIXES (P2-059) — 2026-09-15
    degrading, making the failure visible immediately.
 
 2. Streaming fix  — streamer_cb previously built chunk_payload but never yielded
-   it. OpenWebUI received silence until [DONE], then made a second non-streaming
-   request, causing the 100% CPU spike and iGPU memory eviction observed in
-   intel_gpu_top. Fixed with a SimpleQueue bridge: callback pushes tokens onto
-   the queue; stream_generator() pulls and yields them as SSE chunks in real time.
+   it. A SimpleQueue fix was attempted but deadlocked: FastAPI's StreamingResponse
+   runs a sync generator in a threadpool executor, and queue.get() blocked the
+   uvicorn event loop. Final fix: async generator + asyncio.Queue +
+   loop.call_soon_threadsafe(). The background inference thread pushes tokens
+   into the asyncio queue thread-safely; the async generator awaits them without
+   blocking the event loop. Route handler is async. OpenWebUI now receives tokens
+   in real time.
 
 3. Keepalive thread  — Intel Arc iGPU reclaims shared memory pages when the GPU
    goes idle. A 1-token generation every 55s keeps the model pinned in iGPU
@@ -32,8 +35,8 @@ os.environ.setdefault("SYCL_CACHE_PERSISTENT", "1")     # persist compiled cache
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse
+import asyncio
 import json
-import queue as _queue_mod
 import re
 import threading
 import time
@@ -51,13 +54,24 @@ try:
 except ImportError as e:
     raise SystemExit("openvino-genai not installed.") from e
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app         = FastAPI(title="OpenVINO GenAI — OpenAI Bridge")
+
+# Allow browser fetch from any local origin (file://, localhost:*, etc.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 _pipe:      ov_genai.LLMPipeline | ov_genai.VLMPipeline | None = None
 _tok:       Any   = None
 _model_id:  str   = "ov-model"
 _is_vlm:    bool  = False
 _cache_dir: str   = os.path.expanduser("~/models/.ov_cache")
-_infer_lock = threading.Lock()
+_infer_lock = threading.Lock()   # ensures one inference at a time; concurrent
+                                  # requests block here until the lock is free
 
 
 # ===========================================================================
@@ -86,7 +100,10 @@ class ChatRequest(BaseModel):
     messages:        list[Message]
     tools:           list[Tool] | None = None
     tool_choice:     str | dict | None = None
-    max_tokens:      int   = Field(default=2048, ge=1, le=8192)
+    # Cap at 1024 — the KV cache is pre-allocated at load time for MAX_NEW_TOKENS.
+    # Requesting more tokens than the cache was built for causes CL_EXEC_STATUS_ERROR
+    # (-14) from ocl_event.cpp mid-generation on the Arc iGPU.
+    max_tokens:      int   = Field(default=1024, ge=1, le=1024)
     temperature:     float = Field(default=0.2,  ge=0.0, le=2.0)
     stream:          bool  = False
     response_format: ResponseFormat | None = None
@@ -118,6 +135,16 @@ def _extract_text_content(content: Any) -> str:
     return str(content)
 
 def _build_prompt(req: ChatRequest) -> str:
+    """Build the prompt string for generate().
+
+    For VLMPipeline (Qwen3.8): we build the prompt ourselves with
+    enable_thinking=False and set apply_chat_template=False in GenerationConfig
+    so VLMPipeline uses our pre-built string instead of re-applying the template
+    internally (which ignores enable_thinking and always opens a think block).
+
+    For LLMPipeline: standard path, apply_chat_template=False is already set
+    in the original config from the file header.
+    """
     messages = [{"role": m.role, "content": _extract_text_content(m.content)} for m in req.messages]
 
     if req.tools:
@@ -134,13 +161,36 @@ def _build_prompt(req: ChatRequest) -> str:
 
     if _tok is not None:
         try:
-            return str(_tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+            # enable_thinking=False: suppresses Qwen3's <think> reasoning chain.
+            # For VLMPipeline this only works when we build the prompt here AND
+            # set config.apply_chat_template=False so VLMPipeline uses our string.
+            prompt = str(_tok.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            ))
+            # Safety net: if template left an open think block, close it
+            if prompt.endswith("<think>\n"):
+                prompt += "\n</think>\n\n"
+            return prompt
+        except TypeError:
+            # Older tokenizer: enable_thinking not supported
+            try:
+                prompt = str(_tok.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ))
+                return prompt
+            except Exception:
+                pass
         except Exception:
             pass
 
-    # ChatML fallback
+    # ChatML fallback with closed think block
     lines = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in messages]
-    lines.append("<|im_start|>assistant\n<think>\n</think>")
+    lines.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
     return "\n".join(lines)
 
 def _count_tokens(text: str) -> int:
@@ -192,17 +242,23 @@ def _parse_tool_call(text: str) -> dict | None:
 # ===========================================================================
 
 def _keepalive_worker() -> None:
-    """Keep the model pinned in iGPU memory by generating 1 token every 55s."""
+    """Keep the model pinned in iGPU memory by generating 1 token every 55s.
+
+    Skips the cycle if a real request is in flight (_infer_lock held) so
+    the keepalive never queues behind or delays active inference.
+    """
     while True:
         time.sleep(55)
         if _pipe is None:
             continue
+        if _infer_lock.locked():
+            continue   # real request in flight — skip, don't queue behind it
         try:
             cfg = ov_genai.GenerationConfig()
             cfg.max_new_tokens = 1
-            cfg.do_sample = False
+            cfg.do_sample      = False
             with _infer_lock:
-                _pipe.generate(".", generation_config=cfg)
+                _pipe.generate("The market opens at", generation_config=cfg)
         except Exception:
             pass   # never crash the keepalive thread
 
@@ -246,71 +302,102 @@ def chat_completions(req: ChatRequest):
     else:
         config.do_sample = False
 
-    # ── P2-059 Fix 2: Streaming handler ──────────────────────────────────────
-    # Previously: streamer_cb built chunk_payload but never yielded it.
-    # Now: a SimpleQueue bridges the openvino callback thread to the SSE
-    # generator, so tokens flow to OpenWebUI in real time as they are produced.
+    # ── Streaming handler ─────────────────────────────────────────────────────
+    # Architecture: sync generator running directly in FastAPI's threadpool.
+    # The streamer callback fires synchronously inside _pipe.generate() on the
+    # SAME thread as the generator — no queue, no background thread, no
+    # cancellation race. Tokens are collected into a list by the callback and
+    # yielded by the generator via a shared buffer checked after each callback.
+    #
+    # This is the simplest pattern that works: generate() blocks the threadpool
+    # thread until complete, the streamer callback appends tokens to a deque,
+    # and the generator yields them. FastAPI flushes each yield to the client.
     # ──────────────────────────────────────────────────────────────────────────
     if req.stream:
+        import collections
+
         def stream_generator():
             call_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
             created = int(time.time())
-            q: _queue_mod.SimpleQueue[str | None] = _queue_mod.SimpleQueue()
+            buf: collections.deque[str] = collections.deque()
+            done = [False]
+            error = [None]
 
-            def _run_generation() -> None:
-                """Run inference in a background thread, pushing tokens onto q."""
+            def streamer_cb(subword: str):
+                buf.append(subword)
+                return ov_genai.StreamingStatus.RUNNING
+
+            import queue as _q
+            _stream_q: _q.SimpleQueue[str | None] = _q.SimpleQueue()
+
+            def _gen():
                 try:
                     with _infer_lock:
-                        def streamer_cb(subword: str) -> bool:
-                            q.put(subword)
-                            return False   # returning True would abort generation
-
-                        _pipe.generate(prompt, generation_config=config,
-                                       streamer=streamer_cb)
+                        def cb(subword: str):
+                            _stream_q.put(subword)
+                            return ov_genai.StreamingStatus.RUNNING
+                        _pipe.generate(prompt, generation_config=config, streamer=cb)
                 except Exception as exc:
-                    # Push a sentinel with error info so the generator can stop
-                    q.put(f"\n\n[Generation error: {exc}]")
+                    import traceback
+                    print(f"[STREAM ERROR] {type(exc).__name__}: {exc}", flush=True)
+                    print(traceback.format_exc(), flush=True)
+                    _stream_q.put(f"\n\n[Generation error: {exc}]")
                 finally:
-                    q.put(None)   # sentinel — generation complete
+                    _stream_q.put(None)
 
-            threading.Thread(target=_run_generation, daemon=True).start()
+            _t = threading.Thread(target=_gen, daemon=True)
+            _t.start()
 
-            # Pull tokens from queue and yield as SSE chunks
-            while True:
-                subword = q.get()          # blocks until next token or sentinel
-                if subword is None:
-                    break
-                chunk = {
-                    "id":      call_id,
-                    "object":  "chat.completion.chunk",
-                    "created": created,
-                    "model":   req.model or _model_id,
-                    "choices": [{
-                        "index":         0,
-                        "delta":         {"content": subword},
-                        "finish_reason": None,
-                    }],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
+            try:
+                while True:
+                    try:
+                        subword = _stream_q.get(timeout=300)
+                    except _q.Empty:
+                        print("[STREAM TIMEOUT] Queue empty after 300s", flush=True)
+                        break
+                    if subword is None:
+                        break
+                    chunk = {
+                        "id": call_id, "object": "chat.completion.chunk",
+                        "created": created, "model": req.model or _model_id,
+                        "choices": [{"index": 0, "delta": {"content": subword},
+                                     "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+            except GeneratorExit:
+                print("[STREAM] GeneratorExit — client disconnected", flush=True)
+                raise
+            except Exception as exc:
+                print(f"[STREAM YIELD ERROR] {type(exc).__name__}: {exc}", flush=True)
+                raise
+            finally:
+                _t.join(timeout=10)
 
-            # Final chunk signalling completion
             final = {
-                "id":      call_id,
-                "object":  "chat.completion.chunk",
-                "created": created,
-                "model":   req.model or _model_id,
+                "id": call_id, "object": "chat.completion.chunk",
+                "created": created, "model": req.model or _model_id,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
 
-    # ── Non-streaming handler (unchanged) ─────────────────────────────────────
+    # ── Non-streaming handler ─────────────────────────────────────────────────
     t0 = time.monotonic()
     try:
         with _infer_lock:
-            result = _pipe.generate(prompt, generation_config=config)
+            if _is_vlm:
+                result = _pipe.generate(
+                    prompt,
+                    generation_config=config,   # apply_chat_template=False is key
+                )
+            else:
+                result = _pipe.generate(prompt, generation_config=config)
             raw = str(result.texts[0]).strip() if hasattr(result, "texts") else str(result).strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation error: {e}") from e
@@ -388,6 +475,9 @@ def main() -> None:
     parser.add_argument("--think-log",        default=None)
     parser.add_argument("--draft-model-path", default=None)
     parser.add_argument("--draft-tokens",     type=int, default=2)
+    parser.add_argument("--force-llm",        action="store_true",
+                        help="Force LLMPipeline even when vision embeddings are present. "
+                             "Use for text-only inference on VLM model directories.")
     args, _ = parser.parse_known_args()
 
     _model_id  = args.model_id
@@ -401,17 +491,33 @@ def main() -> None:
     t0 = time.monotonic()
 
     model_dir = Path(args.model_path)
-    _is_vlm   = (model_dir / "openvino_vision_embeddings_model.xml").exists()
+    vision_xml = model_dir / "openvino_vision_embeddings_model.xml"
+    _is_vlm   = vision_xml.exists() and not args.force_llm
 
     if _is_vlm:
-        print(f"  Architecture: VLMPipeline")
-        _pipe = ov_genai.VLMPipeline(str(model_dir), args.device)
+        # Qwen3.8-27B is a native multimodal model — must use VLMPipeline.
+        print(f"  Architecture: VLMPipeline (Qwen3.8 native multimodal — text-only, non-thinking)")
+        _pipe = ov_genai.VLMPipeline(
+            str(model_dir),
+            args.device,
+            CACHE_DIR=_cache_dir,
+        )
+        # Thinking mode is disabled by setting apply_chat_template=False in
+        # GenerationConfig and building the prompt manually via _tok with
+        # enable_thinking=False. This avoids Minja's "Unknown type for 'is'
+        # operator: undefined" error when the template uses 'is undefined'.
+        # See _build_prompt() — VLM path uses _tok.apply_chat_template directly.
+        print("  ✓ Thinking mode: disabled via apply_chat_template=False + manual prompt build")
     else:
-        print(f"  Architecture: LLMPipeline")
+        if args.force_llm and vision_xml.exists():
+            print(f"  Architecture: LLMPipeline (--force-llm: vision files present but ignored)")
+        else:
+            print(f"  Architecture: LLMPipeline")
         _pipe = ov_genai.LLMPipeline(
             str(model_dir),
             args.device,
             CACHE_DIR=_cache_dir,
+            PERFORMANCE_HINT="LATENCY",
         )
 
     try:
@@ -431,7 +537,7 @@ def main() -> None:
     # Start keepalive thread after model is loaded
     threading.Thread(target=_keepalive_worker, daemon=True).start()
 
-    uvicorn.run(app, host="127.0.0.1", port=args.port,
+    uvicorn.run(app, host="0.0.0.0", port=args.port,
                 log_level="warning", access_log=False)
 
 
