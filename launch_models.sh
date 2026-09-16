@@ -44,6 +44,8 @@ WEBUI_PORT=8080
 
 PAIR_OVERRIDE=""
 WITH_WEBUI=false
+WITH_CHAT=false
+CHAT_PORT=3000
 ACTION="start"
 
 for arg in "$@"; do
@@ -51,6 +53,7 @@ for arg in "$@"; do
         --pair)           shift; PAIR_OVERRIDE="${1:-}"; shift ;;
         --pair=*)         PAIR_OVERRIDE="${arg#--pair=}" ;;
         --with-webui)     WITH_WEBUI=true ;;
+        --with-chat)      WITH_CHAT=true ;;   # start standalone chat UI on port 3000
         --stop|stop)      ACTION="stop" ;;
         --status|status)  ACTION="status" ;;
         --logs|logs)      ACTION="logs" ;;
@@ -141,8 +144,10 @@ case "$ACTION" in
         stop_server "$P1_PID" "Port $P1_PORT"
         stop_server "$P2_PID" "Port $P2_PORT"
         stop_server "$WEBUI_PID" "Open WebUI"
+        stop_server "$PID_DIR/chat_ui.pid" "Chat UI"
         pkill -f "serve_model.py" 2>/dev/null || true
         pkill -f "open-webui" 2>/dev/null || true
+        fuser -k "${CHAT_PORT:-3000}/tcp" 2>/dev/null || true
         ok "All servers stopped"; exit 0 ;;
     status)
         echo -e "\n${BOLD}Model Server Status (Pair $PAIR: ${PAIR_NOTE[$PAIR]})${RESET}"
@@ -241,7 +246,23 @@ if $WITH_WEBUI; then
     fi
 fi
 
-# ── Health Poll with Fast-Fail ────────────────────────────────────────────────
+# ── Optional: Standalone Chat UI (port 3000) ──────────────────────────────────
+if $WITH_CHAT || $WITH_WEBUI; then
+    # Kill any existing chat server
+    fuser -k "${CHAT_PORT}/tcp" 2>/dev/null || true
+    sleep 1
+    # Serve trading_chat.html via Python HTTP server
+    if [[ -f "$ROOT_DIR/trading_chat.html" ]]; then
+        cd "$ROOT_DIR"
+        python3 -m http.server "$CHAT_PORT" > "$LOG_DIR/chat_ui.log" 2>&1 &
+        CHAT_PID=$!
+        echo "$CHAT_PID" > "$PID_DIR/chat_ui.pid"
+        cd - >/dev/null
+        ok "Chat UI launched — http://localhost:${CHAT_PORT}/trading_chat.html (PID $CHAT_PID)"
+    else
+        warn "trading_chat.html not found — skipping standalone chat UI"
+    fi
+fi
 echo ""
 info "Loading weights into Arc iGPU memory..."
 info "Cold start compiles Level Zero blobs (~45s). Subsequent starts: <5s."
@@ -295,6 +316,11 @@ echo ""
 echo -e "  ${DIM}Both models resident in Arc iGPU VRAM simultaneously${RESET}"
 if $WITH_WEBUI && [[ -x "$VENV/bin/open-webui" ]]; then
     echo -e "  ${YELLOW}Chat WebUI:${RESET}            http://localhost:$WEBUI_PORT"
+fi
+if $WITH_CHAT || $WITH_WEBUI; then
+    if [[ -f "$ROOT_DIR/trading_chat.html" ]]; then
+        echo -e "  ${YELLOW}Trading Chat UI:${RESET}       http://localhost:${CHAT_PORT}/trading_chat.html"
+    fi
 fi
 echo ""
 echo -e "  Status:  ${CYAN}./launch_models.sh --status${RESET}"

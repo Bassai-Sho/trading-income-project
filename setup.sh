@@ -373,9 +373,12 @@ echo -e "${BOLD}${CYAN}═══════════════════
 echo -e "${BOLD}${GREEN} Setup Complete — Ready for Launch${RESET}"
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 echo ""
-echo -e "  1. Start Model Servers:  ${CYAN}./launch_models.sh --with-webui${RESET}"
-echo -e "  2. Pre-Flight Check:     ${CYAN}./verify.sh${RESET}"
-echo -e "  3. Start Live System:    ${CYAN}python3 src/runner.py${RESET}"
+echo -e "  1. Start Model Servers:  ${CYAN}./launch_models.sh${RESET}"
+echo -e "  2. Start Chat UI:        ${CYAN}python3 -m http.server 3000 &${RESET}"
+echo -e "     Then open:            ${CYAN}http://localhost:3000/trading_chat.html${RESET}"
+echo -e "     (Optional WebUI):     ${CYAN}./launch_models.sh --with-webui${RESET}"
+echo -e "  3. Pre-Flight Check:     ${CYAN}./verify.sh${RESET}"
+echo -e "  4. Start Live System:    ${CYAN}python3 src/runner.py${RESET}"
 if [[ -f "/etc/systemd/system/trading-runner.service" ]]; then
     echo -e "  4. Service Management:   ${CYAN}sudo systemctl status trading-runner${RESET}"
 fi
