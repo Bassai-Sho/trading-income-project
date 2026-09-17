@@ -75,6 +75,87 @@ async def _get_tools() -> list[dict]:
     except Exception:
         pass
     return []
+def _extract_best_url(search_result: str, query: str) -> str | None:
+    """
+    Extract the most useful URL from a web_search result string.
+
+    Prefers:
+    1. URLs that look like actual articles (contain /article/, /news/, date patterns, etc.)
+    2. Known news sources with article-level paths
+    3. Falls back to the first non-Wikipedia, non-Google URL
+
+    Skips: homepages (domain only), Wikipedia, Google, Yahoo homepages.
+    """
+    import re
+
+    # Extract all URLs from the search result
+    urls = re.findall(r'https?://[^\s\])\'"]+', search_result)
+    if not urls:
+        return None
+
+    # Patterns that indicate an actual article (not a homepage)
+    article_patterns = [
+        r'/\d{4}/\d{2}/\d{2}/',   # date in path e.g. /2026/09/17/
+        r'/article/',
+        r'/story/',
+        r'/news/[^/]+/[^/]+',     # news section with article slug
+        r'/world/[^/]+',
+        r'/business/[^/]+',
+        r'/markets/[^/]+',
+        r'/politics/[^/]+',
+        r'-\d{8}',                # article ID suffix
+    ]
+
+    # Domains to skip (homepages only)
+    skip_domains = {
+        'wikipedia.org', 'google.com', 'google.co.uk',
+        'yahoo.com', 'bing.com',
+    }
+
+    # Homepage patterns to skip (URL is just the domain root)
+    def _is_homepage(url: str) -> bool:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        path = parsed.path.rstrip('/')
+        return path == '' or path == '/news' or path == '/world'
+
+    # Priority 1: article-like URLs
+    for url in urls:
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lstrip('www.')
+        if any(skip in domain for skip in skip_domains):
+            continue
+        if _is_homepage(url):
+            continue
+        for pattern in article_patterns:
+            if re.search(pattern, url):
+                return url
+
+    # Priority 2: any non-homepage from a news source
+    news_domains = [
+        'bbc.co.uk', 'bbc.com', 'reuters.com', 'apnews.com',
+        'theguardian.com', 'ft.com', 'bloomberg.com', 'cnbc.com',
+        'cnn.com', 'nytimes.com', 'wsj.com', 'euronews.com',
+        'marketwatch.com', 'investors.com', 'seekingalpha.com',
+    ]
+    for url in urls:
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lstrip('www.')
+        if _is_homepage(url):
+            continue
+        if any(nd in domain for nd in news_domains):
+            return url
+
+    # Priority 3: first non-skip, non-homepage URL
+    for url in urls:
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lstrip('www.')
+        if any(skip in domain for skip in skip_domains):
+            continue
+        if not _is_homepage(url):
+            return url
+
+    return None
 
 
 async def _call_tool(name: str, args: dict) -> str:
@@ -261,13 +342,12 @@ async def on_message(message: cl.Message):
                 async with cl.Step(name=fn_name, type="tool", show_input=True) as step:
                     step.input = json.dumps(fn_args, indent=2)
                     raw_result = await _call_tool(fn_name, fn_args)
-                    # Truncate display only — full result goes to model
                     step.output = (
                         raw_result[:1200] +
                         ("\n…(truncated for display)" if len(raw_result) > 1200 else "")
                     )
 
-                # Bound context fed to model to avoid saturating iGPU KV cache
+                # Bound context fed to model
                 bounded = raw_result[:1600] if len(raw_result) > 1600 else raw_result
                 history.append({
                     "role":         "tool",
@@ -275,18 +355,38 @@ async def on_message(message: cl.Message):
                     "tool_call_id": tc.id,
                 })
 
+                # ── Auto fetch_url after web_search ──────────────────────────
+                # web_search returns URLs and short snippets. For news/current
+                # events queries, automatically fetch the best URL to get actual
+                # article content rather than just homepage links.
+                if fn_name == "web_search":
+                    best_url = _extract_best_url(raw_result, fn_args.get("query", ""))
+                    if best_url:
+                        async with cl.Step(name="fetch_url", type="tool", show_input=True) as step2:
+                            step2.input = json.dumps({"url": best_url}, indent=2)
+                            page_content = await _call_tool("fetch_url", {"url": best_url, "max_chars": 2000})
+                            step2.output = (
+                                page_content[:1200] +
+                                ("\n…(truncated for display)" if len(page_content) > 1200 else "")
+                            )
+                        # Append as a synthetic tool message with a unique ID
+                        history.append({
+                            "role":         "tool",
+                            "content":      f"Full article from {best_url}:\n\n{page_content[:2000]}",
+                            "tool_call_id": f"auto_fetch_{tc.id}",
+                        })
+
             # ── Phase 2: Streaming synthesis after tool results ───────────────
-            # Inject a system instruction so the model uses the tool results
-            # rather than falling back to memory for the final answer.
             synthesis_messages = [
                 {
                     "role": "system",
                     "content": (
-                        "You have just received real-time search results from the web. "
-                        "Use ONLY the information in the tool results above to answer the user's question. "
-                        "Do NOT say you lack access to current information — you just searched. "
-                        "Summarise the key findings from the search results in a clear, concise answer. "
-                        "Cite the source URLs where relevant."
+                        "You have just retrieved real-time information from the web. "
+                        "The tool results above contain both search snippets and full article content. "
+                        "Use ONLY this retrieved information to answer the user's question — "
+                        "do NOT fall back to your training data for facts about current events. "
+                        "Summarise the key findings clearly and concisely. "
+                        "Cite the source URL for each fact you mention."
                     ),
                 }
             ] + history
