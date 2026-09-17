@@ -213,12 +213,26 @@ async def on_message(message: cl.Message):
     history.append({"role": "user", "content": message.content})
     tools = await _get_tools() if use_tools else []
 
+    # System message prepended to every request — instructs model on tool use
+    SYSTEM = {
+        "role": "system",
+        "content": (
+            "You are a trading research assistant. "
+            "When the user asks about current events, prices, news, or any "
+            "information that may have changed since 2023, you MUST call "
+            "web_search with a specific query string before answering. "
+            "Always include the 'query' argument when calling web_search. "
+            "Never say you lack access to current information — use web_search instead."
+        ),
+    }
+    messages_with_system = [SYSTEM] + history
+
     # ── Phase 1: Tool intent detection (non-streaming) ─────────────────────────
     if use_tools and tools:
         try:
             resp = await _client.chat.completions.create(
                 model=MODEL_ID,
-                messages=history,
+                messages=messages_with_system,
                 tools=tools,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -262,6 +276,22 @@ async def on_message(message: cl.Message):
                 })
 
             # ── Phase 2: Streaming synthesis after tool results ───────────────
+            # Inject a system instruction so the model uses the tool results
+            # rather than falling back to memory for the final answer.
+            synthesis_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You have just received real-time search results from the web. "
+                        "Use ONLY the information in the tool results above to answer the user's question. "
+                        "Do NOT say you lack access to current information — you just searched. "
+                        "Summarise the key findings from the search results in a clear, concise answer. "
+                        "Cite the source URLs where relevant."
+                    ),
+                }
+            ] + history
+
+            # ── Phase 2: Streaming synthesis after tool results ───────────────
             msg = cl.Message(content="")
             await msg.send()
             full_text = ""
@@ -269,7 +299,7 @@ async def on_message(message: cl.Message):
             try:
                 stream = await _client.chat.completions.create(
                     model=MODEL_ID,
-                    messages=history,
+                    messages=synthesis_messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     stream=True,
@@ -302,7 +332,7 @@ async def on_message(message: cl.Message):
     try:
         stream = await _client.chat.completions.create(
             model=MODEL_ID,
-            messages=history,
+            messages=messages_with_system,
             temperature=temperature,
             max_tokens=max_tokens,
             stream=True,
