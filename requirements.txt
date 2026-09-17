@@ -15,18 +15,19 @@ alpaca-py>=0.20             # free paper account at alpaca.markets
 
 # ── Scheduling (runner.py) ───────────────────────────────────────────────────
 APScheduler>=3.10,<4        # v4 pre-release has breaking API — pin to stable 3.x
-exchange-calendars>=4.0          # NYSE market calendar — holiday and early-close detection (P1-008)
+exchange-calendars>=4.0     # NYSE market calendar — holiday and early-close detection (P1-008)
 
 # ── Dashboard (trading_dashboard.py) ────────────────────────────────────────
 streamlit>=1.35
 plotly>=5.22
 
 # ── Async HTTP (trading_engine.py live data feed) ────────────────────────────
-aiohttp>=3.9               # async HTTP — used for live Alpaca WebSocket feed
+aiohttp>=3.9                # async HTTP — used for live Alpaca WebSocket feed
+httpx>=0.27                 # async HTTP client for chainlit_app.py (600s timeout support)
 
 # ── LLM session analyser (session_analyser.py) ──────────────────────────────
 requests>=2.31              # Ollama API calls (local NUC model)
-openai>=1.0                 # Ollama-compatible client (tool calling)
+openai>=1.0                 # AsyncOpenAI client — tool calling + streaming (chainlit_app.py)
 
 # ── Notifications ────────────────────────────────────────────────────────────
 discord-webhook>=1.3        # Discord EOD alerts
@@ -43,9 +44,13 @@ python-dotenv>=1.0          # load .env file
 # pytz removed — Python 3.9+ has zoneinfo in stdlib; APScheduler 3.11+ uses zoneinfo
 
 # ── LLM tool calling (tool_runner.py) ────────────────────────────────────────
-ddgs>=6.0      # web_search — no API key required
+ddgs>=6.0                   # web_search — no API key required
 trafilatura>=1.9            # fetch_url — article body extraction
 pandas-market-calendars>=4.3  # US market calendar: early-close, OPEX, holidays
 
 # ── Chat interface ────────────────────────────────────────────────────────────
-open-webui                  # ChatGPT-style local chat UI — pip install only, large (~500MB)
+# open-webui removed — replaced by Chainlit after persistent Socket.IO/streaming
+# failures in v0.11.x with local VLMPipeline models at 2.7 tok/s
+chainlit>=1.0               # ChatGPT-style chat UI with native tool call accordions,
+                            # async streaming, and per-session state isolation
+                            # Launch: chainlit run chainlit_app.py --host 0.0.0.0 --port 8080

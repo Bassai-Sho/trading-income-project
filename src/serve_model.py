@@ -46,15 +46,20 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(override=False)   # load .env so tool_runner gets BRAVE_SEARCH_API_KEY etc.
+except ImportError:
+    pass
 
 try:
     import openvino_genai as ov_genai
 except ImportError as e:
     raise SystemExit("openvino-genai not installed.") from e
-
-from fastapi.middleware.cors import CORSMiddleware
 
 app         = FastAPI(title="OpenVINO GenAI — OpenAI Bridge")
 
@@ -108,15 +113,16 @@ class ChatRequest(BaseModel):
     stream:          bool  = False
     response_format: ResponseFormat | None = None
 
-TOOL_SYSTEM_PREFIX = """You have access to the following tools:
+TOOL_SYSTEM_PREFIX = """You are a trading research assistant with access to the following tools:
 {tools_json}
 
-INSTRUCTIONS FOR TOOL CALLING:
-- To call a tool, respond IMMEDIATELY with ONLY a JSON object:
-{"name": "<tool_name>", "arguments": {<argument key-value pairs>}}
-- Do NOT output any reasoning or introductory text before the JSON.
-- Start directly with { and end with }.
-- If no tool is needed, respond normally as an assistant.
+CRITICAL RULES FOR TOOL USE:
+- For ANY question about current events, news, prices, market conditions, or recent data: call web_search FIRST, then answer using the results. Never answer these from memory.
+- For questions requiring a specific URL or article: call fetch_url after web_search.
+- For trading statistics or calculations: call run_toolkit.
+- After receiving tool results, synthesize them into a clear, grounded answer.
+- If no tool is needed (e.g. explaining a concept you know well), answer directly.
+- Do NOT say "I don't have access to real-time information" — use web_search instead.
 """
 
 
@@ -209,7 +215,43 @@ def _strip_thinking(text: str) -> tuple[str, str]:
     return thoughts, answer
 
 def _parse_tool_call(text: str) -> dict | None:
+    """
+    Parse a tool call from the model's text output.
+    Handles two formats:
+
+    Format 1 — JSON (LLMPipeline / standard OpenAI):
+        {"name": "web_search", "arguments": {"query": "..."}}
+
+    Format 2 — XML (VLMPipeline / Qwen3 native):
+        <tool_call>
+        <function=web_search>
+        <parameter=query>top news today</parameter>
+        </function>
+        </tool_call>
+    """
     stripped = text.strip()
+
+    # ── Format 2: VLMPipeline XML tool call ──────────────────────────────────
+    if "<tool_call>" in stripped or "<function=" in stripped:
+        # Extract function name: <function=web_search> or <function=web_search/>
+        fn_match = re.search(r"<function=(\w+)", stripped)
+        if fn_match:
+            name = fn_match.group(1)
+            # Extract parameters: <parameter=query>value</parameter>
+            params = {}
+            for pm in re.finditer(r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", stripped, re.DOTALL):
+                key, val = pm.group(1), pm.group(2).strip()
+                # Try to coerce numeric values
+                try:
+                    params[key] = int(val)
+                except ValueError:
+                    try:
+                        params[key] = float(val)
+                    except ValueError:
+                        params[key] = val
+            return {"name": name, "arguments": params}
+
+    # ── Format 1: JSON tool call ──────────────────────────────────────────────
     if "```" in stripped:
         m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
         if m:
@@ -270,6 +312,53 @@ def _keepalive_worker() -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "model": _model_id}
+
+@app.get("/v1/tools")
+def list_tools():
+    """Return the available tools schema (from tool_runner.TOOLS)."""
+    try:
+        import sys, pathlib
+        src_dir = str(pathlib.Path(__file__).parent)
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        from tool_runner import TOOLS
+        return {"tools": TOOLS}
+    except ImportError:
+        return {"tools": [], "warning": "tool_runner.py not found"}
+
+class ToolCallRequest(BaseModel):
+    name:      str
+    arguments: dict = {}
+    cfg:       dict = {}
+
+@app.post("/v1/tools/call")
+def call_tool(req: ToolCallRequest):
+    """
+    Execute a tool call and return the result.
+    The chat UI calls this when the model returns a tool_calls response.
+    Proxies to tool_runner.dispatch_tool() which has Brave/DDG web search,
+    URL fetching, toolkit functions, and DB queries.
+    """
+    try:
+        import sys, pathlib, dotenv, os
+        src_dir = str(pathlib.Path(__file__).parent)
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        # Load .env so BRAVE_SEARCH_API_KEY is available
+        env_path = pathlib.Path(__file__).parent.parent / ".env"
+        if env_path.exists():
+            dotenv.load_dotenv(env_path, override=False)
+        from tool_runner import dispatch_tool
+        cfg = {
+            "db_path": req.cfg.get("db_path", "DATA/paper_account.db"),
+            "web_search_results": req.cfg.get("web_search_results", 5),
+        }
+        result = dispatch_tool(req.name, req.arguments, cfg)
+        return {"result": result, "tool": req.name}
+    except ImportError as e:
+        return {"result": f"tool_runner not available: {e}", "tool": req.name}
+    except Exception as e:
+        return {"result": f"Tool error: {e}", "tool": req.name}
 
 @app.get("/v1/models")
 def list_models():
@@ -407,7 +496,14 @@ def chat_completions(req: ChatRequest):
     for eos in ("<|im_end|>", "</s>", "[/INST]", "<|endoftext|>"):
         raw = raw.replace(eos, "").strip()
 
-    tool_call   = _parse_tool_call(raw)
+    # Strip preamble text before XML tool calls (e.g. "I'll search for you.\n\n<tool_call>...")
+    # so the tool call parser sees a clean input
+    raw_for_tool = raw
+    if "<tool_call>" in raw:
+        tc_idx = raw.find("<tool_call>")
+        raw_for_tool = raw[tc_idx:]
+
+    tool_call   = _parse_tool_call(raw_for_tool)
     comp_tokens = _count_tokens(raw)
     tok_per_sec = round(comp_tokens / elapsed, 1)
 

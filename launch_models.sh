@@ -9,13 +9,15 @@
 # Pair 3: Qwen3.6-35B-A3B-int4 + LFM2.5-8B-A1B    (~23GB)
 #
 # Usage:
-#   ./launch_models.sh                  # use pair from .model_pair
-#   ./launch_models.sh --pair 1         # override pair selection
-#   ./launch_models.sh --with-webui     # launch Open WebUI on port 8080
-#   ./launch_models.sh --stop           # stop all servers
-#   ./launch_models.sh --status         # check health
-#   ./launch_models.sh --logs           # tail log files
-#   ./launch_models.sh --restart        # stop then start
+#   ./launch_models.sh                    # use pair from .model_pair
+#   ./launch_models.sh --pair 1           # override pair selection
+#   ./launch_models.sh --with-chainlit    # launch Chainlit chat UI on port 8080 (primary)
+#   ./launch_models.sh --with-chat        # launch standalone trading_chat.html on port 3000
+#   ./launch_models.sh --with-webui       # launch Open WebUI on port 8080 (legacy)
+#   ./launch_models.sh --stop             # stop all servers
+#   ./launch_models.sh --status           # check health
+#   ./launch_models.sh --logs             # tail log files
+#   ./launch_models.sh --restart          # stop then start
 # =============================================================================
 set -euo pipefail
 
@@ -45,19 +47,22 @@ WEBUI_PORT=8080
 PAIR_OVERRIDE=""
 WITH_WEBUI=false
 WITH_CHAT=false
+WITH_CHAINLIT=false
 CHAT_PORT=3000
+CHAINLIT_PORT=8080
 ACTION="start"
 
 for arg in "$@"; do
     case "$arg" in
-        --pair)           shift; PAIR_OVERRIDE="${1:-}"; shift ;;
-        --pair=*)         PAIR_OVERRIDE="${arg#--pair=}" ;;
-        --with-webui)     WITH_WEBUI=true ;;
-        --with-chat)      WITH_CHAT=true ;;   # start standalone chat UI on port 3000
-        --stop|stop)      ACTION="stop" ;;
-        --status|status)  ACTION="status" ;;
-        --logs|logs)      ACTION="logs" ;;
-        --restart|restart) ACTION="restart" ;;
+        --pair)             shift; PAIR_OVERRIDE="${1:-}"; shift ;;
+        --pair=*)           PAIR_OVERRIDE="${arg#--pair=}" ;;
+        --with-webui)       WITH_WEBUI=true ;;
+        --with-chat)        WITH_CHAT=true ;;
+        --with-chainlit)    WITH_CHAINLIT=true ;;
+        --stop|stop)        ACTION="stop" ;;
+        --status|status)    ACTION="status" ;;
+        --logs|logs)        ACTION="logs" ;;
+        --restart|restart)  ACTION="restart" ;;
     esac
 done
 
@@ -145,9 +150,11 @@ case "$ACTION" in
         stop_server "$P2_PID" "Port $P2_PORT"
         stop_server "$WEBUI_PID" "Open WebUI"
         stop_server "$PID_DIR/chat_ui.pid" "Chat UI"
+        stop_server "$PID_DIR/chainlit.pid" "Chainlit"
         pkill -f "serve_model.py" 2>/dev/null || true
-        pkill -f "open-webui" 2>/dev/null || true
-        fuser -k "${CHAT_PORT:-3000}/tcp" 2>/dev/null || true
+        pkill -f "open-webui"     2>/dev/null || true
+        pkill -f "chainlit"       2>/dev/null || true
+        fuser -k "${CHAT_PORT}/tcp" 2>/dev/null || true
         ok "All servers stopped"; exit 0 ;;
     status)
         echo -e "\n${BOLD}Model Server Status (Pair $PAIR: ${PAIR_NOTE[$PAIR]})${RESET}"
@@ -164,6 +171,9 @@ case "$ACTION" in
         done
         if server_alive "$WEBUI_PID"; then
             ok "Port $WEBUI_PORT — Open WebUI (PID $(server_pid "$WEBUI_PID")) — READY"
+        fi
+        if server_alive "$PID_DIR/chainlit.pid"; then
+            ok "Port $CHAINLIT_PORT — Chainlit (PID $(server_pid "$PID_DIR/chainlit.pid")) — READY"
         fi
         exit 0 ;;
     logs)
@@ -211,7 +221,43 @@ info "Starting Port $P2_PORT ($ID_P2)..."
 P2_PID_VAL=$!
 echo "$P2_PID_VAL" > "$P2_PID"
 
-# ── Launch WebUI (Optional) ───────────────────────────────────────────────────
+# ── Optional: Chainlit UI (primary chat interface, port 8080) ─────────────────
+if $WITH_CHAINLIT; then
+    if [[ -f "$ROOT_DIR/chainlit_app.py" ]] && [[ -x "$VENV/bin/chainlit" ]]; then
+        stop_server "$PID_DIR/chainlit.pid" "existing Chainlit"
+        free_port "$CHAINLIT_PORT"
+        info "Starting Chainlit UI on port $CHAINLIT_PORT..."
+        cd "$ROOT_DIR"
+        BACKEND_URL="http://127.0.0.1:$P1_PORT" \
+        MODEL_ID="$ID_P1" \
+        "$VENV/bin/chainlit" run chainlit_app.py \
+            --host 0.0.0.0 --port "$CHAINLIT_PORT" --headless \
+            > "$LOG_DIR/chainlit_8080.log" 2>&1 &
+        echo "$!" > "$PID_DIR/chainlit.pid"
+        ok "Chainlit UI launched — http://localhost:${CHAINLIT_PORT} (PID $!)"
+        cd - >/dev/null
+    else
+        warn "chainlit_app.py or chainlit binary not found — skipping"
+        warn "Install with: pip install chainlit"
+    fi
+fi
+
+# ── Optional: Standalone Chat UI (fallback, port 3000) ────────────────────────
+if $WITH_CHAT; then
+    if [[ -f "$ROOT_DIR/trading_chat.html" ]]; then
+        fuser -k "${CHAT_PORT}/tcp" 2>/dev/null || true
+        sleep 1
+        cd "$ROOT_DIR"
+        python3 -m http.server "$CHAT_PORT" > "$LOG_DIR/chat_ui.log" 2>&1 &
+        echo "$!" > "$PID_DIR/chat_ui.pid"
+        ok "Chat UI launched — http://localhost:${CHAT_PORT}/trading_chat.html (PID $!)"
+        cd - >/dev/null
+    else
+        warn "trading_chat.html not found — skipping standalone chat UI"
+    fi
+fi
+
+# ── Optional: Open WebUI (legacy, port 8080) ──────────────────────────────────
 if $WITH_WEBUI; then
     if [[ -x "$VENV/bin/open-webui" ]]; then
         stop_server "$WEBUI_PID" "existing Open WebUI"
@@ -219,22 +265,13 @@ if $WITH_WEBUI; then
         info "Starting Open WebUI on port $WEBUI_PORT..."
         export OPENAI_API_BASE_URLS="http://127.0.0.1:$P1_PORT/v1;http://127.0.0.1:$P2_PORT/v1"
         export WEBUI_PORT="$WEBUI_PORT"
-        # Fixed secret key — prevents browser token invalidation on restart
         export WEBUI_SECRET_KEY="$(cat "$ROOT_DIR/.webui_secret_key" 2>/dev/null || echo 'trading-income-local-secret-key')"
-        # Disable Ollama (not running, causes model list errors)
         export ENABLE_OLLAMA_API="false"
-        # Disable background tasks that fire concurrent inference requests
-        # while the main generation is holding _infer_lock
         export ENABLE_TITLE_GENERATION="false"
         export ENABLE_TAGS_GENERATION="false"
         export ENABLE_FOLLOW_UP_GENERATION="false"
-        # v0.11.x bug: ORJSON serialization drops SSE lines containing
-        # certain characters, causing empty responses. Disable it.
         export ENABLE_ORJSON="false"
-        # Disable WebSocket — fall back to HTTP polling which works reliably
-        # with local pip-installed OpenWebUI. WebSocket fails on direct connections.
         export ENABLE_WEBSOCKET_SUPPORT="false"
-        # Increase timeouts for slow local models (2-3 tok/s = long generations)
         export AIOHTTP_CLIENT_TIMEOUT="600"
         export AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT="600"
         export AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST="10"
@@ -246,23 +283,7 @@ if $WITH_WEBUI; then
     fi
 fi
 
-# ── Optional: Standalone Chat UI (port 3000) ──────────────────────────────────
-if $WITH_CHAT || $WITH_WEBUI; then
-    # Kill any existing chat server
-    fuser -k "${CHAT_PORT}/tcp" 2>/dev/null || true
-    sleep 1
-    # Serve trading_chat.html via Python HTTP server
-    if [[ -f "$ROOT_DIR/trading_chat.html" ]]; then
-        cd "$ROOT_DIR"
-        python3 -m http.server "$CHAT_PORT" > "$LOG_DIR/chat_ui.log" 2>&1 &
-        CHAT_PID=$!
-        echo "$CHAT_PID" > "$PID_DIR/chat_ui.pid"
-        cd - >/dev/null
-        ok "Chat UI launched — http://localhost:${CHAT_PORT}/trading_chat.html (PID $CHAT_PID)"
-    else
-        warn "trading_chat.html not found — skipping standalone chat UI"
-    fi
-fi
+# ── Health Poll with Fast-Fail ────────────────────────────────────────────────
 echo ""
 info "Loading weights into Arc iGPU memory..."
 info "Cold start compiles Level Zero blobs (~45s). Subsequent starts: <5s."
@@ -314,13 +335,15 @@ echo -e "  ${YELLOW}Phase 1 (Port $P1_PORT):${RESET}  $ID_P1"
 echo -e "  ${YELLOW}Phase 2 (Port $P2_PORT):${RESET}  $ID_P2"
 echo ""
 echo -e "  ${DIM}Both models resident in Arc iGPU VRAM simultaneously${RESET}"
-if $WITH_WEBUI && [[ -x "$VENV/bin/open-webui" ]]; then
-    echo -e "  ${YELLOW}Chat WebUI:${RESET}            http://localhost:$WEBUI_PORT"
+echo ""
+if $WITH_CHAINLIT; then
+    echo -e "  ${YELLOW}Chainlit Chat UI:${RESET}      http://localhost:${CHAINLIT_PORT}"
 fi
-if $WITH_CHAT || $WITH_WEBUI; then
-    if [[ -f "$ROOT_DIR/trading_chat.html" ]]; then
-        echo -e "  ${YELLOW}Trading Chat UI:${RESET}       http://localhost:${CHAT_PORT}/trading_chat.html"
-    fi
+if $WITH_CHAT; then
+    echo -e "  ${YELLOW}Standalone Chat UI:${RESET}    http://localhost:${CHAT_PORT}/trading_chat.html"
+fi
+if $WITH_WEBUI && [[ -x "$VENV/bin/open-webui" ]]; then
+    echo -e "  ${YELLOW}Open WebUI (legacy):${RESET}   http://localhost:$WEBUI_PORT"
 fi
 echo ""
 echo -e "  Status:  ${CYAN}./launch_models.sh --status${RESET}"

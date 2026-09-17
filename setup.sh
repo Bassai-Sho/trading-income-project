@@ -182,7 +182,7 @@ fi
 run_spinner "Installing OpenVINO GenAI nightly runtime" \
     pip install --pre -U openvino openvino-genai openvino-tokenizers \
     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly --quiet
-ok "All dependencies & Streamlit active"
+ok "All dependencies & Chainlit active"
 
 # 4. API Keys
 if ! $MODELS_ONLY; then
@@ -364,7 +364,9 @@ fi
 # 8. Verification
 hdr "8 / 8  Source Code Verification"
 for f in src/runner.py src/trading_engine.py src/market_data_store.py \
-         src/historical_sim.py src/data_corrector.py src/session_analyser.py src/serve_model.py; do
+         src/historical_sim.py src/data_corrector.py src/session_analyser.py \
+         src/serve_model.py src/market_calendar.py chainlit_app.py; do
+    [[ -f "$f" ]] || { warn "$f — not found (skipping)"; continue; }
     "$VENV_DIR/bin/python3" -c "import ast; ast.parse(open('$f').read())" 2>/dev/null && ok "$f" || fail "$f — syntax error"
 done
 
@@ -373,12 +375,10 @@ echo -e "${BOLD}${CYAN}═══════════════════
 echo -e "${BOLD}${GREEN} Setup Complete — Ready for Launch${RESET}"
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 echo ""
-echo -e "  1. Start Model Servers:  ${CYAN}./launch_models.sh${RESET}"
-echo -e "  2. Start Chat UI:        ${CYAN}python3 -m http.server 3000 &${RESET}"
-echo -e "     Then open:            ${CYAN}http://localhost:3000/trading_chat.html${RESET}"
-echo -e "     (Optional WebUI):     ${CYAN}./launch_models.sh --with-webui${RESET}"
-echo -e "  3. Pre-Flight Check:     ${CYAN}./verify.sh${RESET}"
-echo -e "  4. Start Live System:    ${CYAN}python3 src/runner.py${RESET}"
+echo -e "  1. Start Model Servers:  ${CYAN}./launch_models.sh --with-chainlit${RESET}"
+echo -e "     Chat UI (Chainlit):   ${CYAN}http://localhost:8080${RESET}"
+echo -e "  2. Pre-Flight Check:     ${CYAN}./verify.sh${RESET}"
+echo -e "  3. Start Live System:    ${CYAN}python3 src/runner.py${RESET}"
 if [[ -f "/etc/systemd/system/trading-runner.service" ]]; then
     echo -e "  4. Service Management:   ${CYAN}sudo systemctl status trading-runner${RESET}"
 fi
