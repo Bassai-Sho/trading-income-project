@@ -1,0 +1,14 @@
+/* Hide the Chainlit default logo in empty/welcome state */
+img.h-16.w-16.rounded-full {
+    display: none !important;
+}
+div.flex.flex-col.gap-2.mb-2.items-center {
+    display: none !important;
+}
+
+/* Hide thread title "Re" in header but keep profile button visible.
+   The thread title is a line-clamp span inside the first div child of
+   div.flex.items-center — NOT inside button#chat-profiles */
+div#header div.flex.items-center > div:not(.relative) [class*="line-clamp"] {
+    display: none !important;
+}
