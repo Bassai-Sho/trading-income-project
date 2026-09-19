@@ -11,6 +11,7 @@ LOGS/
 *.db
 *.db-shm
 *.db-wal
+trading_engine.log
 
 # Generated model state files — rebuilt by historical_sim.py
 markov_state.json
@@ -32,8 +33,9 @@ venv/
 .venv/
 env/
 
-# Streamlit
+# Streamlit & Chainlit
 .streamlit/
+.chainlit/
 
 # OS
 .DS_Store
