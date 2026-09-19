@@ -5,7 +5,7 @@
 # Starts both model servers concurrently in the project .venv.
 #
 # Pair 1: Qwen3.8-27B-int4    + Phi-4-mini-int4   (~19GB)
-# Pair 2: Qwen3.6-35B-A3B-int4 + Mistral-Nemo-12B (~25GB)
+# Pair 2: Qwen3.6-35B-A3B-int4 + Mistral-7B-v0.1-int4 (~21GB)
 # Pair 3: Qwen3.6-35B-A3B-int4 + LFM2.5-8B-A1B    (~23GB)
 #
 # Usage:
@@ -68,11 +68,11 @@ done
 
 declare -A DEFAULT_P1_DIR=([1]='qwen3.8-27b-int4'  [2]='qwen3.6-35b-a3b'  [3]='qwen3.6-35b-a3b')
 declare -A DEFAULT_P1_ID=( [1]='qwen3.8:27b'       [2]='qwen3.6:35b-a3b'  [3]='qwen3.6:35b-a3b')
-declare -A DEFAULT_P2_DIR=([1]='phi-4-mini-int4'   [2]='mistral-nemo-12b' [3]='lfm2.5-8b-a1b')
-declare -A DEFAULT_P2_ID=( [1]='phi-4-mini:int4'   [2]='mistral-nemo:12b' [3]='lfm2.5:8b')
+declare -A DEFAULT_P2_DIR=([1]='phi-4-mini-int4'   [2]='mistral-7b-v01-int4' [3]='lfm2.5-8b-a1b')
+declare -A DEFAULT_P2_ID=( [1]='phi-4-mini:int4'   [2]='mistral-7b:int4'     [3]='lfm2.5:8b')
 declare -A PAIR_NOTE=(
     [1]='Qwen3.8-27B-int4 (MTP built-in) + Phi-4-mini (~19GB)'
-    [2]='Qwen3.6-35B-A3B-int4 MoE + Mistral-Nemo-12B (~25GB)'
+    [2]='Qwen3.6-35B-A3B-int4 MoE + Mistral-7B-v0.1-int4 (~21GB)'
     [3]='Qwen3.6-35B-A3B-int4 MoE + LFM2.5-8B-A1B (~23GB)'
 )
 
@@ -188,8 +188,15 @@ info "${PAIR_NOTE[$PAIR]}\n"
 
 [[ -d "$VENV" ]]         || { fail ".venv not found. Run ./prepare_host.sh"; exit 1; }
 [[ -f "$SERVE_SCRIPT" ]] || { fail "src/serve_model.py not found"; exit 1; }
-[[ -d "$MODEL_P1" ]]     || { fail "Phase 1 model not found: $MODEL_P1\nRun: ./prepare_host.sh --pair $PAIR --models-only"; exit 1; }
-[[ -d "$MODEL_P2" ]]     || { fail "Phase 2 model not found: $MODEL_P2\nRun: ./prepare_host.sh --pair $PAIR --models-only"; exit 1; }
+[[ -d "$MODEL_P1" ]]     || { fail "Phase 1 model not found: $MODEL_P1\nRun: ./setup.sh --pair $PAIR --models-only"; exit 1; }
+if [[ ! -d "$MODEL_P2" ]]; then
+    warn "Phase 2 model not found: $MODEL_P2"
+    warn "Run: ./setup.sh --pair $PAIR --models-only  to download it"
+    warn "Continuing with Phase 1 only..."
+    SKIP_P2=true
+else
+    SKIP_P2=false
+fi
 
 stop_server "$P1_PID" "existing port $P1_PORT"
 stop_server "$P2_PID" "existing port $P2_PORT"
@@ -212,32 +219,33 @@ P1_PID_VAL=$!
 echo "$P1_PID_VAL" > "$P1_PID"
 
 # ── Launch Phase 2 ────────────────────────────────────────────────────────────
-info "Starting Port $P2_PORT ($ID_P2)..."
-
-"$VENV/bin/python3" "$SERVE_SCRIPT" \
-    --model-path "$MODEL_P2" --model-id "$ID_P2" \
-    --port "$P2_PORT" --device GPU \
-    > "$P2_LOG" 2>&1 &
-P2_PID_VAL=$!
-echo "$P2_PID_VAL" > "$P2_PID"
+if ! $SKIP_P2; then
+    info "Starting Port $P2_PORT ($ID_P2)..."
+    "$VENV/bin/python3" "$SERVE_SCRIPT" \
+        --model-path "$MODEL_P2" --model-id "$ID_P2" \
+        --port "$P2_PORT" --device GPU \
+        > "$P2_LOG" 2>&1 &
+    P2_PID_VAL=$!
+    echo "$P2_PID_VAL" > "$P2_PID"
+fi
 
 # ── Optional: Chainlit UI (primary chat interface, port 8080) ─────────────────
 if $WITH_CHAINLIT; then
-    if [[ -f "$ROOT_DIR/chainlit_app.py" ]] && [[ -x "$VENV/bin/chainlit" ]]; then
+    if [[ -f "$ROOT_DIR/src/chainlit_app.py" ]] && [[ -x "$VENV/bin/chainlit" ]]; then
         stop_server "$PID_DIR/chainlit.pid" "existing Chainlit"
         free_port "$CHAINLIT_PORT"
         info "Starting Chainlit UI on port $CHAINLIT_PORT..."
         cd "$ROOT_DIR"
         BACKEND_URL="http://127.0.0.1:$P1_PORT" \
         MODEL_ID="$ID_P1" \
-        "$VENV/bin/chainlit" run chainlit_app.py \
+        "$VENV/bin/chainlit" run src/chainlit_app.py \
             --host 0.0.0.0 --port "$CHAINLIT_PORT" --headless \
             > "$LOG_DIR/chainlit_8080.log" 2>&1 &
         echo "$!" > "$PID_DIR/chainlit.pid"
         ok "Chainlit UI launched — http://localhost:${CHAINLIT_PORT} (PID $!)"
         cd - >/dev/null
     else
-        warn "chainlit_app.py or chainlit binary not found — skipping"
+        warn "src/chainlit_app.py or chainlit binary not found — skipping"
         warn "Install with: pip install chainlit"
     fi
 fi
@@ -300,7 +308,7 @@ while (( ELAPSED < MAX_WAIT )); do
         tail -n 12 "$P1_LOG" | while IFS= read -r l; do echo -e "    ${DIM}$l${RESET}"; done
         exit 1
     fi
-    if ! kill -0 "$P2_PID_VAL" 2>/dev/null; then
+    if ! $SKIP_P2 && ! kill -0 "$P2_PID_VAL" 2>/dev/null; then
         echo ""
         fail "Phase 2 server on port $P2_PORT crashed on startup. Error log ($P2_LOG):"
         tail -n 12 "$P2_LOG" | while IFS= read -r l; do echo -e "    ${DIM}$l${RESET}"; done
@@ -310,7 +318,7 @@ while (( ELAPSED < MAX_WAIT )); do
     P1_UP=false
     P2_UP=false
     curl -sf "http://127.0.0.1:$P1_PORT/health" >/dev/null 2>&1 && P1_UP=true
-    curl -sf "http://127.0.0.1:$P2_PORT/health" >/dev/null 2>&1 && P2_UP=true
+    $SKIP_P2 && P2_UP=true || { curl -sf "http://127.0.0.1:$P2_PORT/health" >/dev/null 2>&1 && P2_UP=true; }
 
     if $P1_UP && $P2_UP; then
         break

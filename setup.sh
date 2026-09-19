@@ -117,15 +117,15 @@ done
 
 declare -A PAIR_LABEL=(
     [1]='Most Popular    — Qwen3.8-27B-int4 (MTP built-in) + Phi-4-mini (~19GB)'
-    [2]='MoE Speed       — Qwen3.6-35B-A3B-int4 + Mistral-Nemo-int4   (~25GB)'
+    [2]='MoE Speed       — Qwen3.6-35B-A3B-int4 + Mistral-7B-v0.1-int4  (~21GB)'
     [3]='Novel Adversary — Qwen3.6-35B-A3B-int4 + LFM2.5-8B-A1B-int4 (~23GB)'
 )
 declare -A P1_HF_REPO=([1]='OpenVINO/Qwen3.8-27B-int4-ov' [2]='OpenVINO/Qwen3.6-35B-A3B-int4-ov' [3]='OpenVINO/Qwen3.6-35B-A3B-int4-ov')
 declare -A P1_DIR=([1]='qwen3.8-27b-int4' [2]='qwen3.6-35b-a3b' [3]='qwen3.6-35b-a3b')
 declare -A P1_ID=([1]='qwen3.8:27b' [2]='qwen3.6:35b-a3b' [3]='qwen3.6:35b-a3b')
-declare -A P2_HF_REPO=([1]='OpenVINO/Phi-4-mini-instruct-int4-ov' [2]='OpenVINO/Mistral-Nemo-Instruct-2407-int4-ov' [3]='OpenVINO/LFM2.5-8B-A1B-int4-ov')
-declare -A P2_DIR=([1]='phi-4-mini-int4' [2]='mistral-nemo-12b' [3]='lfm2.5-8b-a1b')
-declare -A P2_ID=([1]='phi-4-mini:int4' [2]='mistral-nemo:12b' [3]='lfm2.5:8b')
+declare -A P2_HF_REPO=([1]='OpenVINO/Phi-4-mini-instruct-int4-ov' [2]='OpenVINO/mistral-7b-instruct-v0.1-int4-ov' [3]='OpenVINO/LFM2.5-8B-A1B-int4-ov')
+declare -A P2_DIR=([1]='phi-4-mini-int4' [2]='mistral-7b-v01-int4' [3]='lfm2.5-8b-a1b')
+declare -A P2_ID=([1]='phi-4-mini:int4' [2]='mistral-7b:int4' [3]='lfm2.5:8b')
 declare -A DRAFT_REPO=([1]='' [2]='OpenVINO/Qwen3-0.6B-int4-ov' [3]='OpenVINO/Qwen3-0.6B-int4-ov')
 declare -A DRAFT_LOCAL=([1]='' [2]='draft-qwen3-0.6b' [3]='draft-qwen3-0.6b')
 
@@ -365,7 +365,7 @@ fi
 hdr "8 / 8  Source Code Verification"
 for f in src/runner.py src/trading_engine.py src/market_data_store.py \
          src/historical_sim.py src/data_corrector.py src/session_analyser.py \
-         src/serve_model.py src/market_calendar.py chainlit_app.py; do
+         src/serve_model.py src/market_calendar.py src/chainlit_app.py; do
     [[ -f "$f" ]] || { warn "$f — not found (skipping)"; continue; }
     "$VENV_DIR/bin/python3" -c "import ast; ast.parse(open('$f').read())" 2>/dev/null && ok "$f" || fail "$f — syntax error"
 done

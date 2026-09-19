@@ -1,34 +1,35 @@
 [project]
-# Disable telemetry — local deployment
 enable_telemetry = false
-
-# No user-provided env vars needed (serve_model.py handles .env)
 user_env = []
 
 [features]
-# Allow markdown with embedded HTML (for trading data tables)
 unsafe_allow_html = true
+multi_modal = true
 
-# Single-model setup — no multi-modal file uploads needed
-multi_modal = false
+# File uploads (v1.1.0+)
+[features.spontaneous_file_upload]
+    enabled = true
+    accept = ["image/*", "application/pdf", "text/csv", "text/plain", "application/json"]
+    max_files = 3
+    max_size_mb = 10
 
-# Prompt playground disabled — we have custom settings panel
-prompt_playground = false
+# Message editing — allow user to edit and resend (v1.1.306)
+[features.edit_message]
+    enabled = true
 
 [UI]
 name = "Trading AI"
 description = "Intel Arc iGPU · Qwen3.8-27B · OpenVINO GenAI"
 default_theme = "dark"
 layout = "wide"
-
-# Hide the Chainlit watermark
 hide_cta = true
 
-[UI.theme]
-# Dark trading-terminal colour palette
-primary = "#4f8ef7"
-background = "#0f1117"
-paper = "#1a1d26"
+# Custom JS for favicon override
+custom_js = "/public/header.js"
+
+# Avatar sizes (v2.10.0)
+# Place avatar PNGs in public/avatars/ named by author
+# e.g. public/avatars/Trading AI.png, public/avatars/System.png
 
 [meta]
 generated_by = "trading-income-project"
