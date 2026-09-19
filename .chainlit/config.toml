@@ -5,17 +5,13 @@ user_env = []
 [features]
 unsafe_allow_html = true
 multi_modal = true
+edit_message = true
 
-# File uploads (v1.1.0+)
 [features.spontaneous_file_upload]
     enabled = true
     accept = ["image/*", "application/pdf", "text/csv", "text/plain", "application/json"]
     max_files = 3
     max_size_mb = 10
-
-# Message editing — allow user to edit and resend (v1.1.306)
-[features.edit_message]
-    enabled = true
 
 [UI]
 name = "Trading AI"
@@ -24,12 +20,12 @@ default_theme = "dark"
 layout = "wide"
 hide_cta = true
 
-# Custom JS for favicon override
-custom_js = "/public/header.js"
+# Don't show readme as default — hides the watermark/logo area
+show_readme_as_default = false
 
-# Avatar sizes (v2.10.0)
-# Place avatar PNGs in public/avatars/ named by author
-# e.g. public/avatars/Trading AI.png, public/avatars/System.png
+# Custom CSS and JS
+custom_css = "/public/custom.css"
+custom_js = "/public/header.js"
 
 [meta]
 generated_by = "trading-income-project"

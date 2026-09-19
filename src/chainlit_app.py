@@ -45,6 +45,19 @@ _client  = AsyncOpenAI(
     http_client=_http,
 )
 
+# ── Path setup ────────────────────────────────────────────────────────────────
+# chainlit_app.py lives in src/ — project root is one level up
+_project_root = Path(__file__).parent.parent
+_src = str(Path(__file__).parent)   # src/ itself
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_project_root / ".env", override=False)
+except ImportError:
+    pass
+
 # ── SQLite chat history ────────────────────────────────────────────────────────
 _DB_PATH = str(_project_root / "DATA" / "chainlit_history.db")
 
@@ -94,19 +107,6 @@ def _db_load_thread(thread_id: str) -> list[dict]:
             return [{"role": r[0], "content": r[1]} for r in rows]
     except Exception:
         return []
-
-# chainlit_app.py lives in src/ — project root is one level up
-_project_root = Path(__file__).parent.parent
-_src = str(Path(__file__).parent)   # src/ itself
-if _src not in sys.path:
-    sys.path.insert(0, _src)
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv(_project_root / ".env", override=False)
-except ImportError:
-    pass
-
 
 # ── LaTeX fix (Mindfire Technology pattern) ───────────────────────────────────
 def fix_latex(text: str) -> str:
@@ -367,90 +367,55 @@ async def set_chat_profiles():
             name="Research",
             markdown_description="**Web Search enabled** — searches the web and fetches articles for grounded answers. Best for news, prices, and current market data.",
             icon="🔍",
+            starters=[
+                cl.Starter(label="📰 Top news today",
+                           message="What are the top 3 market-moving news items today?"),
+                cl.Starter(label="📈 SPY right now",
+                           message="What is SPY trading at today and what are analysts saying?"),
+                cl.Starter(label="📅 Earnings this week",
+                           message="Which notable companies report earnings this week?"),
+                cl.Starter(label="⚡ VIX check",
+                           message="What is the current VIX level and what does it signal?"),
+            ],
         ),
         cl.ChatProfile(
             name="D-A-C",
             markdown_description="**Deep Analysis** — thinking mode on, web search enabled. Slower but much deeper reasoning. Use for Divergence-Adversarial-Convergence sessions, strategy review, and complex analysis.",
             icon="🧠",
+            starters=[
+                cl.Starter(label="🧠 Start D-A-C Gate 0",
+                           message="Run a D-A-C review. Start with Gate 0: explain the full methodology."),
+                cl.Starter(label="⚔️ Stress-test my setup",
+                           message="Adversarially stress-test my SPY 0DTE approach. Find the 3 most likely failure modes."),
+                cl.Starter(label="📐 Kelly sizing review",
+                           message="Review my position sizing using Kelly Criterion. What adjustments given recent drawdown?"),
+                cl.Starter(label="📊 V-D-U-R analysis",
+                           message="Has my edge degraded? Run a V-D-U-R analysis on my last 20 trades."),
+            ],
         ),
         cl.ChatProfile(
             name="Quick Chat",
             markdown_description="**No tools, fast responses** — direct conversation without web search or extended reasoning. Best for quick questions and explanations.",
             icon="⚡",
+            starters=[
+                cl.Starter(label="📖 Explain VWAP",
+                           message="Explain VWAP and how I should use it for intraday entries."),
+                cl.Starter(label="🎯 What is EV?",
+                           message="Explain Expected Value in the context of trading and why it matters."),
+                cl.Starter(label="📏 ATR usage",
+                           message="How do I use ATR for position sizing and stop placement?"),
+                cl.Starter(label="🔢 Options Greeks",
+                           message="Explain the key Greeks I need to understand for 0DTE trading."),
+            ],
         ),
     ]
 
 
-@cl.set_commands
-async def set_commands():
-    """
-    ChatGPT-style slash commands (v2.0.5).
-    These appear in a dropdown when the user types / in the input box,
-    AND as button: True commands appear as clickable pills below the composer.
-    More discoverable than settings toggles or action buttons.
-    """
-    return [
-        cl.Command(name="dac",     button=True,  description="▶ Start a D-A-C session"),
-        cl.Command(name="toolkit", button=True,  description="📊 Run trading toolkit"),
-        cl.Command(name="think",   button=True,  description="🧠 Toggle thinking mode"),
-        cl.Command(name="search",  button=False, description="🔍 Force web search"),
-        cl.Command(name="clear",   button=False, description="🗑️ Clear chat history"),
-        cl.Command(name="model",   button=False, description="🔄 Switch model port"),
-        cl.Command(name="help",    button=False, description="❓ Show available commands"),
-    ]
+# Note: @cl.set_commands requires Chainlit v2.0.5+ — using @cl.on_message
+# command detection instead for version compatibility.
+# Quick-action buttons are sent as cl.Action on the welcome message.
 
 
-@cl.set_starters
-async def set_starters():
-    profile = cl.context.session.chat_profile or "Research"
-    if profile == "D-A-C":
-        return [
-            cl.Starter(label="D-A-C Gate 0",
-                       message="Run a D-A-C review. Start with Gate 0: describe the full methodology.",
-                       category="D-A-C Sessions"),
-            cl.Starter(label="Strategy stress-test",
-                       message="Adversarially stress-test my current SPY 0DTE approach. Identify the 3 most likely failure modes.",
-                       category="D-A-C Sessions"),
-            cl.Starter(label="Kelly sizing review",
-                       message="Review my position sizing using Kelly Criterion. What adjustments given recent drawdown?",
-                       category="Risk & Sizing"),
-            cl.Starter(label="Edge validity check",
-                       message="Has my edge degraded? Run a V-D-U-R analysis on my last 20 trades.",
-                       category="Risk & Sizing"),
-        ]
-    elif profile == "Quick Chat":
-        return [
-            cl.Starter(label="Explain VWAP",
-                       message="Explain VWAP and how I should use it for intraday entries.",
-                       category="Concepts"),
-            cl.Starter(label="What is EV?",
-                       message="Explain Expected Value in the context of trading and why it matters.",
-                       category="Concepts"),
-            cl.Starter(label="ATR usage",
-                       message="How do I use ATR for position sizing and stop placement?",
-                       category="Concepts"),
-            cl.Starter(label="Options Greeks",
-                       message="Explain the key Greeks I need to understand for 0DTE trading.",
-                       category="Concepts"),
-        ]
-    else:  # Research
-        return [
-            cl.Starter(label="Market overview",
-                       message="What are the key market headlines and major index movements today?",
-                       category="Market Data"),
-            cl.Starter(label="SPY analysis",
-                       message="What is SPY trading at today and what are analysts saying about near-term direction?",
-                       category="Market Data"),
-            cl.Starter(label="Earnings this week",
-                       message="Which notable companies report earnings this week and what are expectations?",
-                       category="Research"),
-            cl.Starter(label="Volatility check",
-                       message="What is the current VIX level and what does it signal about market conditions?",
-                       category="Research"),
-        ]
-
-
-# ── Session init ──────────────────────────────────────────────────────────────
 @cl.on_chat_start
 async def on_chat_start():
     profile = cl.context.session.chat_profile or "Research"
@@ -487,37 +452,36 @@ async def on_chat_start():
     cl.user_session.set("max_tokens",    max_tokens)
     cl.user_session.set("profile",       profile)
 
-    # Backend health check — graceful degradation (OrionBelt pattern)
-    # Check primary (port 8000) and secondary (port 8001) independently
-    icons = {"Research": "🔍", "D-A-C": "🧠", "Quick Chat": "⚡"}
-    status_lines = []
+    # Backend health check — silent, just sets flags
     p1_ok, p2_ok = False, False
     p1_url = BACKEND_URL
     p2_url = BACKEND_URL.replace(":8000", ":8001")
-
     try:
         async with httpx.AsyncClient(timeout=3.0) as h:
-            r = await h.get(f"{p1_url}/health")
-        d = r.json()
-        status_lines.append(f"✅ `{d.get('model','unknown')}` on `{p1_url}` — ready")
+            await h.get(f"{p1_url}/health")
         p1_ok = True
-    except Exception as e:
-        status_lines.append(f"⚠️ Primary model offline (`{p1_url}`): {type(e).__name__}")
-
+    except Exception:
+        pass
     try:
         async with httpx.AsyncClient(timeout=3.0) as h:
-            r2 = await h.get(f"{p2_url}/health")
-        d2 = r2.json()
-        status_lines.append(f"✅ `{d2.get('model','unknown')}` on `{p2_url}` — ready")
+            await h.get(f"{p2_url}/health")
         p2_ok = True
     except Exception:
-        pass  # P2 offline is non-fatal, don't clutter startup
+        pass
 
-    icon = icons.get(profile, "✅")
-    content = f"{icon} **{profile}** mode\n" + "\n".join(status_lines)
+    # Only send a status message when something needs attention.
+    # When all is well, stay silent so starters appear above the input.
     if not p1_ok:
-        content += "\n\n⏳ Model may still be loading — wait 3-4 minutes after launch."
-    await cl.Message(content=content, author="System").send()
+        await cl.Message(
+            content="⏳ Primary model still loading — allow 3-4 minutes after launch.",
+            author="System"
+        ).send()
+    elif not p2_ok:
+        await cl.Message(
+            content="⚠️ Secondary model (port 8001) offline — primary only.",
+            author="System"
+        ).send()
+    # else: silent — starters render above input automatically
 
 
 @cl.on_settings_update
@@ -676,7 +640,7 @@ async def on_message(message: cl.Message):
             err_msg = cl.Message(
                 content=f"❌ Backend error: {e}\n\n{hint}",
                 author="System",
-                actions=[cl.Action(name="retry", value="retry", label="🔄 Retry")]
+                actions=[cl.Action(name="retry", payload={"value": "retry"}, label="🔄 Retry")]
             )
             await err_msg.send()
             history.pop()
@@ -798,19 +762,43 @@ async def on_message(message: cl.Message):
         _db_save_message(thread_id, "assistant", full_text, profile=profile)
 
         # Actions replaced by /commands (more discoverable, ChatGPT-style)
-        # See @cl.set_commands above for /think /dac /toolkit /clear /search /model
+        # /commands handled in on_message command dispatcher above
 
 
 # ── Action callbacks ──────────────────────────────────────────────────────────
+@cl.action_callback("think")
+async def on_think_action(action):
+    thinking = not cl.user_session.get("thinking_mode", False)
+    cl.user_session.set("thinking_mode", thinking)
+    state = "🟢 ON" if thinking else "🔴 OFF"
+    await cl.Message(content=f"🧠 Thinking mode {state}", author="System").send()
+
+
+@cl.action_callback("help")
+async def on_help(action):
+    await cl.Message(
+        content=(
+            "**Available commands:**\n"
+            "- `/think` — toggle 🧠 thinking mode on/off\n"
+            "- `/dac` — start a D-A-C review session\n"
+            "- `/toolkit` — run trading toolkit analysis\n"
+            "- `/search` — enable web search\n"
+            "- `/model` — switch between Qwen3.8 and Phi-4-mini\n"
+            "- `/clear` — clear chat history\n"
+            "- `/help` — show this message"
+        ),
+        author="System"
+    ).send()
+
+
 @cl.action_callback("retry")
 async def on_retry(action):
     history = cl.user_session.get("history", [])
     if len(history) >= 2:
-        # Re-send the last user message
         last_user = next((m["content"] for m in reversed(history)
                           if m["role"] == "user"), None)
         if last_user:
-            cl.user_session.set("history", history[:-2])  # pop last exchange
+            cl.user_session.set("history", history[:-2])
             await on_message(cl.Message(content=last_user))
 
 
