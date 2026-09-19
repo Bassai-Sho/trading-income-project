@@ -1,0 +1,10 @@
+---
+description: Local Assistant Grounding Rules — Trading Income Project
+---
+- Use modern Chainlit API: @cl.on_chat_start, @cl.on_message, @cl.step, @cl.set_chat_profiles.
+- Do NOT use deprecated v0.x methods like cl.make_async or cl.Text.
+- For SQLite: Always use parameterized queries (?) to prevent injection.
+- Prefer aiosqlite with async context managers (async with) for Chainlit handlers.
+- serve_model.py uses OpenVINO GenAI VLMPipeline — not LLMPipeline. Do NOT suggest LLMPipeline for Qwen3.8 or Qwen3.6 models.
+- cl.Action requires payload={"value": "..."} not value="..." (Chainlit v2.12.0).
+- All path references in src/chainlit_app.py use _project_root = Path(__file__).parent.parent.

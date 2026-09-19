@@ -6,9 +6,9 @@ div.flex.flex-col.gap-2.mb-2.items-center {
     display: none !important;
 }
 
-/* Hide thread title "Re" in header but keep profile button visible.
-   The thread title is a line-clamp span inside the first div child of
-   div.flex.items-center — NOT inside button#chat-profiles */
-div#header div.flex.items-center > div:not(.relative) [class*="line-clamp"] {
+/* Hide broken profile icon images throughout — header button and dropdown items.
+   These show alt text (truncated profile name) when the emoji src fails to load */
+img.w-6.h-6.rounded-md,
+img.rounded-md.object-cover {
     display: none !important;
 }

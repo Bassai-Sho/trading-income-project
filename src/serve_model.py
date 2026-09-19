@@ -120,7 +120,7 @@ class ChatRequest(BaseModel):
     messages:        list[Message]
     tools:           list[Tool] | None = None
     tool_choice:     str | dict | None = None
-    max_tokens:      int   = Field(default=1024, ge=1, le=1024)
+    max_tokens:      int   = Field(default=1024, ge=1, le=16384)
     temperature:     float = Field(default=0.2,  ge=0.0, le=2.0)
     stream:          bool  = False
     response_format: ResponseFormat | None = None
@@ -599,6 +599,60 @@ def list_models():
             "created":  int(time.time()),
             "owned_by": "openvino-arc-gpu",
         }],
+    }
+
+
+# ── /v1/completions — Fill-in-the-Middle tab autocomplete (VS Code Continue) ──
+class CompletionRequest(BaseModel):
+    model:       str | None = None
+    prompt:      str  = ""
+    suffix:      str  = ""           # FIM suffix for tab autocomplete
+    max_tokens:  int   = Field(default=128, ge=1, le=512)
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    stream:      bool  = False
+    stop:        list[str] | None = None
+
+
+@app.post("/v1/completions")
+async def completions(req: CompletionRequest, request: Request):
+    """
+    FIM (Fill-in-the-Middle) endpoint for VS Code tab autocomplete.
+    Wraps prompt/suffix into a chat message and returns a completion.
+    """
+    # Build FIM prompt — Qwen2.5-Coder uses <|fim_prefix|> tokens
+    if req.suffix:
+        content = f"<|fim_prefix|>{req.prompt}<|fim_suffix|>{req.suffix}<|fim_middle|>"
+    else:
+        content = req.prompt
+
+    # Reuse chat completion logic via an internal ChatRequest
+    chat_req = ChatRequest(
+        model=req.model,
+        messages=[Message(role="user", content=content)],
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        stream=req.stream,
+    )
+
+    if req.stream:
+        return StreamingResponse(
+            _stream_chat(chat_req, request),
+            media_type="text/event-stream",
+        )
+
+    result = await _complete_chat(chat_req)
+    # Reformat as completions response
+    return {
+        "id":      result["id"].replace("chatcmpl", "cmpl"),
+        "object":  "text_completion",
+        "created": result["created"],
+        "model":   result["model"],
+        "choices": [{
+            "text":          result["choices"][0]["message"]["content"],
+            "index":         0,
+            "finish_reason": result["choices"][0]["finish_reason"],
+        }],
+        "usage": result.get("usage", {}),
     }
 
 @app.post("/v1/chat/completions")

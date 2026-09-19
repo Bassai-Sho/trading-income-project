@@ -66,14 +66,15 @@ for arg in "$@"; do
     esac
 done
 
-declare -A DEFAULT_P1_DIR=([1]='qwen3.8-27b-int4'  [2]='qwen3.6-35b-a3b'  [3]='qwen3.6-35b-a3b')
-declare -A DEFAULT_P1_ID=( [1]='qwen3.8:27b'       [2]='qwen3.6:35b-a3b'  [3]='qwen3.6:35b-a3b')
-declare -A DEFAULT_P2_DIR=([1]='phi-4-mini-int4'   [2]='mistral-7b-v01-int4' [3]='lfm2.5-8b-a1b')
-declare -A DEFAULT_P2_ID=( [1]='phi-4-mini:int4'   [2]='mistral-7b:int4'     [3]='lfm2.5:8b')
+declare -A DEFAULT_P1_DIR=([1]='qwen3.8-27b-int4'  [2]='qwen3.6-35b-a3b'  [3]='qwen3.6-35b-a3b'  [4]='qwen2.5-coder-7b-int4')
+declare -A DEFAULT_P1_ID=( [1]='qwen3.8:27b'       [2]='qwen3.6:35b-a3b'  [3]='qwen3.6:35b-a3b'  [4]='qwen2.5-coder:7b')
+declare -A DEFAULT_P2_DIR=([1]='phi-4-mini-int4'   [2]='mistral-7b-v01-int4' [3]='lfm2.5-8b-a1b' [4]='qwen2.5-coder-1.5b-int4')
+declare -A DEFAULT_P2_ID=( [1]='phi-4-mini:int4'   [2]='mistral-7b:int4'     [3]='lfm2.5:8b'     [4]='qwen2.5-coder:1.5b')
 declare -A PAIR_NOTE=(
     [1]='Qwen3.8-27B-int4 (MTP built-in) + Phi-4-mini (~19GB)'
     [2]='Qwen3.6-35B-A3B-int4 MoE + Mistral-7B-v0.1-int4 (~21GB)'
     [3]='Qwen3.6-35B-A3B-int4 MoE + LFM2.5-8B-A1B (~23GB)'
+    [4]='Qwen2.5-Coder-7B-int4 + Qwen2.5-Coder-1.5B-int4 (~6GB) [15-20 t/s]'
 )
 
 PAIR="$PAIR_OVERRIDE"

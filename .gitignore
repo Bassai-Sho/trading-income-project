@@ -33,7 +33,7 @@ venv/
 .venv/
 env/
 
-# Streamlit & Chainlit
+# Streamlit & Chainlit (config.toml force-added via git add -f)
 .streamlit/
 .chainlit/
 
