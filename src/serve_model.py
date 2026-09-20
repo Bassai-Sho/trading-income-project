@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -652,21 +652,114 @@ def list_models():
 
 
 # ── /v1/completions — Fill-in-the-Middle tab autocomplete (VS Code Continue) ──
+# ── /v1/completions — Fill-in-the-Middle tab autocomplete AND Continue's Edit ─
+# CORRECTED 19 Sep 2026: this endpoint is used for more than autocomplete.
+# Confirmed via a real Continue extension error log: Continue's Edit feature
+# (Cmd/Ctrl+I, "edit/sendPrompt") routes through this same legacy completions
+# API (OpenAI2._legacystreamComplete, useOpenAIAdapter: false) in Continue
+# 2.0.0 — not /v1/chat/completions as originally assumed. A "make this more
+# readable" whole-function rewrite legitimately needs more than 512 tokens of
+# output; that's not a misconfigured client default the way an unconfigured
+# autocomplete request might be, it's a real, bounded need this endpoint has
+# to serve. Ceiling raised to match ChatRequest's existing 16384 (no NEW risk
+# introduced — /v1/completions already delegates straight to
+# chat_completions() below, which already accepts up to 16384 today with no
+# reported GPU-hang symptom at that ceiling). Default kept LOW (128) so
+# autocomplete requests that don't explicitly ask for more stay fast.
 class CompletionRequest(BaseModel):
     model:       str | None = None
     prompt:      str  = ""
     suffix:      str  = ""           # FIM suffix for tab autocomplete
-    max_tokens:  int   = Field(default=128, ge=1, le=512)
+    max_tokens:  int   = Field(default=128, ge=1, le=16384)
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     stream:      bool  = False
     stop:        list[str] | None = None
 
 
+async def _reformat_chat_stream_to_completions(chat_streaming_response: StreamingResponse):
+    """
+    Reassembles OpenAI chat.completion.chunk SSE (choices[0].delta.content)
+    into the older text_completion/cmpl SSE shape (choices[0].text) that
+    Continue's legacy completions-based Edit/autocomplete diff-streaming
+    pipeline expects. See the docstring on completions() for the full story
+    of why this exists — without it, Continue's diff algorithm reads every
+    chunk's text as empty and produces a pure-deletion diff even when the
+    model is generating real content.
+
+    Verified 19 Sep 2026 against real Starlette internals (not just
+    asserted correct): fed a fake sync token-generator through an actual
+    StreamingResponse, iterated its real body_iterator, confirmed this
+    function's reassembled output is character-for-character identical to
+    what went in.
+    """
+    async for raw_chunk in chat_streaming_response.body_iterator:
+        text = raw_chunk.decode("utf-8") if isinstance(raw_chunk, (bytes, bytearray)) else raw_chunk
+        for line in text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):]
+            if payload.strip() == "[DONE]":
+                yield "data: [DONE]\n\n"
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            choice = (obj.get("choices") or [{}])[0]
+            delta_content = choice.get("delta", {}).get("content", "")
+            completions_chunk = {
+                "id":      obj.get("id", "").replace("chatcmpl", "cmpl"),
+                "object":  "text_completion",
+                "created": obj.get("created", int(time.time())),
+                "model":   obj.get("model", _model_id),
+                "choices": [{
+                    "text":          delta_content or "",
+                    "index":         0,
+                    "finish_reason": choice.get("finish_reason"),
+                }],
+            }
+            yield f"data: {json.dumps(completions_chunk)}\n\n"
+
+
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest, request: Request):
     """
-    FIM (Fill-in-the-Middle) endpoint for VS Code tab autocomplete.
-    Wraps prompt/suffix into a chat message and returns a completion.
+    FIM (Fill-in-the-Middle) endpoint for VS Code tab autocomplete AND
+    Continue's Edit feature (both route through this legacy completions API
+    in Continue 2.0.0 — confirmed via real extension logs, 19 Sep 2026).
+
+    FIXED 19 Sep 2026: this previously called _complete_chat(chat_req) and
+    _stream_chat(chat_req, request) — NEITHER of which exists anywhere in
+    this file. chat_completions() is a single monolithic function with no
+    separate, independently-callable helpers; this endpoint appears to have
+    been written assuming a refactor that never actually happened. That
+    means /v1/completions had likely never worked at all, on either path,
+    until fixed here.
+
+    Fix: chat_completions() is a plain function underneath its @app.post
+    decorator — nothing stops it being called directly. It already handles
+    both streaming (returns a StreamingResponse) and non-streaming (returns
+    a dict) internally based on chat_req.stream, so this delegates to it
+    wholesale rather than reimplementing generation logic a second time.
+
+    FIXED 19 Sep 2026 (2nd pass) — the exact caveat flagged in the first fix
+    turned out to be real: returning chat_completions()'s StreamingResponse
+    as-is yields OpenAI chat.completion.chunk-shaped SSE (delta.content).
+    Continue's Edit diff pipeline (streamDiffLines -> streamLines -> ... ->
+    filterCodeBlockLines, confirmed via a real extension stack trace) reads
+    the OLDER text_completion shape (choices[0].text) instead — every chunk's
+    `text` field was reading as empty, so Continue's diff algorithm saw "the
+    model returned nothing to insert" while still correctly seeing the
+    original code to delete. Result: a pure-deletion diff (red block, no
+    green replacement) even though the model was generating real content the
+    whole time — confirmed by the user's own screenshot of exactly this.
+    Fixed by _reformat_chat_stream_to_completions() below, which reassembles
+    the chat-shaped SSE into completions-shaped SSE, chunk for chunk. Tested
+    directly against real Starlette StreamingResponse internals (not just
+    asserted): fed a fake token stream through an actual StreamingResponse,
+    confirmed body_iterator yields plain strings as expected, confirmed the
+    reformatted text field reassembles character-for-character identical to
+    what was streamed in.
     """
     # Build FIM prompt — Qwen2.5-Coder uses <|fim_prefix|> tokens
     if req.suffix:
@@ -684,12 +777,14 @@ async def completions(req: CompletionRequest, request: Request):
     )
 
     if req.stream:
+        chat_stream_response = chat_completions(chat_req)   # a StreamingResponse, chat-shaped
         return StreamingResponse(
-            _stream_chat(chat_req, request),
+            _reformat_chat_stream_to_completions(chat_stream_response),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    result = await _complete_chat(chat_req)
+    result = chat_completions(chat_req)     # plain function call — chat_completions is sync, not async
     # Reformat as completions response
     return {
         "id":      result["id"].replace("chatcmpl", "cmpl"),

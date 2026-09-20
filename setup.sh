@@ -41,7 +41,13 @@ run_spinner() {
 
     local total_elapsed=$(( $(date +%s) - t_start ))
     local ret=0
-    if ! wait "$pid"; then ret=$?; fi
+    # NOTE (20 Sep 2026): this used to be `if ! wait "$pid"; then ret=$?; fi`.
+    # Inside that then-branch $? is the result of the NEGATED test, i.e. always 0,
+    # so run_spinner reported SUCCESS for every failing command (a 404 on the
+    # libigdgmm12 download, a failed `dpkg -i`, ...).  That silent failure is what
+    # left intel-opencl-icd half-installed and made the GPU vanish after the next
+    # apt run.  Capture the real exit code:
+    wait "$pid" || ret=$?
 
     if (( ret == 0 )); then
         ok "$msg ${DIM}(${total_elapsed}s)${RESET}"
@@ -159,9 +165,11 @@ if [[ -f "requirements.txt" ]]; then
 fi
 
 run_spinner "Installing OpenVINO GenAI nightly runtime & FastAPI" \
-    pip install --pre -U openvino openvino-genai openvino-tokenizers fastapi uvicorn huggingface_hub \
+    pip install --pre -U openvino openvino-genai openvino-tokenizers fastapi uvicorn huggingface_hub pyyaml \
     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly --quiet
 ok "Runtime dependencies installed"
+# pyyaml added 19 Sep 2026: launch_models.sh needs it to update
+# ~/.continue/config.yaml (VS Code Continue extension's active config format).
 
 # 3. Host Drivers & Hardware
 if ! $MODELS_ONLY; then
@@ -193,55 +201,19 @@ if ! $MODELS_ONLY; then
         ok "Arc iGPU using xe driver (no fence watchdog)"
     fi
 
-    # ── 2b. Intel Compute Runtime (NEO) — xe-compatible version ─────────────
-    # xe driver requires NEO ≥ 24.52.32224.5 with IGC ≥ v2.5.6
-    # Check if OpenCL can see the GPU.
-    # Uses $VENV_DIR/bin/python3 explicitly (not bare python3) since Step 2
-    # already installed openvino there. Distinguishes "module not found" from
-    # a genuine "GPU not visible" so the warning below is actually honest
-    # about what failed, instead of a bare `2>/dev/null` hiding the reason.
-    GPU_VISIBLE=false
-    GPU_CHECK_OUT=$("$VENV_DIR/bin/python3" -c "import openvino as ov; print('GPU' in ov.Core().available_devices)" 2>&1)
-    GPU_CHECK_RC=$?
-    if [[ $GPU_CHECK_RC -eq 0 && "$GPU_CHECK_OUT" == "True" ]]; then
-        GPU_VISIBLE=true
-        ok "OpenVINO GPU device visible (compute runtime OK)"
-    elif echo "$GPU_CHECK_OUT" | grep -q "ModuleNotFoundError"; then
-        fail "openvino not importable in .venv — Step 2 (Python Environment) may have failed. Re-run setup.sh, or check pip install output above."
+    # ── 2b. Intel Compute Runtime (NEO) ───────────────────────────────────────
+    # Delegated to gpu.sh (idempotent -- `install` does nothing when already healthy).
+    # The previous inline version installed intel-opencl-icd 24.52 with `dpkg -i`
+    # but never got libigdgmm12 >= 22.5.5 (it requested _22.5.2_, which 404s), and
+    # run_spinner hid that.  dpkg left the package unconfigured; the next apt run
+    # "fixed" it by REMOVING it -> the GPU disappeared until setup.sh was re-run.
+    # `gpu.sh install` installs through apt (dependencies verified) and apt-mark holds
+    # the packages.  Use it on its own any time:  bash gpu.sh [status|install|diag|diff]
+    if [[ -f "$ROOT_DIR/gpu.sh" ]]; then
+        bash "$ROOT_DIR/gpu.sh" install \
+            || warn "GPU runtime install did not complete -- see output above, then run: bash gpu.sh diag"
     else
-        warn "OpenVINO cannot see GPU — installing updated Intel Compute Runtime (NEO)"
-        echo -e "  ${DIM}This provides OpenCL/Level Zero userspace for the xe driver${RESET}"
-        sudo -v
-
-        NEO_TMP=$(mktemp -d /tmp/neo_XXXXXX)
-        cd "$NEO_TMP"
-
-        # IGC v2.5.6 — Intel Graphics Compiler
-        run_spinner "Downloading Intel Graphics Compiler v2.5.6" bash -c "
-            wget -q https://github.com/intel/intel-graphics-compiler/releases/download/v2.5.6/intel-igc-core-2_2.5.6+18417_amd64.deb
-            wget -q https://github.com/intel/intel-graphics-compiler/releases/download/v2.5.6/intel-igc-opencl-2_2.5.6+18417_amd64.deb
-        "
-
-        # NEO 24.52.32224.5 — Compute Runtime
-        run_spinner "Downloading Intel Compute Runtime 24.52.32224.5" bash -c "
-            wget -q https://github.com/intel/compute-runtime/releases/download/24.52.32224.5/intel-level-zero-gpu_1.6.32224.5_amd64.deb
-            wget -q https://github.com/intel/compute-runtime/releases/download/24.52.32224.5/intel-opencl-icd_24.52.32224.5_amd64.deb
-            wget -q https://github.com/intel/compute-runtime/releases/download/24.52.32224.5/libigdgmm12_22.5.2_amd64.deb
-        "
-
-        run_spinner "Installing Intel Compute Runtime (NEO)" sudo dpkg -i *.deb
-        sudo ldconfig
-        cd "$ROOT_DIR"
-        rm -rf "$NEO_TMP"
-
-        # Verify (same honest check as above)
-        GPU_CHECK_OUT=$("$VENV_DIR/bin/python3" -c "import openvino as ov; print('GPU' in ov.Core().available_devices)" 2>&1)
-        if [[ "$GPU_CHECK_OUT" == "True" ]]; then
-            ok "GPU now visible to OpenVINO after NEO update"
-        else
-            warn "GPU still not visible — a reboot may be required if xe driver was just activated"
-            warn "After reboot, re-run: ./setup.sh --models-only"
-        fi
+        fail "gpu.sh not found next to setup.sh -- Intel GPU compute runtime NOT checked"
     fi
 
     # ── 2c. GPU group permissions ─────────────────────────────────────────────
@@ -466,7 +438,11 @@ echo -e "  automatically stops whatever's currently running first. To stop"
 echo -e "  everything without starting a new pair: ${CYAN}./launch_models.sh --stop${RESET}"
 echo ""
 echo -e "  To use the local model in VS Code's Continue extension, just launch a"
-echo -e "  pair — ${CYAN}~/.continue/config.json${RESET} is updated automatically every time"
-echo -e "  ${CYAN}launch_models.sh${RESET} starts, pointed at whatever model is actually live."
+echo -e "  pair — ${CYAN}~/.continue/config.yaml${RESET} is updated automatically every time"
+echo -e "  ${CYAN}launch_models.sh${RESET} starts, pointed at whatever models are actually live"
+echo -e "  (chat/edit/apply -> Phase 1, autocomplete -> Phase 2)."
 echo -e "  (Your other Continue models/settings are preserved, not overwritten.)"
+echo -e "  ${DIM}If Continue still doesn't pick it up, confirm the VS Code YAML extension${RESET}"
+echo -e "  ${DIM}(redhat.vscode-yaml) is installed — Continue can silently fail to read${RESET}"
+echo -e "  ${DIM}config.yaml at all without it.${RESET}"
 echo ""

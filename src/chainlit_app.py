@@ -4,7 +4,7 @@ chainlit_app.py — Trading Income Project
 =========================================
 Chainlit UI with:
 - ChatProfiles: D-A-C (thinking), Research (web search), Quick Chat
-- @cl.step decorator for reliable tool Step ordering
+- ToolProgress: ONE collapsed, self-labelling section for all tool calls (P2-090)
 - LaTeX delimiter fix (Mindfire pattern)
 - Collect-then-render for thinking (solves ordering issue)
 - Per-session state isolation
@@ -57,6 +57,8 @@ _project_root = Path(__file__).parent.parent
 _src = str(Path(__file__).parent)   # src/ itself
 if _src not in sys.path:
     sys.path.insert(0, _src)
+
+from tool_progress import ToolProgress  # src/tool_progress.py  (P2-090)
 
 try:
     from dotenv import load_dotenv
@@ -280,12 +282,33 @@ async def _get_tools() -> list[dict]:
         return []
 
 
-@cl.step(type="tool")
+_TOOL_FAIL_PREFIXES = ("Tool error", "Search failed", "Search timed out",
+                       "HTTP fetch failed", "Error", "Invalid URL", "403", "401")
+
+
+def _tool_failed(result: str) -> bool:
+    """run_tool() returns error STRINGS rather than raising — detect them."""
+    return (not result) or result.startswith(_TOOL_FAIL_PREFIXES)
+
+
+def _call_detail(name: str, args: dict) -> str:
+    """Short label for the section headline: the query, or the page's domain."""
+    from urllib.parse import urlparse
+    if not isinstance(args, dict):
+        return ""
+    if args.get("url"):
+        return urlparse(str(args["url"])).netloc.removeprefix("www.") or str(args["url"])
+    if args.get("query"):
+        return str(args["query"])
+    return next((str(v) for v in args.values() if isinstance(v, str)), "")
+
+
 async def run_tool(name: str, args: dict) -> str:
-    """Execute a tool call with up to 3 retries — @cl.step guarantees render order."""
-    # Update step name to show which tool is being called
-    if cl.context.current_step:
-        cl.context.current_step.name = name
+    """Execute a tool call with up to 3 retries.
+
+    No longer a @cl.step: the caller wraps it in ToolProgress.call(), which owns
+    the (collapsed) UI row — a decorator here would nest a duplicate step inside it.
+    """
     last_error = ""
     for attempt in range(3):
         try:
@@ -769,119 +792,140 @@ async def on_message(message: cl.Message):
                                        show_input=False) as s:
                         s.output = fix_latex(think_text)
 
-            # Execute tools using @cl.step decorator for reliable ordering
-            for tc in choice.message.tool_calls:
-                fn_name = tc.function.name
-                try:
-                    fn_args = json.loads(tc.function.arguments or "{}")
-                    if isinstance(fn_args, dict) and "name" in fn_args and "arguments" in fn_args:
-                        fn_args = fn_args["arguments"]
-                except Exception:
-                    fn_args = {"query": str(tc.function.arguments)}
+            # Execute tools inside ONE collapsed, self-labelling section (P2-090):
+            # the title tracks the latest call while running, then becomes a
+            # summary.  The section is CLOSED before synthesis so the thinking
+            # step and answer bubble are not nested inside it.
+            async with ToolProgress() as progress:
+                for tc in choice.message.tool_calls:
+                    fn_name = tc.function.name
+                    try:
+                        fn_args = json.loads(tc.function.arguments or "{}")
+                        if isinstance(fn_args, dict) and "name" in fn_args and "arguments" in fn_args:
+                            fn_args = fn_args["arguments"]
+                    except Exception:
+                        fn_args = {"query": str(tc.function.arguments)}
 
-                raw_result = await run_tool(fn_name, fn_args)
+                    async with progress.call(fn_name, _call_detail(fn_name, fn_args),
+                                             args=fn_args) as c:
+                        raw_result = await run_tool(fn_name, fn_args)
+                        c.result(raw_result)
+                        if _tool_failed(raw_result):
+                            c.fail()
 
-                history.append({
-                    "role": "tool",
-                    "content": raw_result[:1600],
-                    "tool_call_id": tc.id,
-                })
+                    history.append({
+                        "role": "tool",
+                        "content": raw_result[:1600],
+                        "tool_call_id": tc.id,
+                    })
 
-                # Auto fetch_url after web_search — fetch up to 3 sources in parallel
-                # for news queries to ensure mix of results even if some block/401.
-                if fn_name == "web_search" and not raw_result.startswith(("Search failed", "Search timed out")):
-                    # Fetch up to 6 candidate URLs, retrying on failure to get 3 successes
-                    candidate_urls = _extract_top_urls(raw_result, n=6)
-                    combined_articles = []
-                    for fetch_url_candidate in candidate_urls:
-                        if len(combined_articles) >= 3:
-                            break
-                        try:
-                            page = await run_tool("fetch_url", {"url": fetch_url_candidate, "max_chars": 1500})
-                            if page and not page.startswith(("HTTP fetch failed", "Error", "Invalid URL", "403", "401")):
-                                combined_articles.append(f"[{fetch_url_candidate}]\n{page[:1500]}")
-                        except Exception:
-                            continue  # try next URL
-                    if combined_articles:
-                        history.append({
-                            "role": "tool",
-                            "content": "Fetched articles:\n\n" + "\n\n---\n\n".join(combined_articles),
-                            "tool_call_id": f"auto_fetch_{tc.id}",
-                        })
+                    # Auto fetch_url after web_search — fetch up to 3 sources in parallel
+                    # for news queries to ensure mix of results even if some block/401.
+                    if fn_name == "web_search" and not raw_result.startswith(("Search failed", "Search timed out")):
+                        # Fetch up to 6 candidate URLs, retrying on failure to get 3 successes
+                        candidate_urls = _extract_top_urls(raw_result, n=6)
+                        combined_articles = []
+                        for fetch_url_candidate in candidate_urls:
+                            if len(combined_articles) >= 3:
+                                break
+                            try:
+                                fetch_args = {"url": fetch_url_candidate, "max_chars": 1500}
+                                async with progress.call("fetch_url",
+                                                         _call_detail("fetch_url", fetch_args),
+                                                         args=fetch_args) as c:
+                                    page = await run_tool("fetch_url", fetch_args)
+                                    c.result(page)
+                                    page_ok = bool(page) and not page.startswith(
+                                        ("HTTP fetch failed", "Error", "Invalid URL", "403", "401"))
+                                    if not page_ok:
+                                        c.fail()
+                                if page_ok:
+                                    combined_articles.append(f"[{fetch_url_candidate}]\n{page[:1500]}")
+                            except Exception:
+                                continue  # try next URL
+                        if combined_articles:
+                            history.append({
+                                "role": "tool",
+                                "content": "Fetched articles:\n\n" + "\n\n---\n\n".join(combined_articles),
+                                "tool_call_id": f"auto_fetch_{tc.id}",
+                            })
 
-            # ── Scout: Phi-4-mini port 8001 (Research profile only) ──────────
-            profile = cl.user_session.get("chat_profile", "Research")
-            raw_context = "\n\n".join(
-                m["content"] for m in history
-                if m["role"] == "tool" and m.get("content")
-            )
-            dossier = raw_context  # default: pass raw context if Scout skipped
+                # ── Scout: Phi-4-mini port 8001 (Research profile only) ──────────
+                profile = cl.user_session.get("chat_profile", "Research")
+                raw_context = "\n\n".join(
+                    m["content"] for m in history
+                    if m["role"] == "tool" and m.get("content")
+                )
+                dossier = raw_context  # default: pass raw context if Scout skipped
 
-            if profile == "Research" and raw_context.strip():
-                # Port 8001 is always Phi-4-mini regardless of active_client port
-                from urllib.parse import urlparse as _up
-                _parsed = _up(BACKEND_URL)
-                scout_url = f"{_parsed.scheme}://{_parsed.hostname}:8001"
-                log.info("Scout: firing to %s (raw_context=%d chars)", scout_url, len(raw_context))
-                scout_payload = {
-                    "model": "phi-4-mini:int4",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Extract key facts from this search data and output ONLY valid XML.\n\n"
-                                f"Question: {cmd}\n\n"
-                                f"Data:\n{raw_context[:3000]}\n\n"
-                                "Output format (XML only, no other text):\n"
-                                "<dossier>\n"
-                                "  <key_facts>\n"
-                                "  - fact one [source domain]\n"
-                                "  - fact two [source domain]\n"
-                                "  </key_facts>\n"
-                                "  <gaps>any gaps or contradictions, or NONE</gaps>\n"
-                                "</dossier>"
-                            )
-                        }
-                    ],
-                    "max_tokens": 350,
-                    "temperature": 0.1,
-                    "stream": False,
-                    "thinking": False,
-                }
-                try:
-                    async with cl.Step(
-                        name="🔍 Scout — Phi-4-mini",
-                        type="tool",
-                        show_input=False,
-                    ) as scout_step:
+                if profile == "Research" and raw_context.strip():
+                    # Port 8001 is always Phi-4-mini regardless of active_client port
+                    from urllib.parse import urlparse as _up
+                    _parsed = _up(BACKEND_URL)
+                    scout_url = f"{_parsed.scheme}://{_parsed.hostname}:8001"
+                    log.info("Scout: firing to %s (raw_context=%d chars)", scout_url, len(raw_context))
+                    scout_payload = {
+                        "model": "phi-4-mini:int4",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Extract key facts from this search data and output ONLY valid XML.\n\n"
+                                    f"Question: {cmd}\n\n"
+                                    f"Data:\n{raw_context[:3000]}\n\n"
+                                    "Output format (XML only, no other text):\n"
+                                    "<dossier>\n"
+                                    "  <key_facts>\n"
+                                    "  - fact one [source domain]\n"
+                                    "  - fact two [source domain]\n"
+                                    "  </key_facts>\n"
+                                    "  <gaps>any gaps or contradictions, or NONE</gaps>\n"
+                                    "</dossier>"
+                                )
+                            }
+                        ],
+                        "max_tokens": 350,
+                        "temperature": 0.1,
+                        "stream": False,
+                        "thinking": False,
+                    }
+                    try:
                         n_sources = len([m for m in history if m["role"] == "tool"])
-                        scout_step.input = f"Filtering {len(raw_context)} chars from {n_sources} sources..."
-                        log.info("Scout: sending POST to %s/v1/chat/completions", scout_url)
-                        # Hard 30s timeout — Scout must not block synthesis
-                        async with httpx.AsyncClient(
-                            timeout=httpx.Timeout(30.0, connect=5.0)
-                        ) as _sc:
-                            scout_resp = await _sc.post(
-                                f"{scout_url}/v1/chat/completions",
-                                json=scout_payload
-                            )
-                        log.info("Scout: response status %s", scout_resp.status_code)
-                        scout_data = scout_resp.json()
-                        scout_raw = scout_data["choices"][0]["message"]["content"].strip()
-                        # Strip Phi-4-mini EOS tokens from display
-                        import re as _re
-                        scout_raw = _re.sub(r"<\|?im_end\|?>", "", scout_raw).strip()
-                        # Only use Scout output if it returned valid XML dossier
-                        if "<dossier>" in scout_raw:
-                            dossier = scout_raw
-                            log.info("Scout: valid XML dossier (%d chars)", len(dossier))
-                        else:
-                            dossier = raw_context
-                            log.warning("Scout returned prose not XML — using raw context")
-                        scout_step.output = scout_raw  # show whatever Scout returned in UI
-                except Exception as _scout_err:
-                    dossier = raw_context  # fall back to raw context on Scout failure
-                    log.warning("Scout (port 8001) FAILED: %s — %s", type(_scout_err).__name__, _scout_err)
+                        async with progress.call(
+                            "scout", "Phi-4-mini",
+                            args={"chars": len(raw_context), "sources": n_sources},
+                        ) as sc:
+                            log.info("Scout: sending POST to %s/v1/chat/completions", scout_url)
+                            # Hard 30s timeout — Scout must not block synthesis
+                            async with httpx.AsyncClient(
+                                timeout=httpx.Timeout(30.0, connect=5.0)
+                            ) as _sc:
+                                scout_resp = await _sc.post(
+                                    f"{scout_url}/v1/chat/completions",
+                                    json=scout_payload
+                                )
+                            log.info("Scout: response status %s", scout_resp.status_code)
+                            scout_data = scout_resp.json()
+                            scout_raw = scout_data["choices"][0]["message"]["content"].strip()
+                            # Strip Phi-4-mini EOS tokens from display
+                            import re as _re
+                            scout_raw = _re.sub(r"<\|?im_end\|?>", "", scout_raw).strip()
+                            # Only use Scout output if it returned valid XML dossier
+                            if "<dossier>" in scout_raw:
+                                dossier = scout_raw
+                                log.info("Scout: valid XML dossier (%d chars)", len(dossier))
+                            else:
+                                dossier = raw_context
+                                log.warning("Scout returned prose not XML — using raw context")
+                            # Always leave visible text in the row (an empty output renders blank)
+                            sc.result(scout_raw or "(Scout returned an empty response)")
+                            if not scout_raw:
+                                sc.fail()
+                            elif "<dossier>" not in scout_raw:
+                                sc.note("→ not a valid XML dossier; raw context passed to synthesis")
+                    except Exception as _scout_err:
+                        dossier = raw_context  # fall back to raw context on Scout failure
+                        log.warning("Scout (port 8001) FAILED: %s — %s", type(_scout_err).__name__, _scout_err)
 
             # ── Phase 2: Synthesis (Qwen3.8-27B port 8000) ───────────────────
             synthesis_messages = [{
