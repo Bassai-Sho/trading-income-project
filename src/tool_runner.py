@@ -223,9 +223,13 @@ def _yfinance_headlines(query: str, max_items: int = 3) -> str:
     try:
         t = yf.Ticker(valid[0])
         for n in (t.news or [])[:max_items]:
-            title = n.get("title", "")
-            link  = n.get("link", "")
-            pub   = n.get("publisher", "Market Wire")
+            # yfinance v0.2+ returns nested content dict
+            content = n.get("content", n)  # fall back to n itself for older versions
+            title = content.get("title", "")
+            # canonicalUrl is more reliable than clickThroughUrl
+            canon = content.get("canonicalUrl", {})
+            link  = canon.get("url", "") or content.get("clickThroughUrl", {}).get("url", "")
+            pub   = (content.get("provider", {}) or {}).get("displayName", "Yahoo Finance")
             if title and link:
                 lines.append(f"[{pub}] {title}\nURL: {link}")
         if lines:
