@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -50,16 +51,68 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+# Optional enhanced dependencies — degrade gracefully if not installed
+try:
+    import yfinance as yf
+    _YFINANCE = True
+except ImportError:
+    _YFINANCE = False
+
+try:
+    from domain_telemetry import get_domain_strategy, record_domain_result
+    _TELEMETRY = True
+except ImportError:
+    _TELEMETRY = False
+    def get_domain_strategy(url: str) -> str: return "HTTPX_TRAFILATURA"  # noqa
+    def record_domain_result(*a, **kw): pass  # noqa
+
 log = logging.getLogger("tool_runner")
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-TOOL_TIMEOUT     = 30    # seconds — max time per tool call
+TOOL_TIMEOUT     = 45    # seconds — raised from 30; ddgs needs time to try multiple backends
 WEB_BODY_CHARS   = 800   # chars returned per web search result (was 200, too short)
 FETCH_MAX_CHARS  = 3000  # chars returned from a full page fetch
-WEB_N_RESULTS    = 5     # default number of search results
+WEB_N_RESULTS    = 10    # default number of search results — more options for multi-source fetch
+
+# FIXED 19 Sep 2026 (revised twice — see history below): the `ddgs` package's
+# DDGS().text() defaults to backend="auto", a metasearch pool (bing, brave,
+# duckduckgo, google, mojeek, startpage, yandex, yahoo, wikipedia) with only
+# a 5s default HTTP timeout per backend attempt.
+#
+# Revision history, each caught by live-testing before being trusted:
+#   1. Original bug: "auto" mode hit Startpage, which proxies through Google
+#      and is prone to bot-detection — timed out.
+#   2. First fix attempt: pinned to backend="duckduckgo" alone. Live-tested —
+#      FAILED outright. Pinning to one backend throws away fallback
+#      resilience; if that one backend is itself slow/blocked on a given
+#      network (confirmed for plain DuckDuckGo in the sandbox used to test
+#      this — raw curl to duckduckgo.com got zero response), a single-
+#      backend pin fails with no fallback, worse than the original bug.
+#   3. Second fix: "duckduckgo,bing,brave,yahoo" — kept fallback resilience,
+#      excluded Startpage. CONFIRMED ON THE ACTUAL PRODUCTION NUC (not just
+#      the test sandbox) that this still isn't enough: it stalled on THIS
+#      list's "brave" entry — ddgs's own HTML-scraping backend against
+#      search.brave.com (the consumer search results page), a completely
+#      different thing from _brave_search()'s call to the real API at
+#      api.search.brave.com. Error was "Connection reset by peer" on a
+#      follow-up fetch_url attempt — an actively torn-down connection, more
+#      consistent with bot-detection/blocking than ordinary slowness.
+#   4. Current: dropped ddgs's scraping "brave" backend too, now confirmed
+#      bad on the real network, not just suspected. Two scraping backends
+#      failing on the same real network is a pattern, not one bad engine —
+#      the actual fix is setting BRAVE_SEARCH_API_KEY in .env so
+#      _brave_search() (the real API, tried BEFORE this fallback ever runs)
+#      handles requests instead of depending on scraping at all. This list
+#      is a stopgap for when that key isn't set, not a substitute for it.
+# ddgs v0.3+ supports 9 engines: duckduckgo, bing, google, brave, ecosia,
+# qwant, yahoo, yandex, wikipedia. More engines = more resilience. If one
+# is blocked/rate-limited, ddgs tries the next automatically.
+# "auto" would pick for us but is unpredictable; explicit list is better.
+DDG_BACKEND      = "bing,google,duckduckgo,yahoo,ecosia"
+
 
 # Whitelisted scripts that run_script is allowed to execute
 # Format: {alias: [python_path, *args]}
@@ -135,8 +188,10 @@ def _ddg_search(query: str, n_results: int) -> str:
         except ImportError:
             from duckduckgo_search import DDGS   # fallback for older installs
         out = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=n_results):
+        # timeout on DDGS() constructor (default is 5s — too low for slow backends)
+        with DDGS(timeout=20) as ddgs:
+            # backend order: bing,google tried first — duckduckgo last
+            for r in ddgs.text(query, max_results=n_results, backend=DDG_BACKEND):
                 title = r.get("title", "")
                 href  = r.get("href", "")
                 body  = r.get("body", "")[:WEB_BODY_CHARS]
@@ -148,12 +203,46 @@ def _ddg_search(query: str, n_results: int) -> str:
         return f"Search failed: {e}"
 
 
+# Common uppercased words that look like tickers but aren't
+_TICKER_BLACKLIST = {
+    "NEWS", "TODAY", "STOCK", "WHAT", "BEST", "FOR", "USA", "USD", "FED",
+    "THE", "AND", "SPX", "ETF", "TOP", "MARKET", "LATEST", "THIS", "WEEK",
+    "NOW", "ARE", "HOW", "WHY", "FROM", "WITH", "RATE", "HIKE", "HIGH", "LOW"
+}
+
+
+def _yfinance_headlines(query: str, max_items: int = 3) -> str:
+    """Pull verified publisher headlines direct from Yahoo Finance for any ticker in query."""
+    if not _YFINANCE:
+        return ""
+    tickers = re.findall(r'\b[A-Z]{2,5}\b', query.upper())
+    valid = [t for t in tickers if t not in _TICKER_BLACKLIST]
+    if not valid:
+        return ""
+    lines = []
+    try:
+        t = yf.Ticker(valid[0])
+        for n in (t.news or [])[:max_items]:
+            title = n.get("title", "")
+            link  = n.get("link", "")
+            pub   = n.get("publisher", "Market Wire")
+            if title and link:
+                lines.append(f"[{pub}] {title}\nURL: {link}")
+        if lines:
+            log.debug("web_search: yfinance pre-flight returned %d headlines for %s",
+                      len(lines), valid[0])
+    except Exception as e:
+        log.debug("web_search: yfinance pre-flight failed: %s", e)
+    return "\n".join(lines)
+
+
 def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
     """
     Search the web.
 
-    Strategy: Brave Search API (primary, independent index, 2,000 free queries/month)
-              → DuckDuckGo (fallback, no API key, may rate-limit on heavy automated use)
+    Strategy: yfinance ticker pre-flight (if ticker detected)
+              → Brave Search API (primary, independent index)
+              → DuckDuckGo multi-engine fallback (bing,google,duckduckgo,yahoo,ecosia)
 
     Brave is preferred because it has its own index, a proper JSON API with an SLA,
     and consistent results. DuckDuckGo scrapes Bing's HTML endpoint and can be blocked
@@ -162,6 +251,9 @@ def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
     Set BRAVE_SEARCH_API_KEY in .env to activate Brave.
     Get a free key at: https://api.search.brave.com  (2,000 queries/month free)
     """
+    # yfinance pre-flight: zero-scraping official news for ticker queries
+    yf_prefix = _yfinance_headlines(query)
+
     def _search():
         brave_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
 
@@ -173,8 +265,9 @@ def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
                 return result
             log.info("web_search: Brave failed/rate-limited — falling back to DuckDuckGo")
 
-        # Fallback: DuckDuckGo
-        return _ddg_search(query, n_results)
+        # Fallback: ddgs multi-engine (bing,google,duckduckgo,yahoo,ecosia)
+        ddg = _ddg_search(query, n_results)
+        return (yf_prefix + "\n\n---\n\n" + ddg).strip() if yf_prefix else ddg
 
     try:
         return _with_timeout(_search, timeout=TOOL_TIMEOUT)
@@ -191,6 +284,7 @@ def tool_fetch_url(url: str, max_chars: int = FETCH_MAX_CHARS) -> str:
     Fetch the main text content from a URL.
 
     Uses trafilatura for clean article extraction (strips nav, ads, boilerplate).
+    Integrates domain_telemetry: skips quarantined domains, logs success/failure.
     Falls back to requests + basic HTML strip if trafilatura unavailable.
 
     Useful for: reading full SSRN paper abstracts, news articles found via
@@ -199,15 +293,31 @@ def tool_fetch_url(url: str, max_chars: int = FETCH_MAX_CHARS) -> str:
     if not url.startswith(("http://", "https://")):
         return f"Invalid URL (must start with http:// or https://): {url}"
 
+    # Telemetry gate — skip quarantined domains in <1ms
+    if get_domain_strategy(url) == "SKIP":
+        log.debug("fetch_url: skipping quarantined domain %s", url)
+        return f"[Skipped: domain quarantined due to persistent 403/paywall — trying next source]"
+
     def _fetch():
+        t0 = time.time()
         try:
             import requests
             resp = requests.get(
                 url,
                 timeout=15,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; trading-research-bot/1.0)"},
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"},
             )
-            resp.raise_for_status()
+            lat_ms = int((time.time() - t0) * 1000)
+
+            if resp.status_code in (401, 403):
+                record_domain_result(url, False, error_type="403_BOT", latency_ms=lat_ms)
+                return f"HTTP fetch failed: {resp.status_code} Client Error: HTTP Forbidden for url: {url}"
+            if resp.status_code != 200:
+                record_domain_result(url, False,
+                                     error_type=f"HTTP_{resp.status_code}", latency_ms=lat_ms)
+                resp.raise_for_status()
+
             html = resp.text
         except Exception as e:
             return f"HTTP fetch failed: {e}"
@@ -217,17 +327,24 @@ def tool_fetch_url(url: str, max_chars: int = FETCH_MAX_CHARS) -> str:
             import trafilatura
             text = trafilatura.extract(html, include_comments=False, include_tables=True)
             if text and len(text.strip()) > 100:
-                return text.strip()[:max_chars]
+                record_domain_result(url, True, latency_ms=lat_ms)
+                compact = " ".join(text.split())
+                return compact[:max_chars].rsplit(" ", 1)[0] + "..."
         except ImportError:
             pass
 
         # Fallback: basic tag stripping
         try:
-            import re
-            text = re.sub(r"<[^>]+>", " ", html)
-            text = re.sub(r"\s+", " ", text).strip()
-            return text[:max_chars]
+            import re as _re
+            text = _re.sub(r"<[^>]+>", " ", html)
+            text = _re.sub(r"\s+", " ", text).strip()
+            if len(text) > 180:
+                record_domain_result(url, True, latency_ms=lat_ms)
+                return text[:max_chars]
+            record_domain_result(url, False, error_type="EMPTY_CONTENT", latency_ms=lat_ms)
+            return f"[No article body extracted from {url}]"
         except Exception as e:
+            record_domain_result(url, False, error_type="EXTRACT_ERROR")
             return f"Content extraction failed: {e}"
 
     try:
@@ -531,7 +648,6 @@ TOOLS: list[dict] = [
                 "type": "object",
                 "properties": {
                     "query":     {"type": "string", "description": "Search query"},
-                    "n_results": {"type": "integer", "description": "Number of results (default 5)", "default": 5},
                 },
                 "required": ["query"],
             },
@@ -678,7 +794,7 @@ def dispatch_tool(name: str, args: dict, cfg: dict) -> str:
 
     try:
         if name == "web_search":
-            return tool_web_search(args.get("query", ""), args.get("n_results", n_web))
+            return tool_web_search(args.get("query", ""), n_web)  # always use WEB_N_RESULTS, ignore model's n_results
 
         if name == "fetch_url":
             return tool_fetch_url(args.get("url", ""), args.get("max_chars", FETCH_MAX_CHARS))

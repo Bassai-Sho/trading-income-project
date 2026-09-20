@@ -96,7 +96,6 @@ get_env_val() {
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 MODELS_DIR="${MODELS_DIR:-$HOME/models}"
-SERVER_DIR="$HOME/.local/share/openvino-server"
 CACHE_DIR="$HOME/.cache/openvino"
 MODELS_ONLY=false
 CHOSEN_PAIR=""
@@ -137,42 +136,18 @@ declare -A P2_ID=([1]='phi-4-mini:int4' [2]='mistral-7b:int4' [3]='lfm2.5:8b' [4
 echo -e "\n${BOLD}Trading Income Project — Unified System & VS Code Setup${RESET}"
 
 # 1. Directories
-hdr "1 / 8  Directory Scaffolding"
-for d in DATA DATA/models LOGS LOGS/pids "$MODELS_DIR" "$SERVER_DIR" "$CACHE_DIR"; do
+hdr "1 / 7  Directory Scaffolding"
+for d in DATA DATA/models LOGS LOGS/pids "$MODELS_DIR" "$CACHE_DIR"; do
     [[ ! -d "$d" ]] && { mkdir -p "$d"; ok "Created $d/"; } || skip "$d/"
 done
 
-# 2. Host Drivers & Hardware
-if ! $MODELS_ONLY; then
-    hdr "2 / 8  Compute Drivers & GPU Access"
-    if [ -f "/etc/default/grub" ] && ! grep -q "i915.enable_psr=0" /proc/cmdline 2>/dev/null && ! grep -q "i915.enable_psr=0" /etc/default/grub 2>/dev/null; then
-        if ask "Disable PSR in GRUB to prevent Meteor Lake display artifacts?"; then
-            sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 i915.enable_psr=0"/' /etc/default/grub
-            sudo update-grub 2>/dev/null || true
-            ok "PSR disabled in GRUB (reboot required later)"
-        fi
-    fi
-
-    if ! ldconfig -p 2>/dev/null | grep -E "libze_intel_gpu" >/dev/null; then
-        echo -e "  ${DIM}Requesting sudo privileges for Level Zero compute drivers...${RESET}"
-        sudo -v
-        for stale in /etc/apt/sources.list.d/intel-gpu*.list /etc/apt/sources.list.d/oneAPI.list; do [[ -f "$stale" ]] && sudo rm -f "$stale"; done
-        run_spinner "Updating package lists" sudo apt-get update -qq
-        run_spinner "Installing Level Zero & OpenCL runtime" sudo apt-get install -y -q intel-opencl-icd libze1 libze-intel-gpu1 libze-dev mesa-vulkan-drivers clinfo
-        sudo ldconfig
-    fi
-    ok "Level Zero GPU runtime active"
-
-    if ! id -nG "$USER" | grep -qw "render"; then
-        sudo usermod -aG render,video "$USER"
-        ok "Added $USER to render/video groups"
-    else
-        ok "GPU group permissions verified"
-    fi
-fi
-
-# 3. Python Virtualenv
-hdr "3 / 8  Python Environment (.venv) & Packages"
+# 2. Python Virtualenv
+# NOTE: this now runs BEFORE the driver/GPU step. It used to run after, which
+# meant the GPU-visibility check in that step tested a bare `python3` that
+# could never have had `openvino` installed yet on a first-time run — every
+# fresh install saw a false "OpenVINO cannot see GPU" warning regardless of
+# actual driver/runtime state. Creating the venv first fixes that at the root.
+hdr "2 / 7  Python Environment (.venv) & Packages"
 VENV_DIR="$ROOT_DIR/.venv"
 [[ ! -d "$VENV_DIR" ]] && { python3 -m venv "$VENV_DIR"; ok "Created .venv/"; } || skip ".venv/"
 source "$VENV_DIR/bin/activate"
@@ -188,14 +163,110 @@ run_spinner "Installing OpenVINO GenAI nightly runtime & FastAPI" \
     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly --quiet
 ok "Runtime dependencies installed"
 
-# Deploy isolated serve_model.py
-if [[ -f "src/serve_model.py" ]]; then
-    cp "src/serve_model.py" "$SERVER_DIR/serve_model.py"
-    ok "Deployed server script to $SERVER_DIR/serve_model.py"
+# 3. Host Drivers & Hardware
+if ! $MODELS_ONLY; then
+    hdr "3 / 7  Compute Drivers & GPU Access"
+
+    # ── 2a. xe kernel driver migration (i915 → xe) ───────────────────────────
+    # Meteor Lake / Xe-LPG architecture requires the xe driver.
+    # i915 has a 10s fence watchdog that kills GPU compute during long prefills
+    # (27B model attention on ~1800 token context takes 25-40s → kernel kills it).
+    # xe supports native preemption and has no watchdog limit.
+    # Reference: OpenVINO Issue #36260, #36404
+    GPU_ID=$(lspci -nn -s 00:02.0 2>/dev/null | grep -oP '\[8086:\K[0-9a-f]+(?=\])' || echo "")
+    CURRENT_DRIVER=$(lspci -k -s 00:02.0 2>/dev/null | grep "Kernel driver in use:" | awk '{print $NF}' || echo "unknown")
+
+    if [[ -n "$GPU_ID" && "$CURRENT_DRIVER" != "xe" ]]; then
+        warn "Arc iGPU using legacy i915 driver (GPU ID: $GPU_ID) — upgrade recommended"
+        info "The xe driver prevents GPU fence watchdog crashes during large model inference."
+        if ask "Migrate Arc iGPU from i915 to xe driver? (requires reboot)"; then
+            if ! grep -q "xe.force_probe" /etc/default/grub 2>/dev/null; then
+                sudo sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 i915.enable_psr=0 i915.force_probe=!${GPU_ID} xe.force_probe=${GPU_ID}\"/" /etc/default/grub
+                sudo update-grub 2>/dev/null || true
+                ok "GRUB updated for xe driver (i915.force_probe=!${GPU_ID} xe.force_probe=${GPU_ID})"
+                warn "Reboot required to activate xe driver — run: sudo reboot"
+            else
+                skip "xe driver already configured in GRUB"
+            fi
+        fi
+    elif [[ "$CURRENT_DRIVER" == "xe" ]]; then
+        ok "Arc iGPU using xe driver (no fence watchdog)"
+    fi
+
+    # ── 2b. Intel Compute Runtime (NEO) — xe-compatible version ─────────────
+    # xe driver requires NEO ≥ 24.52.32224.5 with IGC ≥ v2.5.6
+    # Check if OpenCL can see the GPU.
+    # Uses $VENV_DIR/bin/python3 explicitly (not bare python3) since Step 2
+    # already installed openvino there. Distinguishes "module not found" from
+    # a genuine "GPU not visible" so the warning below is actually honest
+    # about what failed, instead of a bare `2>/dev/null` hiding the reason.
+    GPU_VISIBLE=false
+    GPU_CHECK_OUT=$("$VENV_DIR/bin/python3" -c "import openvino as ov; print('GPU' in ov.Core().available_devices)" 2>&1)
+    GPU_CHECK_RC=$?
+    if [[ $GPU_CHECK_RC -eq 0 && "$GPU_CHECK_OUT" == "True" ]]; then
+        GPU_VISIBLE=true
+        ok "OpenVINO GPU device visible (compute runtime OK)"
+    elif echo "$GPU_CHECK_OUT" | grep -q "ModuleNotFoundError"; then
+        fail "openvino not importable in .venv — Step 2 (Python Environment) may have failed. Re-run setup.sh, or check pip install output above."
+    else
+        warn "OpenVINO cannot see GPU — installing updated Intel Compute Runtime (NEO)"
+        echo -e "  ${DIM}This provides OpenCL/Level Zero userspace for the xe driver${RESET}"
+        sudo -v
+
+        NEO_TMP=$(mktemp -d /tmp/neo_XXXXXX)
+        cd "$NEO_TMP"
+
+        # IGC v2.5.6 — Intel Graphics Compiler
+        run_spinner "Downloading Intel Graphics Compiler v2.5.6" bash -c "
+            wget -q https://github.com/intel/intel-graphics-compiler/releases/download/v2.5.6/intel-igc-core-2_2.5.6+18417_amd64.deb
+            wget -q https://github.com/intel/intel-graphics-compiler/releases/download/v2.5.6/intel-igc-opencl-2_2.5.6+18417_amd64.deb
+        "
+
+        # NEO 24.52.32224.5 — Compute Runtime
+        run_spinner "Downloading Intel Compute Runtime 24.52.32224.5" bash -c "
+            wget -q https://github.com/intel/compute-runtime/releases/download/24.52.32224.5/intel-level-zero-gpu_1.6.32224.5_amd64.deb
+            wget -q https://github.com/intel/compute-runtime/releases/download/24.52.32224.5/intel-opencl-icd_24.52.32224.5_amd64.deb
+            wget -q https://github.com/intel/compute-runtime/releases/download/24.52.32224.5/libigdgmm12_22.5.2_amd64.deb
+        "
+
+        run_spinner "Installing Intel Compute Runtime (NEO)" sudo dpkg -i *.deb
+        sudo ldconfig
+        cd "$ROOT_DIR"
+        rm -rf "$NEO_TMP"
+
+        # Verify (same honest check as above)
+        GPU_CHECK_OUT=$("$VENV_DIR/bin/python3" -c "import openvino as ov; print('GPU' in ov.Core().available_devices)" 2>&1)
+        if [[ "$GPU_CHECK_OUT" == "True" ]]; then
+            ok "GPU now visible to OpenVINO after NEO update"
+        else
+            warn "GPU still not visible — a reboot may be required if xe driver was just activated"
+            warn "After reboot, re-run: ./setup.sh --models-only"
+        fi
+    fi
+
+    # ── 2c. GPU group permissions ─────────────────────────────────────────────
+    if ! id -nG "$USER" | grep -qw "render"; then
+        sudo usermod -aG render,video "$USER"
+        ok "Added $USER to render/video groups (re-login required)"
+    else
+        ok "GPU group permissions verified"
+    fi
+
+    # ── 2d. PSR disable (legacy i915 screen artifact prevention) ─────────────
+    if [[ "$CURRENT_DRIVER" != "xe" ]] && \
+       [[ -f "/etc/default/grub" ]] && \
+       ! grep -q "i915.enable_psr=0" /proc/cmdline 2>/dev/null && \
+       ! grep -q "i915.enable_psr=0" /etc/default/grub 2>/dev/null; then
+        if ask "Disable PSR in GRUB to prevent Meteor Lake display artifacts?"; then
+            sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 i915.enable_psr=0"/' /etc/default/grub
+            sudo update-grub 2>/dev/null || true
+            ok "PSR disabled in GRUB (takes effect on next boot)"
+        fi
+    fi
 fi
 
 # 4. API Keys & Tokens Configuration
-hdr "4 / 8  API Keys & Tokens Configuration (.env)"
+hdr "4 / 7  API Keys & Tokens Configuration (.env)"
 [[ -f ".env" ]] || { cp .env.example .env 2>/dev/null || touch .env; ok "Created .env"; }
 
 if ! $MODELS_ONLY; then
@@ -253,7 +324,7 @@ set_env_val "DAC_BASE_URL" "http://127.0.0.1:8001/v1"
 ok "Environment variables active"
 
 # 5. Model Selection & Verification
-hdr "5 / 8  Model Selection & Download"
+hdr "5 / 7  Model Selection & Download"
 if [[ -z "$CHOSEN_PAIR" ]]; then
     echo ""
     echo -e "${BOLD}Select OpenVINO Model Configuration:${RESET}"
@@ -325,83 +396,77 @@ PYEOF
 download_model_verified "${P1_HF_REPO[$CHOSEN_PAIR]}" "${P1_DIR[$CHOSEN_PAIR]}" "Primary: ${P1_ID[$CHOSEN_PAIR]}"
 download_model_verified "${P2_HF_REPO[$CHOSEN_PAIR]}" "${P2_DIR[$CHOSEN_PAIR]}" "Secondary/FIM: ${P2_ID[$CHOSEN_PAIR]}"
 
-# 6. Data Bootstrap (Optional)
-hdr "6 / 8  Data Bootstrap"
-info "Skipped by default during setup. Run historical_sim.py when ready."
+# ── Fixed Qwen3 chat template (eemin/Qwen-Fixed-Chat-Templates v22.1) ────────
+# Fixes the infinite <tool_call><web_search> loop (empty-think poisoning).
+# Reference: https://huggingface.co/eemin/Qwen-Fixed-Chat-Templates
+P1_FULL_PATH="$MODELS_DIR/${P1_DIR[$CHOSEN_PAIR]}"
+TEMPLATE_TARGET="$P1_FULL_PATH/chat_template.jinja"
 
-# 7. Systemd User Daemon Configuration
-if ! $MODELS_ONLY && command -v systemctl &>/dev/null; then
-    hdr "7 / 8  Systemd Service (Non-Destructive User Service)"
-    USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
-    mkdir -p "$USER_SYSTEMD_DIR"
-    SERVICE_FILE="$USER_SYSTEMD_DIR/openvino-coder.service"
-
-    cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=OpenVINO Model Server for VS Code and Trading Project
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$SERVER_DIR
-Environment="SYCL_DEVICE_FILTER=gpu"
-Environment="SYCL_CACHE_PERSISTENT=1"
-ExecStart=$VENV_DIR/bin/python3 $SERVER_DIR/serve_model.py \
-    --model-path $MODELS_DIR/${P1_DIR[$CHOSEN_PAIR]} \
-    --model-id ${P1_ID[$CHOSEN_PAIR]} \
-    --port 8000 \
-    --device GPU \
-    --cache-dir $CACHE_DIR
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-EOF
-
-    systemctl --user daemon-reload
-    ok "Configured user systemd unit: $SERVICE_FILE"
-
-    if ask "Enable and start local model server now as user service?" "Y"; then
-        systemctl --user enable --now openvino-coder.service
-        ok "openvino-coder service active (Port 8000)"
+# Only apply to Qwen3 chat models — not Phi-4-mini or Qwen2.5-Coder
+if [[ "${P1_ID[$CHOSEN_PAIR]}" == *"qwen3"* ]]; then
+    if [[ -f "$TEMPLATE_TARGET" ]]; then
+        skip "Fixed chat template already present in $(basename $P1_FULL_PATH)"
+    else
+        info "Downloading fixed Qwen3 chat template (fixes tool call infinite loop)..."
+        python3 -c "
+import sys, shutil, os
+from pathlib import Path
+from huggingface_hub import hf_hub_download
+dest = Path('$P1_FULL_PATH')
+token = os.environ.get('HF_TOKEN') or None
+try:
+    p = hf_hub_download('eemin/Qwen-Fixed-Chat-Templates', 'chat_template.jinja', token=token)
+    shutil.copy(p, dest / 'chat_template.jinja')
+    print('ok')
+except Exception as e:
+    print(f'failed: {e}', file=sys.stderr)
+    sys.exit(1)
+" && ok "Fixed chat template installed → $(basename $P1_FULL_PATH)/chat_template.jinja" \
+      || warn "Template download failed — run: bash scripts/download_fixed_template.sh $P1_FULL_PATH"
     fi
 fi
 
-# 8. Verification
-hdr "8 / 8  Installation Verification"
+
+# 6. Data Bootstrap (Optional)
+hdr "6 / 7  Data Bootstrap"
+info "Skipped by default during setup. Run historical_sim.py when ready."
+
+# 7. Verification
+hdr "7 / 7  Installation Verification"
+
+# Remove any systemd service from a previous version of this script.
+# This project now runs exactly one model pair at a time via launch_models.sh;
+# a persistent, auto-restarting background service on a fixed port (which is
+# what the old Step 7 installed) collides with that by design — it's a
+# different, independent use case (VS Code Continue autocomplete) that
+# happened to hardcode the same port launch_models.sh also uses.
+if command -v systemctl &>/dev/null; then
+    if systemctl --user list-unit-files 2>/dev/null | grep -q "openvino-coder.service"; then
+        warn "Found an existing openvino-coder systemd service from a previous setup — removing it"
+        systemctl --user disable --now openvino-coder.service 2>/dev/null || true
+        rm -f "$HOME/.config/systemd/user/openvino-coder.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        ok "Removed openvino-coder.service — launch_models.sh now has sole ownership of the model server ports"
+    fi
+fi
+
 ok "Setup complete."
 
 echo ""
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
-echo -e "${BOLD}${GREEN} Ready for VS Code Integration${RESET}"
+echo -e "${BOLD}${GREEN} Ready — start models with launch_models.sh${RESET}"
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 echo ""
-echo -e "  Add this to your VS Code Continue config (${CYAN}~/.continue/config.json${RESET}):"
+echo -e "  This project runs ${BOLD}one model pair at a time${RESET}, started manually:"
 echo ""
-cat << EOF
-{
-  "models": [
-    {
-      "title": "Local Qwen Coder (Arc iGPU)",
-      "provider": "openai",
-      "model": "${P1_ID[$CHOSEN_PAIR]}",
-      "apiBase": "http://127.0.0.1:8000/v1",
-      "apiKey": "none"
-    }
-  ],
-  "tabAutocompleteModel": {
-    "title": "Local Qwen Autocomplete",
-    "provider": "openai",
-    "model": "${P1_ID[$CHOSEN_PAIR]}",
-    "apiBase": "http://127.0.0.1:8000/v1",
-    "apiKey": "none"
-  }
-}
-EOF
+echo -e "    ${CYAN}./launch_models.sh --pair $CHOSEN_PAIR --with-chainlit${RESET}"
 echo ""
-echo -e "  Management Commands:"
-echo -e "    Check Server Status:  ${CYAN}systemctl --user status openvino-coder${RESET}"
-echo -e "    Follow Server Logs:   ${CYAN}journalctl --user -u openvino-coder -f${RESET}"
-echo -e "    Restart Model Server: ${CYAN}systemctl --user restart openvino-coder${RESET}"
+echo -e "  Switching pairs is safe to do directly — launching a new pair"
+echo -e "  automatically stops whatever's currently running first. To stop"
+echo -e "  everything without starting a new pair: ${CYAN}./launch_models.sh --stop${RESET}"
+echo ""
+echo -e "  To use the local model in VS Code's Continue extension, just launch a"
+echo -e "  pair — ${CYAN}~/.continue/config.json${RESET} is updated automatically every time"
+echo -e "  ${CYAN}launch_models.sh${RESET} starts, pointed at whatever model is actually live."
+echo -e "  (Your other Continue models/settings are preserved, not overwritten.)"
 echo ""

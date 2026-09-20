@@ -75,6 +75,10 @@ _tok:       Any   = None
 _model_id:  str   = "ov-model"
 _is_vlm:    bool  = False
 _cache_dir: str   = os.path.expanduser("~/models/.ov_cache")
+# ADDED (19 Sep 2026): verbose per-request debug logging, off by default.
+# Toggled via launch_models.sh --debug (passed through as --debug here).
+# See chat_completions() for what gets logged when this is on.
+_debug: bool = False
 # ADDED (P2-068, 2026-09-17): needed by the new /admin/reload_pipeline endpoint
 # below, so pipeline reconstruction can happen outside main() too.
 _model_dir: str | None = None
@@ -124,19 +128,26 @@ class ChatRequest(BaseModel):
     temperature:     float = Field(default=0.2,  ge=0.0, le=2.0)
     stream:          bool  = False
     response_format: ResponseFormat | None = None
-    thinking:        bool  = False   # True = enable Qwen3 chain-of-thought
     thinking:        bool  = False   # True = enable Qwen3 chain-of-thought reasoning
 
-TOOL_SYSTEM_PREFIX = """You are a trading research assistant with access to the following tools:
+TOOL_SYSTEM_PREFIX = """You are a trading research assistant. You have access to these tools:
 {tools_json}
 
-CRITICAL RULES FOR TOOL USE:
-- For ANY question about current events, news, prices, market conditions, or recent data: call web_search FIRST, then answer using the results. Never answer these from memory.
-- For questions requiring a specific URL or article: call fetch_url after web_search.
-- For trading statistics or calculations: call run_toolkit.
-- After receiving tool results, synthesize them into a clear, grounded answer.
-- If no tool is needed (e.g. explaining a concept you know well), answer directly.
-- Do NOT say "I don't have access to real-time information" — use web_search instead.
+To call a tool, output EXACTLY this format and nothing else:
+<tool_call>
+<function=TOOL_NAME>
+<parameter=PARAM_NAME>VALUE</parameter>
+</function>
+</tool_call>
+
+Example:
+<tool_call>
+<function=web_search>
+<parameter=query>top market news today</parameter>
+</function>
+</tool_call>
+
+If no tool is needed, answer directly. Call web_search for any question about current events, news, prices, or market data.
 """
 
 
@@ -169,6 +180,39 @@ def _build_prompt(req: ChatRequest) -> str:
     our pre-built string rather than re-applying the template internally.
     """
     messages = [{"role": m.role, "content": _extract_text_content(m.content)} for m in req.messages]
+
+    # When thinking=True, Qwen3's chat template cannot handle role="tool" messages.
+    # Convert tool results into a user message so the template renders them correctly.
+    # This is the root cause of "I don't have access to real-time information"
+    # appearing in thinking mode — the tool results were silently dropped.
+    if req.thinking:
+        merged: list[dict] = []
+        tool_results: list[str] = []
+        for m in messages:
+            if m["role"] == "tool":
+                tool_results.append(m["content"])
+            else:
+                if tool_results:
+                    # Flush accumulated tool results as a user message
+                    merged.append({
+                        "role": "user",
+                        "content": "Web search results:\n\n" + "\n\n---\n\n".join(tool_results)
+                    })
+                    tool_results = []
+                # Merge consecutive user messages (avoid double-user which template rejects)
+                if merged and merged[-1]["role"] == m["role"] == "user":
+                    merged[-1]["content"] += "\n\n" + m["content"]
+                elif merged and merged[-1]["role"] == m["role"] == "assistant":
+                    # Skip duplicate assistant messages (tool_calls + content)
+                    pass
+                else:
+                    merged.append(m)
+        if tool_results:
+            merged.append({
+                "role": "user",
+                "content": "Web search results:\n\n" + "\n\n---\n\n".join(tool_results)
+            })
+        messages = merged
 
     # Non-thinking mode: inject /no_think into system message.
     # Skipped when thinking=True so the model reasons freely.
@@ -247,8 +291,8 @@ def _parse_tool_call(text: str, model_id: str | None = None) -> dict | None:
 
     Formats handled:
       xml_fn   — <tool_call><function=web_search><parameter=query>text
-      xml_tag  — <tool_call> <web_search> text <parameter=n_results> 5
-      xml_json — <tool_call>{"query":"text","n_results":5}</tool_call>
+      xml_tag  — <tool_call> <web_search> text </tool_call>
+      xml_json — <tool_call>{"query":"text"}</tool_call>
       json_bare— {"name":"web_search","arguments":{"query":"text"}}
       fenced   — ```json {"name":...} ```
 
@@ -257,6 +301,11 @@ def _parse_tool_call(text: str, model_id: str | None = None) -> dict | None:
     stripped = text.strip()
     if not stripped:
         return None
+
+    # Strip Claude-style XML tags that Qwen3 sometimes generates
+    # (trained on Claude outputs — produces </antThinking> instead of </tool_call>)
+    stripped = re.sub(r'</?(antThinking|antArtifact|antml:[a-z_]+)[^>]*>', '', stripped)
+    stripped = stripped.strip()
 
     # Strip preamble before the tool call marker
     for marker in ("<tool_call>", "<function="):
@@ -352,7 +401,7 @@ def _try_parse_format(text: str, fmt: str) -> dict | None:
         name = fn.group(1)
         params: dict = {}
         for pm in re.finditer(
-            r"<parameter=(\w+)>\s*(.*?)\s*(?:</parameter>|<parameter|</function|$)",
+            r"<parameter=(\w+)>\s*(.*?)\s*(?:</parameter>|<parameter|</function|</tool_call|$)",
             text, re.DOTALL
         ):
             key = pm.group(1)
@@ -663,16 +712,22 @@ def chat_completions(req: ChatRequest):
     prompt       = _build_prompt(req)
     prompt_tokens = _count_tokens(prompt)
 
+    if _debug:
+        print(f"[DEBUG] Request: stream={req.stream} thinking={req.thinking} "
+              f"tools={len(req.tools) if req.tools else 0} "
+              f"temp={req.temperature} max_tokens={req.max_tokens} "
+              f"prompt_tokens={prompt_tokens}", flush=True)
+
     config = ov_genai.GenerationConfig()
     config.max_new_tokens    = req.max_tokens
-    config.apply_chat_template = False   # _build_prompt() already returns a fully-templated
-                                          # string in BOTH branches (thinking or not) — this
-                                          # must always be False so VLMPipeline uses our string
-                                          # as-is rather than re-templating it internally.
-                                          # FIXED 2026-09-17 (P2-068): was `not req.thinking`,
-                                          # which inverted the mapping and double-templated the
-                                          # default (thinking=False) path instead of the
-                                          # thinking=True path the original comment claimed.
+    config.apply_chat_template = False   # _build_prompt() returns fully-templated string
+
+    # Stop generation when tool call closes — prevents the infinite
+    # <tool_call><web_search>...<tool_call><web_search> loop
+    try:
+        config.stop_strings = ["</tool_call>", "</function>", "<|im_end|>"]
+    except Exception:
+        pass  # older OpenVINO builds may not support stop_strings
 
     if req.temperature > 0.05:
         config.do_sample  = True
@@ -682,15 +737,12 @@ def chat_completions(req: ChatRequest):
         config.do_sample = False
 
     # ── Streaming handler ─────────────────────────────────────────────────────
-    # Architecture: sync generator running directly in FastAPI's threadpool.
-    # The streamer callback fires synchronously inside _pipe.generate() on the
-    # SAME thread as the generator — no queue, no background thread, no
-    # cancellation race. Tokens are collected into a list by the callback and
-    # yielded by the generator via a shared buffer checked after each callback.
-    #
-    # This is the simplest pattern that works: generate() blocks the threadpool
-    # thread until complete, the streamer callback appends tokens to a deque,
-    # and the generator yields them. FastAPI flushes each yield to the client.
+    # Architecture: background thread runs _pipe.generate() and pushes tokens
+    # into a queue.SimpleQueue; the sync generator below (run in FastAPI's
+    # threadpool) reads from that queue and yields SSE chunks. Not a naive
+    # queue-free direct-callback design — the queue is what lets the streamer
+    # callback (running on the background thread) hand tokens to the generator
+    # (running on a different thread) safely.
     # ──────────────────────────────────────────────────────────────────────────
     if req.stream:
         import collections
@@ -701,6 +753,7 @@ def chat_completions(req: ChatRequest):
             buf: collections.deque[str] = collections.deque()
             done = [False]
             error = [None]
+            _tok_count = [0]   # for the debug summary at the end
 
             def streamer_cb(subword: str):
                 buf.append(subword)
@@ -756,6 +809,7 @@ def chat_completions(req: ChatRequest):
                         break
                     if subword is None:
                         break
+                    _tok_count[0] += 1
                     yield _emit(subword)
             except GeneratorExit:
                 print("[STREAM] GeneratorExit — client disconnected", flush=True)
@@ -765,6 +819,8 @@ def chat_completions(req: ChatRequest):
                 raise
             finally:
                 _t.join(timeout=10)
+                if _debug:
+                    print(f"[DEBUG] Stream complete: {_tok_count[0]} chunks yielded", flush=True)
 
             if req.thinking:
                 yield _emit("\n</think>\n\n")
@@ -825,7 +881,7 @@ def chat_completions(req: ChatRequest):
     else:
         _, raw = _strip_thinking(raw)
 
-    for eos in ("<|im_end|>", "</s>", "[/INST]", "<|endoftext|>"):
+    for eos in ("<|im_end|>", "</s>", "[/INST]", "<|endoftext|>", "</antThinking>", "</tool_call>"):
         raw = raw.replace(eos, "").strip()
 
     # Strip preamble text before XML tool calls (e.g. "I'll search for you.\n\n<tool_call>...")
@@ -836,6 +892,24 @@ def chat_completions(req: ChatRequest):
         raw_for_tool = raw[tc_idx:]
 
     tool_call   = _parse_tool_call(raw_for_tool, model_id=_model_id)
+
+    if _debug:
+        if req.tools:
+            if tool_call:
+                print(f"[DEBUG] Tool call parsed OK: {tool_call['name']}"
+                      f"({tool_call['arguments']})", flush=True)
+            else:
+                # This is the exact failure case behind the fabricated-citation
+                # investigation (19 Sep 2026): tools were available and the
+                # system prompt told the model to use them, but no <tool_call>
+                # block was found in its output. Log what it said instead, so
+                # this is directly observable next time rather than inferred.
+                print(f"[DEBUG] Tools were available ({len(req.tools)}) but "
+                      f"NO tool call was parsed from the model's output — it "
+                      f"answered directly instead. Raw output (first 500 chars): "
+                      f"{raw[:500]!r}", flush=True)
+        else:
+            print("[DEBUG] No tools were provided on this request.", flush=True)
 
     # Fallback: if web_search has no query, extract from last user message
     if tool_call and tool_call.get("name") == "web_search" \
@@ -909,7 +983,7 @@ def chat_completions(req: ChatRequest):
 # ===========================================================================
 
 def main() -> None:
-    global _pipe, _tok, _model_id, _cache_dir, _is_vlm, _model_dir, _device, _force_llm
+    global _pipe, _tok, _model_id, _cache_dir, _is_vlm, _model_dir, _device, _force_llm, _debug
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path",       required=True)
@@ -923,16 +997,26 @@ def main() -> None:
     parser.add_argument("--force-llm",        action="store_true",
                         help="Force LLMPipeline even when vision embeddings are present. "
                              "Use for text-only inference on VLM model directories.")
+    parser.add_argument("--debug",            action="store_true",
+                        help="Verbose per-request logging: request summary (tools/thinking/"
+                             "stream/token counts) and, critically, the raw model output "
+                             "whenever tools were available but no tool call was parsed — "
+                             "the exact signal needed to diagnose a model answering directly "
+                             "instead of calling a tool. Off by default; noisy, meant for "
+                             "active debugging, not routine operation.")
     args, _ = parser.parse_known_args()
 
     _model_id  = args.model_id
     _cache_dir = args.cache_dir
+    _debug     = args.debug
     os.makedirs(_cache_dir, exist_ok=True)
 
     # Confirm SYCL guard is active
     sycl_filter = os.environ.get("SYCL_DEVICE_FILTER", "not set")
     print(f"\n[serve_model] SYCL_DEVICE_FILTER = {sycl_filter}")
     print(f"[serve_model] Loading '{args.model_id}' onto {args.device}...")
+    if _debug:
+        print("[serve_model] Debug logging: ON — per-request details will print to this log")
     t0 = time.monotonic()
 
     model_dir = Path(args.model_path)
@@ -979,6 +1063,22 @@ def main() -> None:
             _tok = ov_genai.Tokenizer(str(model_dir))
         except Exception:
             _tok = None
+
+    # Load community-fixed chat template if present
+    # Source: eemin/Qwen-Fixed-Chat-Templates (v22.1, Apache-2.0)
+    # Fixes: empty-think poisoning → infinite <tool_call> loop, Qwen3.8 regressions
+    # Download: scripts/download_fixed_template.sh <model_dir>
+    _fixed_tpl = model_dir / "chat_template.jinja"
+    if _fixed_tpl.exists() and _tok is not None:
+        try:
+            with open(_fixed_tpl) as _f:
+                _tok.chat_template = _f.read()
+            print(f"  ✓ Fixed chat template loaded (eemin/Qwen-Fixed-Chat-Templates)")
+        except Exception as e:
+            print(f"  ⚠ Could not apply fixed template: {e}")
+    else:
+        print(f"  ⚠ No fixed chat template found — tool calls may loop")
+        print(f"    Fix: bash scripts/download_fixed_template.sh {model_dir}")
 
     elapsed_load = time.monotonic() - t0
     print(f"  ✓ Model ready in {elapsed_load:.1f}s on {args.device}")

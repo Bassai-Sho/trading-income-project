@@ -277,6 +277,9 @@ async def _get_tools() -> list[dict]:
 @cl.step(type="tool")
 async def run_tool(name: str, args: dict) -> str:
     """Execute a tool call with up to 3 retries — @cl.step guarantees render order."""
+    # Update step name to show which tool is being called
+    if cl.context.current_step:
+        cl.context.current_step.name = name
     last_error = ""
     for attempt in range(3):
         try:
@@ -304,6 +307,83 @@ async def run_tool(name: str, args: dict) -> str:
         return f"Tool error after 3 attempts: {last_error} | fallback: {e}"
 
 
+def _extract_top_urls(search_result: str, n: int = 3) -> list[str]:
+    """Return up to n fetchable URLs — one per domain for diversity."""
+    import re as _re
+    from urllib.parse import urlparse as _up
+    urls = _re.findall(r"https?://[^ \t\n\r<>]+", search_result)
+    urls = [u.rstrip(".,)]") for u in urls]
+
+    skip = {"wikipedia.org", "google.com", "google.co.uk", "yahoo.com", "bing.com",
+            "bloomberg.com", "ft.com", "wsj.com", "nytimes.com",
+            "economist.com", "thetimes.co.uk", "telegraph.co.uk",
+            "reuters.com", "marketwatch.com", "barrons.com", "seekingalpha.com",
+            "tipranks.com", "fool.com", "thestreet.com", "investopedia.com"}
+
+    article_pats = [r"/\d{4}/\d{2}/\d{2}/", r"/article/", r"/story/",
+                    r"/news/[^/]+/[^/]+", r"-\d{8}"]
+
+    news_fallback = ["bbc.", "apnews.", "nbcnews.", "cbsnews.", "theguardian.",
+                     "euronews.", "cnbc.", "cnn.", "independent.", "sky.com",
+                     "thehill.", "axios.", "politico.", "npr.org"]
+
+    def _is_skip(url):
+        d = _up(url).netloc.lstrip("www.")
+        return any(s in d for s in skip)
+
+    def _is_homepage(url):
+        p = _up(url)
+        path = p.path.rstrip("/")
+        # Pure domain root with no path or query
+        if path == "" and not p.query:
+            return True
+        # Generic section roots with no sub-path
+        if path in ("/news", "/world", "/news/world", "/latest", "/markets"):
+            return True
+        # Yahoo Finance quote root (but /quote/SPY/news is NOT a homepage)
+        if "/quote/" in path and path.endswith("/quote/" + path.split("/quote/")[-1].split("/")[0]):
+            return True
+        return False
+
+    seen: set = set()
+    results: list = []
+
+    domain_count: dict = {}
+
+    def _try_add(url, max_per_domain=1):
+        d = _up(url).netloc.lstrip("www.")
+        if _is_skip(url):
+            return False
+        if domain_count.get(d, 0) >= max_per_domain:
+            return False
+        domain_count[d] = domain_count.get(d, 0) + 1
+        results.append(url)
+        return len(results) >= n
+
+    # Pass 1: article-pattern URLs, 1 per domain
+    for url in urls:
+        if not _is_homepage(url) and any(_re.search(p, url) for p in article_pats):
+            if _try_add(url, max_per_domain=1): return results
+    # Pass 2: any non-homepage URL, 1 per domain
+    for url in urls:
+        if not _is_homepage(url) and url not in results:
+            if _try_add(url, max_per_domain=1): return results
+    # Pass 3: known news domains even if homepage-like, 1 per domain
+    for url in urls:
+        d = _up(url).netloc.lstrip("www.")
+        if url not in results and any(nd in d for nd in news_fallback):
+            if _try_add(url, max_per_domain=1): return results
+    # Pass 4: relax to 2 per domain if still short
+    for url in urls:
+        if not _is_homepage(url) and url not in results:
+            if _try_add(url, max_per_domain=2): return results
+    # Pass 5: include homepage-like pages as last resort
+    for url in urls:
+        if url not in results and not _is_skip(url):
+            if _try_add(url, max_per_domain=2): return results
+    return results
+
+
 def _extract_best_url(search_result: str) -> str | None:
     """Pick the best article URL from search results, skipping paywalls and homepages."""
     urls = re.findall(r'https?://[^\s\])\'"…]+', search_result)
@@ -312,7 +392,9 @@ def _extract_best_url(search_result: str) -> str | None:
 
     skip = {'wikipedia.org', 'google.com', 'google.co.uk', 'yahoo.com', 'bing.com',
             'bloomberg.com', 'ft.com', 'wsj.com', 'nytimes.com',
-            'economist.com', 'thetimes.co.uk', 'telegraph.co.uk'}
+            'economist.com', 'thetimes.co.uk', 'telegraph.co.uk',
+            'reuters.com',   # 401 Forbidden on direct fetch
+            'marketwatch.com', 'barrons.com', 'seekingalpha.com'}  # paywall/bot-block
 
     article_pats = [r'/\d{4}/\d{2}/\d{2}/', r'/article/', r'/story/',
                     r'/news/[^/]+/[^/]+', r'/world/[^/]+', r'/business/[^/]+',
@@ -426,6 +508,38 @@ async def on_chat_start():
     temperature = 0.6 if profile == "D-A-C" else 0.2
     max_tokens  = 1024
 
+    # Fetch which model is ACTUALLY running on each port before building the
+    # Settings panel — this must happen BEFORE ChatSettings is sent, not after.
+    # FIXED 19 Sep 2026 (P2-076): the panel used to hard-code
+    # "8000 = Qwen3.8-27B (deep analysis) · 8001 = Phi-4-mini (fast)" as a
+    # static string, regardless of which pair launch_models.sh actually
+    # started. That's actively misleading once more than one pair exists
+    # (Pair 4 is Qwen2.5-Coder-7B on port 8000, not Qwen3.8-27B) — confirmed
+    # via a live screenshot showing the stale label while Pair 4 was running.
+    # serve_model.py's /health endpoint already returns {"model": ...}; this
+    # reuses that instead of a second hardcoded guess.
+    p1_ok, p2_ok = False, False
+    p1_model_id, p2_model_id = "unknown (port 8000)", "unknown (port 8001)"
+    p1_url = BACKEND_URL
+    p2_url = BACKEND_URL.replace(":8000", ":8001")
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as h:
+            r = await h.get(f"{p1_url}/health")
+            p1_ok = True
+            p1_model_id = r.json().get("model", p1_model_id)
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as h:
+            r = await h.get(f"{p2_url}/health")
+            p2_ok = True
+            p2_model_id = r.json().get("model", p2_model_id)
+    except Exception:
+        pass
+
+    cl.user_session.set("p1_model_id", p1_model_id)
+    cl.user_session.set("p2_model_id", p2_model_id)
+
     from chainlit.input_widget import Select, TextInput
     await cl.ChatSettings([
         Select(
@@ -433,7 +547,7 @@ async def on_chat_start():
             label="Model",
             values=["8000", "8001"],
             initial_index=0,
-            description="8000 = Qwen3.8-27B (deep analysis) · 8001 = Phi-4-mini (fast)"
+            description=f"8000 = {p1_model_id} · 8001 = {p2_model_id}"
         ),
         Switch(id="use_tools",     label="🔍 Web Search & Tools", initial=use_tools,
                description="Search the web and fetch article content"),
@@ -451,23 +565,6 @@ async def on_chat_start():
     cl.user_session.set("temperature",   temperature)
     cl.user_session.set("max_tokens",    max_tokens)
     cl.user_session.set("profile",       profile)
-
-    # Backend health check — silent, just sets flags
-    p1_ok, p2_ok = False, False
-    p1_url = BACKEND_URL
-    p2_url = BACKEND_URL.replace(":8000", ":8001")
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as h:
-            await h.get(f"{p1_url}/health")
-        p1_ok = True
-    except Exception:
-        pass
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as h:
-            await h.get(f"{p2_url}/health")
-        p2_ok = True
-    except Exception:
-        pass
 
     # Only send a status message when something needs attention.
     # When all is well, stay silent so starters appear above the input.
@@ -543,11 +640,16 @@ async def on_message(message: cl.Message):
         port = cl.user_session.get("model_port", "8000")
         new_port = "8001" if port == "8000" else "8000"
         cl.user_session.set("model_port", new_port)
-        model = "Phi-4-mini (fast)" if new_port == "8001" else "Qwen3.8-27B (deep)"
+        model = cl.user_session.get(
+            "p2_model_id" if new_port == "8001" else "p1_model_id",
+            f"unknown (port {new_port})"
+        )
         await cl.Message(content=f"🔄 Switched to `{model}` on port `{new_port}`", author="System").send()
         return
 
     elif cmd == "help":
+        _p1 = cl.user_session.get("p1_model_id", "port 8000")
+        _p2 = cl.user_session.get("p2_model_id", "port 8001")
         await cl.Message(
             content=(
                 "**Available commands:**\n"
@@ -555,7 +657,7 @@ async def on_message(message: cl.Message):
                 "- `/dac` — start a D-A-C review session\n"
                 "- `/toolkit` — run trading toolkit analysis\n"
                 "- `/search` — enable web search\n"
-                "- `/model` — switch between Qwen3.8 and Phi-4-mini\n"
+                f"- `/model` — switch between `{_p1}` and `{_p2}`\n"
                 "- `/clear` — clear chat history\n"
                 "- `/help` — show this message"
             ),
@@ -613,7 +715,7 @@ async def on_message(message: cl.Message):
                         messages=messages_with_system,
                         tools=tools,
                         temperature=0.0,
-                        max_tokens=128,
+                        max_tokens=512,  # raised: 128 truncated tool XML before <parameter=query>
                         stream=False,
                         extra_body={"thinking": False},
                     )
@@ -671,8 +773,6 @@ async def on_message(message: cl.Message):
                 except Exception:
                     fn_args = {"query": str(tc.function.arguments)}
 
-                # Set step name to tool name for display
-                cl.context.current_step.name = fn_name if cl.context.current_step else fn_name
                 raw_result = await run_tool(fn_name, fn_args)
 
                 history.append({
@@ -681,15 +781,25 @@ async def on_message(message: cl.Message):
                     "tool_call_id": tc.id,
                 })
 
-                # Auto fetch_url after web_search
-                if fn_name == "web_search":
-                    best_url = _extract_best_url(raw_result)
-                    if best_url:
-                        page_content = await run_tool("fetch_url",
-                                                      {"url": best_url, "max_chars": 2000})
+                # Auto fetch_url after web_search — fetch up to 3 sources in parallel
+                # for news queries to ensure mix of results even if some block/401.
+                if fn_name == "web_search" and not raw_result.startswith(("Search failed", "Search timed out")):
+                    # Fetch up to 6 candidate URLs, retrying on failure to get 3 successes
+                    candidate_urls = _extract_top_urls(raw_result, n=6)
+                    combined_articles = []
+                    for fetch_url_candidate in candidate_urls:
+                        if len(combined_articles) >= 3:
+                            break
+                        try:
+                            page = await run_tool("fetch_url", {"url": fetch_url_candidate, "max_chars": 1500})
+                            if page and not page.startswith(("HTTP fetch failed", "Error", "Invalid URL", "403", "401")):
+                                combined_articles.append(f"[{fetch_url_candidate}]\n{page[:1500]}")
+                        except Exception:
+                            continue  # try next URL
+                    if combined_articles:
                         history.append({
                             "role": "tool",
-                            "content": f"Article from {best_url}:\n\n{page_content[:2000]}",
+                            "content": "Fetched articles:\n\n" + "\n\n---\n\n".join(combined_articles),
                             "tool_call_id": f"auto_fetch_{tc.id}",
                         })
 
@@ -776,6 +886,8 @@ async def on_think_action(action):
 
 @cl.action_callback("help")
 async def on_help(action):
+    _p1 = cl.user_session.get("p1_model_id", "port 8000")
+    _p2 = cl.user_session.get("p2_model_id", "port 8001")
     await cl.Message(
         content=(
             "**Available commands:**\n"
@@ -783,7 +895,7 @@ async def on_help(action):
             "- `/dac` — start a D-A-C review session\n"
             "- `/toolkit` — run trading toolkit analysis\n"
             "- `/search` — enable web search\n"
-            "- `/model` — switch between Qwen3.8 and Phi-4-mini\n"
+            f"- `/model` — switch between `{_p1}` and `{_p2}`\n"
             "- `/clear` — clear chat history\n"
             "- `/help` — show this message"
         ),
