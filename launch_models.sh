@@ -14,9 +14,6 @@
 #   ./launch_models.sh --with-chainlit    # launch Chainlit chat UI on port 8080 (primary)
 #   ./launch_models.sh --with-chat        # launch standalone trading_chat.html on port 3000
 #   ./launch_models.sh --with-webui       # launch Open WebUI on port 8080 (legacy)
-#   ./launch_models.sh --debug            # verbose per-request server logs (tool-call
-#                                          #   parsing outcomes, request summaries) — off
-#                                          #   by default, noisy, for active debugging only
 #   ./launch_models.sh --stop             # stop all servers
 #   ./launch_models.sh --status           # check health
 #   ./launch_models.sh --logs             # tail log files
@@ -51,7 +48,6 @@ PAIR_OVERRIDE=""
 WITH_WEBUI=false
 WITH_CHAT=false
 WITH_CHAINLIT=false
-DEBUG_LOGGING=false
 CHAT_PORT=3000
 CHAINLIT_PORT=8080
 ACTION="start"
@@ -63,7 +59,7 @@ for arg in "$@"; do
         --with-webui)       WITH_WEBUI=true ;;
         --with-chat)        WITH_CHAT=true ;;
         --with-chainlit)    WITH_CHAINLIT=true ;;
-        --debug)            DEBUG_LOGGING=true ;;
+        --debug)            DEBUG=1 ;;
         --stop|stop)        ACTION="stop" ;;
         --status|status)    ACTION="status" ;;
         --logs|logs)        ACTION="logs" ;;
@@ -185,18 +181,7 @@ case "$ACTION" in
     logs)
         tail -f "$P1_LOG" "$P2_LOG"; exit 0 ;;
     restart)
-        # FIXED 19 Sep 2026: was `exec "$0"` with no args, silently dropping
-        # --pair/--with-chainlit/--debug/etc. on every restart. Reconstructed
-        # explicitly from the already-parsed state below rather than replaying
-        # raw "$@" — that would both loop forever (still contains --restart)
-        # and lose --pair's value (already consumed by `shift` above).
-        RESTART_ARGS=()
-        [[ -n "$PAIR_OVERRIDE" ]] && RESTART_ARGS+=(--pair "$PAIR_OVERRIDE")
-        $WITH_CHAINLIT && RESTART_ARGS+=(--with-chainlit)
-        $WITH_CHAT     && RESTART_ARGS+=(--with-chat)
-        $WITH_WEBUI    && RESTART_ARGS+=(--with-webui)
-        $DEBUG_LOGGING && RESTART_ARGS+=(--debug)
-        "$0" --stop; sleep 1; exec "$0" "${RESTART_ARGS[@]}" ;;
+        "$0" --stop; sleep 1; exec "$0" ;;
 esac
 
 # ── Pre-flight ────────────────────────────────────────────────────────────────
@@ -225,22 +210,12 @@ THINK_ARGS=()
 [[ -n "$THINK_LOG" ]] && THINK_ARGS=(--think-log "$THINK_LOG")
 DRAFT_ARGS=()
 [[ -n "$DRAFT_MODEL_PATH" ]] && DRAFT_ARGS=(--draft-model-path "$DRAFT_MODEL_PATH")
-DEBUG_ARGS=()
-$DEBUG_LOGGING && DEBUG_ARGS=(--debug)
 
 info "Starting Port $P1_PORT ($ID_P1)..."
-$DEBUG_LOGGING && info "Debug logging enabled — verbose per-request output in $P1_LOG"
 
-# `python3 -u` (unbuffered stdout/stderr): without it, Python fully
-# block-buffers output when it's redirected to a file rather than a
-# terminal — print() calls can sit in memory indefinitely instead of
-# reaching the log file, making live log-tailing and post-hoc debugging
-# unreliable for anything that isn't explicitly flush=True. Found 19 Sep
-# 2026 when LOGS/model_8000.log was 0 bytes despite the server having
-# clearly started and handled a request.
-"$VENV/bin/python3" -u "$SERVE_SCRIPT" \
+"$VENV/bin/python3" "$SERVE_SCRIPT" \
     --model-path "$MODEL_P1" --model-id "$ID_P1" \
-    --port "$P1_PORT" --device GPU "${THINK_ARGS[@]}" "${DRAFT_ARGS[@]}" "${DEBUG_ARGS[@]}" \
+    --port "$P1_PORT" --device GPU "${THINK_ARGS[@]}" "${DRAFT_ARGS[@]}" \
     > "$P1_LOG" 2>&1 &
 P1_PID_VAL=$!
 echo "$P1_PID_VAL" > "$P1_PID"
@@ -248,9 +223,9 @@ echo "$P1_PID_VAL" > "$P1_PID"
 # ── Launch Phase 2 ────────────────────────────────────────────────────────────
 if ! $SKIP_P2; then
     info "Starting Port $P2_PORT ($ID_P2)..."
-    "$VENV/bin/python3" -u "$SERVE_SCRIPT" \
+    "$VENV/bin/python3" "$SERVE_SCRIPT" \
         --model-path "$MODEL_P2" --model-id "$ID_P2" \
-        --port "$P2_PORT" --device GPU "${DEBUG_ARGS[@]}" \
+        --port "$P2_PORT" --device GPU \
         > "$P2_LOG" 2>&1 &
     P2_PID_VAL=$!
     echo "$P2_PID_VAL" > "$P2_PID"
@@ -265,6 +240,7 @@ if $WITH_CHAINLIT; then
         cd "$ROOT_DIR"
         BACKEND_URL="http://127.0.0.1:$P1_PORT" \
         MODEL_ID="$ID_P1" \
+        CHAINLIT_DEBUG="${DEBUG:-0}" \
         "$VENV/bin/chainlit" run src/chainlit_app.py \
             --host 0.0.0.0 --port "$CHAINLIT_PORT" --headless \
             > "$LOG_DIR/chainlit_8080.log" 2>&1 &
@@ -361,70 +337,6 @@ done
 
 printf "\r\033[K"
 
-# ── Update VS Code Continue config ──────────────────────────────────────────
-# Points Continue at whichever model is actually live on Port $P1_PORT right
-# now. Runs every launch (not just setup) since the live model changes with
-# --pair — a config written once at setup time would go stale the moment you
-# switch pairs. Merges into any existing ~/.continue/config.json rather than
-# overwriting it, so other models/settings you've configured are preserved.
-# An entry is matched and replaced by "title" so re-launching (even with a
-# different pair) updates the same entry instead of accumulating duplicates.
-# Skipped if Phase 1 never came up (nothing live to point Continue at).
-if kill -0 "$P1_PID_VAL" 2>/dev/null && curl -sf "http://127.0.0.1:$P1_PORT/health" >/dev/null 2>&1; then
-    CONTINUE_UPDATE=$(python3 - "$ID_P1" "$P1_PORT" << 'PYEOF' 2>&1
-import json, sys
-from pathlib import Path
-
-model_id, port = sys.argv[1], sys.argv[2]
-config_path = Path.home() / ".continue" / "config.json"
-config_path.parent.mkdir(parents=True, exist_ok=True)
-
-if config_path.exists():
-    try:
-        config = json.loads(config_path.read_text())
-    except json.JSONDecodeError:
-        # Don't silently clobber a config we can't parse — back it up instead.
-        backup = config_path.with_suffix(".json.bak")
-        config_path.rename(backup)
-        print(f"WARN: existing config.json was invalid JSON — backed up to {backup.name}")
-        config = {}
-else:
-    config = {}
-
-TITLE = "Local Qwen Coder (Arc iGPU)"
-entry = {
-    "title": TITLE,
-    "provider": "openai",
-    "model": model_id,
-    "apiBase": f"http://127.0.0.1:{port}/v1",
-    "apiKey": "none",
-}
-
-models = [m for m in config.get("models", []) if m.get("title") != TITLE]
-models.append(entry)
-config["models"] = models
-config["tabAutocompleteModel"] = {
-    "title": "Local Qwen Autocomplete",
-    "provider": "openai",
-    "model": model_id,
-    "apiBase": f"http://127.0.0.1:{port}/v1",
-    "apiKey": "none",
-}
-
-config_path.write_text(json.dumps(config, indent=2) + "\n")
-print("OK")
-PYEOF
-)
-    if [[ "$CONTINUE_UPDATE" == *"OK" ]]; then
-        ok "VS Code Continue config updated — ~/.continue/config.json now points at $ID_P1"
-        [[ "$CONTINUE_UPDATE" == *"WARN:"* ]] && warn "${CONTINUE_UPDATE%%OK}"
-    else
-        warn "Could not update ~/.continue/config.json automatically:"
-        info "$CONTINUE_UPDATE"
-        info "You can still edit it manually — see the models block in this script's header comment."
-    fi
-fi
-
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 echo -e "${BOLD}${GREEN} OpenVINO GenAI — Pair $PAIR Active & Ready${RESET}"
@@ -434,9 +346,6 @@ echo -e "  ${YELLOW}Phase 1 (Port $P1_PORT):${RESET}  $ID_P1"
 echo -e "  ${YELLOW}Phase 2 (Port $P2_PORT):${RESET}  $ID_P2"
 echo ""
 echo -e "  ${DIM}Both models resident in Arc iGPU VRAM simultaneously${RESET}"
-if $DEBUG_LOGGING; then
-    echo -e "  ${YELLOW}Debug logging: ON${RESET}  — verbose per-request output in LOGS/model_800{0,1}.log"
-fi
 echo ""
 if $WITH_CHAINLIT; then
     echo -e "  ${YELLOW}Chainlit Chat UI:${RESET}      http://localhost:${CHAINLIT_PORT}"

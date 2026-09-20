@@ -31,6 +31,12 @@ from openai import AsyncOpenAI
 # ── Backend config ─────────────────────────────────────────────────────────────
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 MODEL_ID    = os.getenv("MODEL_ID", "qwen3.8:27b")
+DEBUG_MODE  = os.getenv("CHAINLIT_DEBUG", "0") == "1"
+
+# Logger — verbose when CHAINLIT_DEBUG=1 (set by launch_models.sh --debug)
+import logging as _logging
+_logging.basicConfig(level=_logging.DEBUG if DEBUG_MODE else _logging.INFO)
+log = _logging.getLogger("chainlit_app")
 
 # Timeouts configurable from .env (OrionBelt pattern)
 _BACKEND_TIMEOUT = float(os.getenv("BACKEND_TIMEOUT", "600"))
@@ -803,7 +809,81 @@ async def on_message(message: cl.Message):
                             "tool_call_id": f"auto_fetch_{tc.id}",
                         })
 
-            # ── Phase 2: Synthesis ────────────────────────────────────────────
+            # ── Scout: Phi-4-mini port 8001 (Research profile only) ──────────
+            profile = cl.user_session.get("chat_profile", "Research")
+            raw_context = "\n\n".join(
+                m["content"] for m in history
+                if m["role"] == "tool" and m.get("content")
+            )
+            dossier = raw_context  # default: pass raw context if Scout skipped
+
+            if profile == "Research" and raw_context.strip():
+                # Port 8001 is always Phi-4-mini regardless of active_client port
+                from urllib.parse import urlparse as _up
+                _parsed = _up(BACKEND_URL)
+                scout_url = f"{_parsed.scheme}://{_parsed.hostname}:8001"
+                log.info("Scout: firing to %s (raw_context=%d chars)", scout_url, len(raw_context))
+                scout_payload = {
+                    "model": "phi-4-mini:int4",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Extract key facts from this search data and output ONLY valid XML.\n\n"
+                                f"Question: {cmd}\n\n"
+                                f"Data:\n{raw_context[:3000]}\n\n"
+                                "Output format (XML only, no other text):\n"
+                                "<dossier>\n"
+                                "  <key_facts>\n"
+                                "  - fact one [source domain]\n"
+                                "  - fact two [source domain]\n"
+                                "  </key_facts>\n"
+                                "  <gaps>any gaps or contradictions, or NONE</gaps>\n"
+                                "</dossier>"
+                            )
+                        }
+                    ],
+                    "max_tokens": 350,
+                    "temperature": 0.1,
+                    "stream": False,
+                    "thinking": False,
+                }
+                try:
+                    async with cl.Step(
+                        name="🔍 Scout — Phi-4-mini",
+                        type="tool",
+                        show_input=False,
+                    ) as scout_step:
+                        n_sources = len([m for m in history if m["role"] == "tool"])
+                        scout_step.input = f"Filtering {len(raw_context)} chars from {n_sources} sources..."
+                        log.info("Scout: sending POST to %s/v1/chat/completions", scout_url)
+                        # Hard 30s timeout — Scout must not block synthesis
+                        async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(30.0, connect=5.0)
+                        ) as _sc:
+                            scout_resp = await _sc.post(
+                                f"{scout_url}/v1/chat/completions",
+                                json=scout_payload
+                            )
+                        log.info("Scout: response status %s", scout_resp.status_code)
+                        scout_data = scout_resp.json()
+                        scout_raw = scout_data["choices"][0]["message"]["content"].strip()
+                        # Strip Phi-4-mini EOS tokens from display
+                        import re as _re
+                        scout_raw = _re.sub(r"<\|?im_end\|?>", "", scout_raw).strip()
+                        # Only use Scout output if it returned valid XML dossier
+                        if "<dossier>" in scout_raw:
+                            dossier = scout_raw
+                            log.info("Scout: valid XML dossier (%d chars)", len(dossier))
+                        else:
+                            dossier = raw_context
+                            log.warning("Scout returned prose not XML — using raw context")
+                        scout_step.output = scout_raw  # show whatever Scout returned in UI
+                except Exception as _scout_err:
+                    dossier = raw_context  # fall back to raw context on Scout failure
+                    log.warning("Scout (port 8001) FAILED: %s — %s", type(_scout_err).__name__, _scout_err)
+
+            # ── Phase 2: Synthesis (Qwen3.8-27B port 8000) ───────────────────
             synthesis_messages = [{
                 "role": "system",
                 "content": (
@@ -811,7 +891,13 @@ async def on_message(message: cl.Message):
                     "Use ONLY this retrieved information — do NOT fall back to training data. "
                     "Summarise clearly and cite source URLs."
                 ),
-            }] + history
+            }] + [m for m in history if m["role"] not in ("tool",)] + [{
+                "role": "user",
+                "content": (
+                    f"Research intelligence (pre-filtered by Scout):\n{dossier}\n\n"
+                    f"Answer the question: {cmd}"
+                )
+            }]
 
             stream = await active_client.chat.completions.create(
                 model=MODEL_ID,
