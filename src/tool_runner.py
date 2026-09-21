@@ -45,7 +45,6 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, datetime, time as _dtime
 from pathlib import Path
 from typing import Any
@@ -133,14 +132,38 @@ SCRIPT_WHITELIST: dict[str, list[str]] = {
 # Timeout utility
 # ---------------------------------------------------------------------------
 
-def _with_timeout(fn, args: tuple = (), kwargs: dict | None = None, timeout: int = TOOL_TIMEOUT) -> Any:
-    """Run fn(*args, **kwargs) with a wall-clock timeout. Returns result or raises TimeoutError."""
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn, *args, **(kwargs or {}))
+def _start_bounded(fn, seconds: float, args: tuple = (), kwargs: dict | None = None):
+    """Start fn(*args, **kwargs) on a daemon thread NOW and return get(). get() waits only for what is left of
+    `seconds` (measured from the start), then returns fn's result, re-raises fn's own exception, or raises
+    TimeoutError. An overrunning call is ABANDONED, never joined, so the caller always gets control back on
+    time. (The old _with_timeout used `with ThreadPoolExecutor(...)`, whose __exit__ waits for the worker: a
+    1 s timeout on a 4 s call raised after 4.0 s -- P2-100.)"""
+    out: dict = {}
+    t0 = time.monotonic()
+
+    def _run():
         try:
-            return fut.result(timeout=timeout)
-        except FuturesTimeoutError:
-            raise TimeoutError(f"Tool call timed out after {timeout}s")
+            out["value"] = fn(*args, **(kwargs or {}))
+        except BaseException as e:               # noqa: BLE001 -- handed back to the caller by get()
+            out["error"] = e
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+
+    def get():
+        th.join(max(0.0, seconds - (time.monotonic() - t0)))
+        if th.is_alive():
+            raise TimeoutError(f"Tool call timed out after {seconds}s")
+        if "error" in out:
+            raise out["error"]
+        return out["value"]
+
+    return get
+
+
+def _with_timeout(fn, args: tuple = (), kwargs: dict | None = None, timeout: int = TOOL_TIMEOUT) -> Any:
+    """Run fn(*args, **kwargs) with a REAL wall-clock timeout. Returns the result, or raises TimeoutError on time."""
+    return _start_bounded(fn, timeout, args, kwargs)()
 
 
 # ---------------------------------------------------------------------------
@@ -266,22 +289,27 @@ _PRICE_INTENT_RE = re.compile(
 QUOTE_TIMEOUT = 6      # seconds per yfinance pre-flight call; a hung call is abandoned, never waited for
 
 
-def _call_with_deadline(fn, seconds: float, default=""):
-    """Run fn() in a daemon thread and give up after `seconds`. Unlike _with_timeout (whose executor waits
-    for the worker on exit, so it does NOT bound the wall-clock time) this really returns on time; a hung
-    call is simply abandoned. Never raises."""
-    box: list = []
+def _call_with_deadline(fn, seconds: float, default="", what: str = "pre-flight"):
+    """Fail-quiet wrapper for optional enrichments: fn()'s result, or `default` on timeout or error. What it
+    swallows is LOGGED (warning), so a pre-flight that silently never works can be diagnosed. Never raises."""
+    try:
+        return _start_bounded(fn, seconds)()
+    except TimeoutError:
+        log.warning("%s abandoned after %ss (still running in the background)", what, seconds)
+    except Exception as e:                       # noqa: BLE001
+        log.warning("%s failed: %s: %s", what, type(e).__name__, e)
+    return default
 
-    def _run():
-        try:
-            box.append(fn())
-        except Exception as e:                       # noqa: BLE001 -- pre-flight must never break a search
-            log.debug("pre-flight call failed: %s", e)
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(seconds)
-    return box[0] if box else default
+def _settled(get, what: str) -> str:
+    """Collect a _start_bounded getter for a pre-flight; '' (and a warning) on timeout or error."""
+    try:
+        return get() or ""
+    except TimeoutError:
+        log.warning("web_search: %s pre-flight abandoned after %ss", what, QUOTE_TIMEOUT)
+    except Exception as e:                       # noqa: BLE001
+        log.warning("web_search: %s pre-flight failed: %s: %s", what, type(e).__name__, e)
+    return ""
 
 
 def _detect_tickers(query: str, limit: int = 2) -> list:
@@ -366,13 +394,11 @@ def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
     Get a key at: https://api.search.brave.com  (no free tier since Feb 2026; $5/month credit, card required)
     """
     # yfinance pre-flight: a labelled price quote (P2-097) and zero-scraping headlines for ticker queries.
-    # Quote FIRST (the chat layer truncates long results), each call bounded and fail-quiet.
-    quote_lines = _call_with_deadline(lambda: _yfinance_quote_line(query), QUOTE_TIMEOUT)
-    headlines = _call_with_deadline(lambda: _yfinance_headlines(query), QUOTE_TIMEOUT)
-    yf_prefix = "\n\n".join(x for x in (quote_lines, headlines) if x)
-
-    def _with_prefix(text: str) -> str:
-        return (yf_prefix + "\n\n---\n\n" + text).strip() if yf_prefix and text else text
+    # Started NOW so they run concurrently with the search: they add at most what is left of QUOTE_TIMEOUT
+    # after the search returns, never their own full duration on top of it. Quote FIRST (the chat layer
+    # truncates long results). Each is bounded and fail-quiet, and a failure is logged.
+    quote_get = _start_bounded(lambda: _yfinance_quote_line(query), QUOTE_TIMEOUT)
+    headlines_get = _start_bounded(lambda: _yfinance_headlines(query), QUOTE_TIMEOUT)
 
     def _search():
         brave_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
@@ -382,17 +408,18 @@ def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
             result = _brave_search(query, n_results, brave_key)
             if result:
                 log.debug("web_search: Brave Search used")
-                return _with_prefix(result)
-            log.info("web_search: Brave failed/rate-limited — falling back to DuckDuckGo")
+                return result
+            log.info("web_search: Brave failed/rate-limited -- falling back to DuckDuckGo")
 
         # Fallback: ddgs multi-engine (bing,google,duckduckgo,yahoo,ecosia)
-        ddg = _ddg_search(query, n_results)
-        return _with_prefix(ddg)
+        return _ddg_search(query, n_results)
 
     try:
-        return _with_timeout(_search, timeout=TOOL_TIMEOUT)
+        text = _with_timeout(_search, timeout=TOOL_TIMEOUT)
     except TimeoutError as e:
         return f"Search timed out: {e}"
+    prefix = "\n\n".join(x for x in (_settled(quote_get, "quote"), _settled(headlines_get, "headlines")) if x)
+    return (prefix + "\n\n---\n\n" + text).strip() if prefix and text else text
 
 
 # ---------------------------------------------------------------------------
