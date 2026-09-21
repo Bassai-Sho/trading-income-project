@@ -819,7 +819,12 @@ def chat_completions(req: ChatRequest):
     # Stop generation when tool call closes — prevents the infinite
     # <tool_call><web_search>...<tool_call><web_search> loop
     try:
-        config.stop_strings = ["</tool_call>", "</function>", "<|im_end|>"]
+        # OpenVINO GenAI's stop_strings is a SET of str: assigning a list raises TypeError, which
+        # this try/except used to swallow silently -- so the loop guard never worked (found 21 Sep
+        # 2026 when the warning below first fired on the NUC). include_stop_str_in_output keeps the
+        # closing tag in the text so the tool-call parser still sees a complete call.
+        config.stop_strings = {"</tool_call>", "</function>", "<|im_end|>"}
+        config.include_stop_str_in_output = True
     except Exception as _stop_err:
         # Older OpenVINO builds may not support stop_strings. Don't fail the request,
         # but say so once: without it the tool-call loop guard (P2-080) is inactive.
@@ -1167,7 +1172,8 @@ def main() -> None:
             print("  ✓ Fixed chat template loaded (eemin/Qwen-Fixed-Chat-Templates)")
         except Exception as e:
             print(f"  ⚠ Could not apply fixed template: {e}")
-    else:
+    elif "qwen3" in (_model_id or "").lower():
+        # The fixed template only exists for Qwen3; warning about it on Qwen2.5-Coder etc. is noise.
         print("  ⚠ No fixed chat template found — tool calls may loop")
         print(f"    Fix: bash scripts/download_fixed_template.sh {model_dir}")
 

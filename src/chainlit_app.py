@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -292,6 +293,58 @@ _TOOL_FAIL_PREFIXES = ("Tool error", "Search failed", "Search timed out",
 def _tool_failed(result: str) -> bool:
     """run_tool() returns error STRINGS rather than raising — detect them."""
     return (not result) or result.startswith(_TOOL_FAIL_PREFIXES)
+
+
+# -- Content-quality gates (P2-096) ------------------------------------------
+# fetch_url can "succeed" with a cookie wall or a minified-JS shell (a live run counted a YouTube
+# consent page and a TradingView script blob as two of its three sources), and the small Scout
+# model can invent a "dossier" that replaces the real context. Both gates fail SAFE: when in
+# doubt, skip the page / pass the raw fetched text to synthesis.
+_JUNK_MARKERS = ("before you continue to", "we use cookies", "accept all cookies", "enable javascript",
+                 "please enable cookies", "verify you are human", "checking your browser", "access denied")
+_JS_HINTS = ("window.", "document.", "function(", "=>{", "var ", "const ", "initdata", "settimeout(")
+
+
+def _looks_like_junk_page(text: str) -> bool:
+    """True for consent walls / script shells that carry no article text."""
+    t = (text or "").lower()
+    if not t.strip():
+        return True
+    if any(m in t for m in _JUNK_MARKERS):
+        return True
+    if sum(h in t for h in _JS_HINTS) >= 3:
+        return True
+    code_chars = sum(t.count(ch) for ch in "{}();=<>")
+    return len(t) >= 200 and code_chars / len(t) > 0.05
+
+
+_FIGURE_RE = re.compile(r"\$\d[\d,]*(?:\.\d+)?|\d[\d,]*\.\d+%?|\d+(?:\.\d+)?%")
+_URL_RE = re.compile(r"https?://[^\s\]\)<>\"']+")
+
+
+def _grounding_anchors(text: str) -> set[str]:
+    """Checkable specifics in a text: price/percent figures and source domains."""
+    from urllib.parse import urlparse
+    anchors = set(_FIGURE_RE.findall(text))
+    for u in _URL_RE.findall(text):
+        d = urlparse(u).netloc.lower().removeprefix("www.")
+        if d:
+            anchors.add(d)
+    return anchors
+
+
+def _scout_dossier_usable(scout_raw: str, raw_context: str, min_anchors: int = 2) -> bool:
+    """A Scout dossier may replace the raw context only if it is XML AND repeats at least
+    min_anchors figures/domains that really occur in the fetched text. An ungrounded dossier
+    (e.g. a 1.5B model 'defining' what SPY trading is) would otherwise become the ONLY thing the
+    synthesis model sees."""
+    if "<dossier>" not in scout_raw:
+        return False
+    raw_anchors = _grounding_anchors(raw_context)
+    if len(raw_anchors) < min_anchors:
+        return False                       # nothing to verify against -> do not trust it
+    low = scout_raw.lower()
+    return sum(1 for a in raw_anchors if a.lower() in low) >= min_anchors
 
 
 def _call_detail(name: str, args: dict) -> str:
@@ -780,9 +833,11 @@ async def on_message(message: cl.Message):
                                                          args=fetch_args) as c:
                                     page = await run_tool("fetch_url", fetch_args)
                                     c.result(page)
-                                    page_ok = not _tool_failed(page)
+                                    page_ok = not _tool_failed(page) and not _looks_like_junk_page(page)
                                     if not page_ok:
                                         c.fail()
+                                        if not _tool_failed(page):
+                                            c.note("(cookie wall / script shell -- not an article; skipped)")
                                 if page_ok:
                                     combined_articles.append(f"[{fetch_url_candidate}]\n{page[:1500]}")
                             except Exception:
@@ -814,7 +869,10 @@ async def on_message(message: cl.Message):
                             {
                                 "role": "user",
                                 "content": (
-                                    f"Extract key facts from this search data and output ONLY valid XML.\n\n"
+                                    f"Extract key facts from this search data and output ONLY valid XML.\n"
+                                    f"Tickers such as SPY, QQQ or NVDA are stock/ETF symbols, not ordinary words. "
+                                    f"State ONLY facts that appear in the Data, each with its [source domain]; "
+                                    f"never define terms from memory.\n\n"
                                     f"Question: {cmd}\n\n"
                                     f"Data:\n{raw_context[:3000]}\n\n"
                                     "Output format (XML only, no other text):\n"
@@ -836,7 +894,7 @@ async def on_message(message: cl.Message):
                     try:
                         n_sources = len([m for m in history if m["role"] == "tool"])
                         async with progress.call(
-                            "scout", "Phi-4-mini",
+                            "scout", cl.user_session.get("p2_model_id") or "Scout model",
                             args={"chars": len(raw_context), "sources": n_sources},
                         ) as sc:
                             log.info("Scout: sending POST to %s/v1/chat/completions", scout_url)
@@ -854,19 +912,26 @@ async def on_message(message: cl.Message):
                             # Strip Phi-4-mini EOS tokens from display
                             import re as _re
                             scout_raw = _re.sub(r"<\|?im_end\|?>", "", scout_raw).strip()
-                            # Only use Scout output if it returned valid XML dossier
-                            if "<dossier>" in scout_raw:
+                            # Use Scout's dossier only if it is valid XML AND grounded in the fetched text
+                            _has_xml = "<dossier>" in scout_raw
+                            _usable = _scout_dossier_usable(scout_raw, raw_context)
+                            if _usable:
                                 dossier = scout_raw
-                                log.info("Scout: valid XML dossier (%d chars)", len(dossier))
+                                log.info("Scout: grounded XML dossier (%d chars)", len(dossier))
                             else:
                                 dossier = raw_context
-                                log.warning("Scout returned prose not XML — using raw context")
+                                log.warning("Scout output %s -- using raw context",
+                                            "is not grounded in the fetched pages" if _has_xml
+                                            else "was prose, not XML")
                             # Always leave visible text in the row (an empty output renders blank)
                             sc.result(scout_raw or "(Scout returned an empty response)")
                             if not scout_raw:
                                 sc.fail()
-                            elif "<dossier>" not in scout_raw:
-                                sc.note("→ not a valid XML dossier; raw context passed to synthesis")
+                            elif not _has_xml:
+                                sc.note("-> not a valid XML dossier; raw context passed to synthesis")
+                            elif not _usable:
+                                sc.note("-> dossier not grounded in the fetched pages (no matching figures or "
+                                        "sources -- possible hallucination); raw context passed to synthesis")
                     except Exception as _scout_err:
                         dossier = raw_context  # fall back to raw context on Scout failure
                         log.warning("Scout (port 8001) FAILED: %s — %s", type(_scout_err).__name__, _scout_err)
