@@ -32,6 +32,11 @@ from openai import AsyncOpenAI
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 MODEL_ID    = os.getenv("MODEL_ID", "qwen3.8:27b")
 DEBUG_MODE  = os.getenv("CHAINLIT_DEBUG", "0") == "1"
+# Scout (the port-8001 pre-filter) is OFF by default -- P2-098, option B. In every live run examined
+# (20-21 Sep) it cost 1.6-16 s per query and never contributed to an answer: its output was empty,
+# discarded, or ungrounded (and the model on port 8001 differs per pair; on Phi-4-mini it is also sent
+# a malformed prompt, P2-099). Set SCOUT_ENABLED=1 to turn it back on for an A/B comparison.
+SCOUT_ENABLED = os.getenv("SCOUT_ENABLED", "0") == "1"
 
 # Logger — verbose when CHAINLIT_DEBUG=1 (set by launch_models.sh --debug)
 import logging as _logging
@@ -313,6 +318,7 @@ _JS_HINTS = ("window.", "document.", "function(", "=>{", "var ", "const ", "init
 # live run (21 Sep) showed the DB pre-filter not taking effect, so the stub reply itself is also
 # treated as a signal. Either way a quarantined domain is attempted at most once per process.
 _QUARANTINE_SEEN: set = set()
+_QUARANTINE_DIAG_DONE = False
 
 
 def _domain_of(url: str) -> str:
@@ -322,12 +328,22 @@ def _domain_of(url: str) -> str:
 
 def _is_quarantined(url: str) -> bool:
     """True if this domain is known to be quarantined (learned from a stub, or per domain_telemetry)."""
+    global _QUARANTINE_DIAG_DONE
     if _domain_of(url) in _QUARANTINE_SEEN:
         return True
     try:
-        from domain_telemetry import get_domain_strategy
-        return get_domain_strategy(url) == "SKIP"
-    except Exception:
+        import domain_telemetry as _dt
+        state = _dt.get_domain_strategy(url)
+        if not _QUARANTINE_DIAG_DONE:          # logged once per process (visible with --debug)
+            _QUARANTINE_DIAG_DONE = True
+            _db = getattr(_dt, "DB_PATH", None)
+            log.info("quarantine lookup: cwd=%s db=%s exists=%s  %s -> %s", os.getcwd(),
+                     _db.resolve() if _db else "?", _db.exists() if _db else "?", _domain_of(url), state)
+        return state == "SKIP"
+    except Exception as _e:
+        if not _QUARANTINE_DIAG_DONE:
+            _QUARANTINE_DIAG_DONE = True
+            log.warning("quarantine lookup FAILED: %s: %s", type(_e).__name__, _e)
         return False
 
 
@@ -889,8 +905,9 @@ async def on_message(message: cl.Message):
                     if m["role"] == "tool" and m.get("content")
                 )
                 dossier = raw_context  # default: pass raw context if Scout skipped
+                scout_used = False
 
-                if profile == "Research" and raw_context.strip():
+                if SCOUT_ENABLED and profile == "Research" and raw_context.strip():
                     # Port 8001 is always Phi-4-mini regardless of active_client port
                     from urllib.parse import urlparse as _up
                     _parsed = _up(BACKEND_URL)
@@ -950,6 +967,7 @@ async def on_message(message: cl.Message):
                             _usable = _scout_dossier_usable(scout_raw, raw_context)
                             if _usable:
                                 dossier = scout_raw
+                                scout_used = True
                                 log.info("Scout: grounded XML dossier (%d chars)", len(dossier))
                             else:
                                 dossier = raw_context
@@ -970,6 +988,7 @@ async def on_message(message: cl.Message):
                         log.warning("Scout (port 8001) FAILED: %s — %s", type(_scout_err).__name__, _scout_err)
 
             # ── Phase 2: Synthesis (Qwen3.8-27B port 8000) ───────────────────
+            _ctx_label = "pre-filtered by Scout" if scout_used else "retrieved from the web"
             synthesis_messages = [{
                 "role": "system",
                 "content": (
@@ -980,7 +999,7 @@ async def on_message(message: cl.Message):
             }] + [m for m in history if m["role"] not in ("tool",)] + [{
                 "role": "user",
                 "content": (
-                    f"Research intelligence (pre-filtered by Scout):\n{dossier}\n\n"
+                    f"Research intelligence ({_ctx_label}):\n{dossier}\n\n"
                     f"Answer the question: {cmd}"
                 )
             }]

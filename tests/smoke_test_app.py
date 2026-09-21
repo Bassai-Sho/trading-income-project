@@ -78,6 +78,7 @@ class FakeHttp:
     async def post(self, url, json=None):
         return SimpleNamespace(status_code=200, json=lambda: {"choices": [{"message": {"content": "Phi says prose, not xml <|im_end|>"}}]})
 import httpx
+app.SCOUT_ENABLED = True   # Scout is off by default (P2-098); this test keeps covering the Scout path
 app.httpx = SimpleNamespace(AsyncClient=FakeHttp, Timeout=httpx.Timeout, ConnectError=httpx.ConnectError)
 
 async def fake_stream(stream, thinking, thinking_step_name="x"):
