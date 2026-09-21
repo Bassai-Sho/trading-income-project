@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -357,7 +356,7 @@ def _extract_top_urls(search_result: str, n: int = 3) -> list[str]:
                      "thehill.", "axios.", "politico.", "npr.org"]
 
     def _is_skip(url):
-        d = _up(url).netloc.lstrip("www.")
+        d = _up(url).netloc.removeprefix("www.")
         return any(s in d for s in skip)
 
     def _is_homepage(url):
@@ -374,13 +373,12 @@ def _extract_top_urls(search_result: str, n: int = 3) -> list[str]:
             return True
         return False
 
-    seen: set = set()
     results: list = []
 
     domain_count: dict = {}
 
     def _try_add(url, max_per_domain=1):
-        d = _up(url).netloc.lstrip("www.")
+        d = _up(url).netloc.removeprefix("www.")
         if _is_skip(url):
             return False
         if domain_count.get(d, 0) >= max_per_domain:
@@ -399,7 +397,7 @@ def _extract_top_urls(search_result: str, n: int = 3) -> list[str]:
             if _try_add(url, max_per_domain=1): return results
     # Pass 3: known news domains even if homepage-like, 1 per domain
     for url in urls:
-        d = _up(url).netloc.lstrip("www.")
+        d = _up(url).netloc.removeprefix("www.")
         if url not in results and any(nd in d for nd in news_fallback):
             if _try_add(url, max_per_domain=1): return results
     # Pass 4: relax to 2 per domain if still short
@@ -411,63 +409,6 @@ def _extract_top_urls(search_result: str, n: int = 3) -> list[str]:
         if url not in results and not _is_skip(url):
             if _try_add(url, max_per_domain=2): return results
     return results
-
-
-def _extract_best_url(search_result: str) -> str | None:
-    """Pick the best article URL from search results, skipping paywalls and homepages."""
-    urls = re.findall(r'https?://[^\s\])\'"…]+', search_result)
-    if not urls:
-        return None
-
-    skip = {'wikipedia.org', 'google.com', 'google.co.uk', 'yahoo.com', 'bing.com',
-            'bloomberg.com', 'ft.com', 'wsj.com', 'nytimes.com',
-            'economist.com', 'thetimes.co.uk', 'telegraph.co.uk',
-            'reuters.com',   # 401 Forbidden on direct fetch
-            'marketwatch.com', 'barrons.com', 'seekingalpha.com'}  # paywall/bot-block
-
-    article_pats = [r'/\d{4}/\d{2}/\d{2}/', r'/article/', r'/story/',
-                    r'/news/[^/]+/[^/]+', r'/world/[^/]+', r'/business/[^/]+',
-                    r'/markets/[^/]+', r'-\d{8}']
-
-    def _skip(url):
-        from urllib.parse import urlparse
-        d = urlparse(url).netloc.lstrip('www.')
-        return any(s in d for s in skip)
-
-    def _homepage(url):
-        from urllib.parse import urlparse
-        p = urlparse(url)
-        path = p.path.rstrip('/')
-        return (path == '' and not p.query) or \
-               (path in ('/news', '/world', '/news/world', '/latest') and not p.query)
-
-    news_domains = ['bbc.co.uk', 'bbc.com', 'reuters.com', 'apnews.com',
-                    'theguardian.com', 'cnbc.com', 'cnn.com', 'euronews.com',
-                    'marketwatch.com', 'seekingalpha.com', 'nbcnews.com', 'cbsnews.com']
-    news_fallback = ['bbc.', 'reuters.', 'apnews.', 'nbcnews.', 'cbsnews.',
-                     'theguardian.', 'euronews.', 'sky.com', 'independent.']
-
-    # P1: article-like URL
-    for url in urls:
-        if _skip(url) or _homepage(url): continue
-        if any(re.search(p, url) for p in article_pats): return url
-    # P2: news domain non-homepage
-    for url in urls:
-        from urllib.parse import urlparse
-        d = urlparse(url).netloc.lstrip('www.')
-        if _skip(url) or _homepage(url): continue
-        if any(nd in d for nd in news_domains): return url
-    # P3: any non-skip non-homepage
-    for url in urls:
-        if _skip(url) or _homepage(url): continue
-        return url
-    # P4: fallback — any news domain even if homepage
-    for url in urls:
-        from urllib.parse import urlparse
-        d = urlparse(url).netloc.lstrip('www.')
-        if _skip(url): continue
-        if any(nd in d for nd in news_fallback): return url
-    return None
 
 
 # ── Chat Profiles ─────────────────────────────────────────────────────────────
@@ -569,7 +510,7 @@ async def on_chat_start():
     cl.user_session.set("p1_model_id", p1_model_id)
     cl.user_session.set("p2_model_id", p2_model_id)
 
-    from chainlit.input_widget import Select, TextInput
+    from chainlit.input_widget import Select
     await cl.ChatSettings([
         Select(
             id="model_port",

@@ -40,11 +40,9 @@ import json
 import logging
 import os
 import re
-import signal
 import sqlite3
 import subprocess
 import sys
-import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date
@@ -306,7 +304,7 @@ def tool_fetch_url(url: str, max_chars: int = FETCH_MAX_CHARS) -> str:
     # Telemetry gate — skip quarantined domains in <1ms
     if get_domain_strategy(url) == "SKIP":
         log.debug("fetch_url: skipping quarantined domain %s", url)
-        return f"[Skipped: domain quarantined due to persistent 403/paywall — trying next source]"
+        return "[Skipped: domain quarantined due to persistent 403/paywall — trying next source]"
 
     def _fetch():
         t0 = time.time()
