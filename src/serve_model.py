@@ -823,7 +823,11 @@ def chat_completions(req: ChatRequest):
         # this try/except used to swallow silently -- so the loop guard never worked (found 21 Sep
         # 2026 when the warning below first fired on the NUC). include_stop_str_in_output keeps the
         # closing tag in the text so the tool-call parser still sees a complete call.
-        config.stop_strings = {"</tool_call>", "</function>", "<|im_end|>"}
+        # NOT "<|im_end|>": for Qwen it is the EOS special token (generation already ends there), and for
+        # other families (e.g. Phi-4-mini, which is prompted with ChatML here) it can appear as PLAIN
+        # TEXT early in the reply -- as a stop string it truncated a Scout reply to nothing (21 Sep).
+        # The output is stripped of these markers afterwards anyway.
+        config.stop_strings = {"</tool_call>", "</function>"}
         config.include_stop_str_in_output = True
     except Exception as _stop_err:
         # Older OpenVINO builds may not support stop_strings. Don't fail the request,

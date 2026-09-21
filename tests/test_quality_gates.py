@@ -36,6 +36,12 @@ NEWS = ("Stocks ended higher on Friday as the S&P 500 gained 0.4% to close at 6,
         "banks raising year-end targets. The SPDR S&P 500 ETF (SPY) rose to $761.69. Futures had climbed earlier "
         "ahead of the Trump-Xi summit, the document said. The window for a rate cut is narrowing, one strategist noted.")
 
+STOCKSTOTRADE_WALL = ("We don't currently have information about State Street SPDR S&P 500 ETF Trust's earnings. The Game "
+                      "is Rigged But Our AI-driven analysis Has Leveled the Playing Field Sign up for access to institutional "
+                      "grade tools and insights and join 10,000+ traders Enter a valid email address. Enter a valid phone "
+                      "number. I AGREE TO RECEIVE MARKETING By entering your info and clicking I AGREE below, you provide "
+                      "your electronic signature, express written consent and binding agreement to our Terms of Use ...")
+
 RAW = ("[Stocktwits] Futures rise ahead of the summit URL: https://stocktwits.com/news-articles/x "
        "[Yahoo Finance] https://finance.yahoo.com/quote/SPY/ latest SPY quote\n\nFetched articles:\n\n"
        "[https://www.247wallst.com/a-1]\nSPY closed at $761.69, up 0.4% on Friday.")
@@ -53,6 +59,7 @@ def main() -> None:
     assert app._looks_like_junk_page(YOUTUBE_WALL), "YouTube cookie wall must be junk"
     assert app._looks_like_junk_page(TRADINGVIEW_JS), "TradingView script blob must be junk"
     assert app._looks_like_junk_page(""), "empty page must be junk"
+    assert app._looks_like_junk_page(STOCKSTOTRADE_WALL), "sign-up / marketing wall must be junk"
     assert not app._looks_like_junk_page(TRADINGVIEW_PROSE), "prose page must NOT be junk"
     assert not app._looks_like_junk_page(NEWS), "a news paragraph must NOT be junk (even with 'document.' / 'window.' in it)"
 
@@ -62,7 +69,20 @@ def main() -> None:
     assert not app._scout_dossier_usable("Spy trading is a practice ...", RAW), "prose (no XML) must be rejected"
     assert not app._scout_dossier_usable(GROUNDED, "no figures or links here at all"), \
         "with nothing to verify against, do not trust the dossier"
-    print("PASS: cookie walls / script blobs are junk, real prose is not; hallucinated dossier rejected, grounded accepted")
+
+    # --- quarantine pre-filter -------------------------------------------------------
+    import types
+    fake = types.ModuleType("domain_telemetry")
+    fake.get_domain_strategy = lambda url: "SKIP" if ("stocktwits.com" in url or "benzinga.com" in url) else "OK"
+    sys.modules["domain_telemetry"] = fake
+    assert app._is_quarantined("https://stocktwits.com/news-articles/x")
+    assert app._is_quarantined("https://www.benzinga.com/quote/SPY")
+    assert not app._is_quarantined("https://www.cnbc.com/2026/09/20/markets.html")
+    fake.get_domain_strategy = lambda url: (_ for _ in ()).throw(RuntimeError("db locked"))
+    assert not app._is_quarantined("https://stocktwits.com/x"), "a telemetry failure must fail OPEN (fetch anyway)"
+    del sys.modules["domain_telemetry"]
+    print("PASS: cookie/JS/sign-up walls are junk, real prose is not; hallucinated dossier rejected, grounded accepted; "
+          "quarantined domains pre-filtered (fails open)")
 
 
 if __name__ == "__main__":

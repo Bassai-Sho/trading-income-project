@@ -301,8 +301,20 @@ def _tool_failed(result: str) -> bool:
 # model can invent a "dossier" that replaces the real context. Both gates fail SAFE: when in
 # doubt, skip the page / pass the raw fetched text to synthesis.
 _JUNK_MARKERS = ("before you continue to", "we use cookies", "accept all cookies", "enable javascript",
-                 "please enable cookies", "verify you are human", "checking your browser", "access denied")
+                 "please enable cookies", "verify you are human", "checking your browser", "access denied",
+                 # sign-up / marketing walls (a StocksToTrade quote page counted as a good source)
+                 "enter a valid email address", "i agree to receive", "sign up for access",
+                 "subscribe to continue", "sign in to continue", "create a free account")
 _JS_HINTS = ("window.", "document.", "function(", "=>{", "var ", "const ", "initdata", "settimeout(")
+
+
+def _is_quarantined(url: str) -> bool:
+    """True if domain_telemetry has quarantined this domain (persistent 403 / paywall). Never raises."""
+    try:
+        from domain_telemetry import get_domain_strategy
+        return get_domain_strategy(url) == "SKIP"
+    except Exception:
+        return False
 
 
 def _looks_like_junk_page(text: str) -> bool:
@@ -821,7 +833,10 @@ async def on_message(message: cl.Message):
                     # for news queries to ensure mix of results even if some block/401.
                     if fn_name == "web_search" and not raw_result.startswith(("Search failed", "Search timed out")):
                         # Fetch up to 6 candidate URLs, retrying on failure to get 3 successes
-                        candidate_urls = _extract_top_urls(raw_result, n=6)
+                        # Ask for extra candidates, then drop quarantined domains up front so the slots
+                        # go to sources that can actually be fetched (no more 0.0s "skipped" rows).
+                        candidate_urls = [u for u in _extract_top_urls(raw_result, n=12)
+                                          if not _is_quarantined(u)][:6]
                         combined_articles = []
                         for fetch_url_candidate in candidate_urls:
                             if len(combined_articles) >= 3:
