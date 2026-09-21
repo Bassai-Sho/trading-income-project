@@ -60,8 +60,12 @@ _client  = AsyncOpenAI(
 # chainlit_app.py lives in src/ — project root is one level up
 _project_root = Path(__file__).parent.parent
 _src = str(Path(__file__).parent)   # src/ itself
-if _src not in sys.path:
-    sys.path.insert(0, _src)
+# Chainlit's loader (chainlit.config.load_module) inserts src/ at sys.path[0] ONLY while it executes this file
+# and pops it afterwards. The old guard `if _src not in sys.path` therefore never fired, and every call-time
+# import of a sibling module failed with ModuleNotFoundError: domain_telemetry (quarantine lookup) and
+# tool_runner (the run_tool direct fallback). Check sys.path[1:] and APPEND so the entry survives the pop.
+if _src not in sys.path[1:]:
+    sys.path.append(_src)
 
 from tool_progress import ToolProgress  # src/tool_progress.py  (P2-090)
 
