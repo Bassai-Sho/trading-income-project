@@ -43,9 +43,10 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import date
+from datetime import date, datetime, time as _dtime
 from pathlib import Path
 from typing import Any
 
@@ -244,6 +245,111 @@ def _yfinance_headlines(query: str, max_items: int = 3) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Price-quote pre-flight (P2-097)
+# ---------------------------------------------------------------------------
+# "What is SPY trading at?" used to depend on some news article happening to quote the price (a live run
+# got $766.65 from one article and $766.69 from another; earlier runs found none). yfinance returns one
+# number in one call, so put it FIRST in the search result, labelled with when it was retrieved and
+# whether the US market was open. Everything here fails quiet: no yfinance / no network / bad symbol -> "".
+
+_TICKER_BLACKLIST |= {
+    "ORB", "VWAP", "RSI", "ATR", "EMA", "SMA", "GEX", "PDT", "CPI", "GDP", "FOMC", "IPO", "CEO",
+    "EPS", "NYSE", "NASDAQ", "DOW", "ATH", "AI", "US", "UK", "EU", "OK", "PM", "AM", "ET",
+    # intent words, for queries typed in capitals ("SPY PRICE TODAY")
+    "PRICE", "QUOTE", "TRADING", "TRADES", "WORTH", "CURRENT", "RIGHT", "LAST", "CLOSE", "CLOSED",
+    "OPEN", "OPENED",
+}
+_LOWER_TICKERS = {"spy", "qqq", "iwm", "dia", "voo", "vti", "tlt", "gld"}   # unambiguous when typed in lower case
+_PRICE_INTENT_RE = re.compile(
+    r"\b(price|priced|quote|worth|trading at|trades at|current|currently|right now|how much|at today)\b", re.I)
+QUOTE_TIMEOUT = 6      # seconds per yfinance pre-flight call; a hung call is abandoned, never waited for
+
+
+def _call_with_deadline(fn, seconds: float, default=""):
+    """Run fn() in a daemon thread and give up after `seconds`. Unlike _with_timeout (whose executor waits
+    for the worker on exit, so it does NOT bound the wall-clock time) this really returns on time; a hung
+    call is simply abandoned. Never raises."""
+    box: list = []
+
+    def _run():
+        try:
+            box.append(fn())
+        except Exception as e:                       # noqa: BLE001 -- pre-flight must never break a search
+            log.debug("pre-flight call failed: %s", e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(seconds)
+    return box[0] if box else default
+
+
+def _detect_tickers(query: str, limit: int = 2) -> list:
+    """Ticker symbols in a query. Case-aware on purpose (the old detector upper-cased the whole query, so
+    'price' and 'today' looked like tickers): $cashtags, UPPER-CASE tokens of 2-5 letters, and a short
+    list of unambiguous lower-case ETFs. Common upper-case words are blacklisted."""
+    found: list = []
+
+    def _add(sym: str) -> None:
+        sym = sym.upper()
+        if sym not in _TICKER_BLACKLIST and sym not in found:
+            found.append(sym)
+
+    for m in re.finditer(r"\$([A-Za-z]{1,5})\b", query):
+        _add(m.group(1))
+    for m in re.finditer(r"\b[A-Z]{2,5}\b", query):
+        _add(m.group(0))
+    for w in re.findall(r"\b[a-z]{2,5}\b", query):
+        if w in _LOWER_TICKERS:
+            _add(w)
+    return found[:limit]
+
+
+def _market_note(now_et: datetime) -> str:
+    """What kind of number a yfinance quote is at this moment (holidays are not detected)."""
+    if now_et.weekday() >= 5:
+        return "US market closed (weekend) - this is the last regular-session close"
+    if _dtime(9, 30) <= now_et.time() < _dtime(16, 0):
+        return "US market hours - quote may be delayed ~15 min"
+    return "outside US market hours - last regular-session close (after-hours moves not shown)"
+
+
+def _now_et() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:                                # tzdata missing: fall back to a fixed offset
+        from datetime import timedelta, timezone
+        return datetime.now(timezone(timedelta(hours=-4)))
+
+
+def _yfinance_quote_line(query: str, now: "datetime | None" = None) -> str:
+    """One labelled quote line per ticker (max 2) for price-type queries; '' when not applicable/available."""
+    if not _YFINANCE:
+        return ""
+    cashtag = re.search(r"\$[A-Za-z]{1,5}\b", query) is not None
+    if not (cashtag or _PRICE_INTENT_RE.search(query)):
+        return ""
+    now_et = now or _now_et()
+    lines = []
+    for sym in _detect_tickers(query):
+        try:
+            fi = yf.Ticker(sym).fast_info
+            last = float(fi["last_price"])
+            prev = float(fi["previous_close"])
+        except Exception as e:                       # noqa: BLE001 -- unknown symbol, no network, rate limit ...
+            log.debug("quote pre-flight: %s unavailable (%s)", sym, e)
+            continue
+        if not (last > 0) or last != last or not (prev > 0) or prev != prev:      # 0 / negative / NaN
+            continue
+        chg = (last / prev - 1.0) * 100.0
+        lines.append(
+            f"[Yahoo Finance quote] {sym}: ${last:,.2f} ({chg:+.2f}% vs previous close ${prev:,.2f}) - "
+            f"retrieved {now_et:%Y-%m-%d %H:%M} ET; {_market_note(now_et)}. "
+            f"URL: https://finance.yahoo.com/quote/{sym}/")
+    return "\n".join(lines)
+
+
 def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
     """
     Search the web.
@@ -259,8 +365,14 @@ def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
     Set BRAVE_SEARCH_API_KEY in .env to activate Brave.
     Get a key at: https://api.search.brave.com  (no free tier since Feb 2026; $5/month credit, card required)
     """
-    # yfinance pre-flight: zero-scraping official news for ticker queries
-    yf_prefix = _yfinance_headlines(query)
+    # yfinance pre-flight: a labelled price quote (P2-097) and zero-scraping headlines for ticker queries.
+    # Quote FIRST (the chat layer truncates long results), each call bounded and fail-quiet.
+    quote_lines = _call_with_deadline(lambda: _yfinance_quote_line(query), QUOTE_TIMEOUT)
+    headlines = _call_with_deadline(lambda: _yfinance_headlines(query), QUOTE_TIMEOUT)
+    yf_prefix = "\n\n".join(x for x in (quote_lines, headlines) if x)
+
+    def _with_prefix(text: str) -> str:
+        return (yf_prefix + "\n\n---\n\n" + text).strip() if yf_prefix and text else text
 
     def _search():
         brave_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
@@ -270,12 +382,12 @@ def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
             result = _brave_search(query, n_results, brave_key)
             if result:
                 log.debug("web_search: Brave Search used")
-                return result
+                return _with_prefix(result)
             log.info("web_search: Brave failed/rate-limited — falling back to DuckDuckGo")
 
         # Fallback: ddgs multi-engine (bing,google,duckduckgo,yahoo,ecosia)
         ddg = _ddg_search(query, n_results)
-        return (yf_prefix + "\n\n---\n\n" + ddg).strip() if yf_prefix else ddg
+        return _with_prefix(ddg)
 
     try:
         return _with_timeout(_search, timeout=TOOL_TIMEOUT)
