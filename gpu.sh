@@ -53,7 +53,21 @@ HAVE_VENV=false; [[ -x "$ROOT_DIR/.venv/bin/python3" ]] && HAVE_VENV=true
 # (NOT Status-Abbrev: its first letter is the *desired* state, so a held package reads "hi", not "ii")
 pkg_state() { dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null; }
 pkg_ver()   { dpkg-query -W -f='${Version}' "$1" 2>/dev/null; }
-gpu_visible() { $HAVE_VENV && "$PY" -c "import sys, openvino as ov; sys.exit(0 if 'GPU' in ov.Core().available_devices else 1)" >/dev/null 2>&1; }
+# echoes: visible | nogpu | noimport | novenv
+# (P2-074: "openvino cannot be imported" must never be reported as "the GPU is not visible" -- different fixes)
+gpu_state() {
+    $HAVE_VENV || { echo novenv; return; }
+    "$PY" - >/dev/null 2>&1 <<'PYEOF'
+import sys
+try:
+    import openvino as ov
+except Exception:
+    sys.exit(3)
+sys.exit(0 if "GPU" in ov.Core().available_devices else 1)
+PYEOF
+    case $? in 0) echo visible ;; 3) echo noimport ;; *) echo nogpu ;; esac
+}
+gpu_visible() { [[ "$(gpu_state)" == visible ]]; }
 
 # ---- health report (used by status, install and diag) -----------------------
 HEALTHY=true
@@ -80,7 +94,11 @@ report() {   # report [noov]  -- 'noov' skips the OpenVINO check (diag does its 
 
     if [[ "${1:-}" == noov ]]; then :
     elif $HAVE_VENV; then
-        if gpu_visible; then ok "OpenVINO sees the GPU"; else HEALTHY=false; bad "OpenVINO does NOT see the GPU"; fi
+        case "$(gpu_state)" in
+            visible)  ok "OpenVINO sees the GPU" ;;
+            noimport) HEALTHY=false; bad "openvino cannot be imported in .venv -- setup.sh step 2 (packages) is incomplete. This is NOT a GPU problem." ;;
+            *)        HEALTHY=false; bad "OpenVINO does NOT see the GPU" ;;
+        esac
     else info "no .venv yet -- skipped the OpenVINO GPU check"; fi
 }
 
@@ -142,6 +160,7 @@ cmd_install() {
     echo -e "\n${B}Re-check${Z}"
     report
     if $HEALTHY; then echo -e "\n  ${G}Done.${Z} Launch as normal -- no need to re-run setup.sh."; return 0
+    elif [[ "$(gpu_state)" == noimport ]]; then echo -e "\n  ${Y}Runtime installed, but openvino is not importable in .venv.${Z} Finish setup.sh step 2 (Python packages), then re-run:  bash gpu.sh status"; return 1
     else echo -e "\n  ${R}Packages are fine but something else is wrong.${Z} Run:  bash gpu.sh diag   (render group? kernel driver? reboot needed?)"; return 1; fi
 }
 
