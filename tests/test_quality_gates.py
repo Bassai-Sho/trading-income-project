@@ -81,6 +81,15 @@ def main() -> None:
     fake.get_domain_strategy = lambda url: (_ for _ in ()).throw(RuntimeError("db locked"))
     assert not app._is_quarantined("https://stocktwits.com/x"), "a telemetry failure must fail OPEN (fetch anyway)"
     del sys.modules["domain_telemetry"]
+
+    # A quarantine learned from a fetch_url stub must work even when the telemetry DB is not visible
+    # to this process (the live run showed the DB pre-filter not taking effect).
+    app._QUARANTINE_SEEN.clear()
+    assert not app._is_quarantined("https://stocktwits.com/news-articles/y")
+    app._QUARANTINE_SEEN.add(app._domain_of("https://www.stocktwits.com/news-articles/x"))
+    assert app._is_quarantined("https://stocktwits.com/news-articles/y"), "learned domain must be skipped"
+    assert not app._is_quarantined("https://www.cnbc.com/x"), "other domains unaffected"
+    app._QUARANTINE_SEEN.clear()
     print("PASS: cookie/JS/sign-up walls are junk, real prose is not; hallucinated dossier rejected, grounded accepted; "
           "quarantined domains pre-filtered (fails open)")
 

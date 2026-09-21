@@ -308,8 +308,22 @@ _JUNK_MARKERS = ("before you continue to", "we use cookies", "accept all cookies
 _JS_HINTS = ("window.", "document.", "function(", "=>{", "var ", "const ", "initdata", "settimeout(")
 
 
+# Domains that fetch_url has told THIS process are quarantined. The telemetry DB is the source of
+# truth, but the tool runs in the model-server process and this process reads the DB separately; a
+# live run (21 Sep) showed the DB pre-filter not taking effect, so the stub reply itself is also
+# treated as a signal. Either way a quarantined domain is attempted at most once per process.
+_QUARANTINE_SEEN: set = set()
+
+
+def _domain_of(url: str) -> str:
+    from urllib.parse import urlparse
+    return urlparse(url).netloc.lower().removeprefix("www.")
+
+
 def _is_quarantined(url: str) -> bool:
-    """True if domain_telemetry has quarantined this domain (persistent 403 / paywall). Never raises."""
+    """True if this domain is known to be quarantined (learned from a stub, or per domain_telemetry)."""
+    if _domain_of(url) in _QUARANTINE_SEEN:
+        return True
     try:
         from domain_telemetry import get_domain_strategy
         return get_domain_strategy(url) == "SKIP"
@@ -841,6 +855,8 @@ async def on_message(message: cl.Message):
                         for fetch_url_candidate in candidate_urls:
                             if len(combined_articles) >= 3:
                                 break
+                            if _is_quarantined(fetch_url_candidate):
+                                continue        # learned earlier in this run: no row, no wasted call
                             try:
                                 fetch_args = {"url": fetch_url_candidate, "max_chars": 1500}
                                 async with progress.call("fetch_url",
@@ -848,6 +864,8 @@ async def on_message(message: cl.Message):
                                                          args=fetch_args) as c:
                                     page = await run_tool("fetch_url", fetch_args)
                                     c.result(page)
+                                    if page.startswith("[Skipped: domain quarantined"):
+                                        _QUARANTINE_SEEN.add(_domain_of(fetch_url_candidate))
                                     page_ok = not _tool_failed(page) and not _looks_like_junk_page(page)
                                     if not page_ok:
                                         c.fail()
