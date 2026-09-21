@@ -281,8 +281,12 @@ async def _get_tools() -> list[dict]:
         return []
 
 
+# run_tool() returns failure/stub STRINGS instead of raising. fetch_url's quarantine skip and
+# empty-extraction stubs start with "[" -- they were once counted as successful pages (a live run
+# showed a 0.0s "✓" for a quarantined domain), wasting one of the three source slots.
 _TOOL_FAIL_PREFIXES = ("Tool error", "Search failed", "Search timed out",
-                       "HTTP fetch failed", "Error", "Invalid URL", "403", "401")
+                       "HTTP fetch failed", "Error", "Invalid URL", "403", "401",
+                       "[Skipped", "[No article body")
 
 
 def _tool_failed(result: str) -> bool:
@@ -776,8 +780,7 @@ async def on_message(message: cl.Message):
                                                          args=fetch_args) as c:
                                     page = await run_tool("fetch_url", fetch_args)
                                     c.result(page)
-                                    page_ok = bool(page) and not page.startswith(
-                                        ("HTTP fetch failed", "Error", "Invalid URL", "403", "401"))
+                                    page_ok = not _tool_failed(page)
                                     if not page_ok:
                                         c.fail()
                                 if page_ok:
