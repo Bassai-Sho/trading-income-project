@@ -5,20 +5,19 @@ serve_model.py
 OpenAI /v1/chat/completions server wrapping OpenVINO GenAI.
 Supports both LLMPipeline (text) and VLMPipeline (VLM text-only) on Intel Arc GPU.
 
-FIXES (P2-059) — 2026-09-15
-----------------------------
+FIXES (P2-089, originally logged as P2-059) — 2026-09-15
+--------------------------------------------------------
 1. SYCL_DEVICE_FILTER=gpu  — set before any OpenVINO import; blocks silent CPU
    fallback at driver level. If GPU OOM the process crashes rather than silently
    degrading, making the failure visible immediately.
 
-2. Streaming fix  — streamer_cb previously built chunk_payload but never yielded
-   it. A SimpleQueue fix was attempted but deadlocked: FastAPI's StreamingResponse
-   runs a sync generator in a threadpool executor, and queue.get() blocked the
-   uvicorn event loop. Final fix: async generator + asyncio.Queue +
-   loop.call_soon_threadsafe(). The background inference thread pushes tokens
-   into the asyncio queue thread-safely; the async generator awaits them without
-   blocking the event loop. Route handler is async. OpenWebUI now receives tokens
-   in real time.
+2. Streaming fix  -- streamer_cb previously built chunk_payload but never yielded
+   it. Now: a background thread runs _pipe.generate() and its streamer callback
+   pushes tokens into a queue.SimpleQueue; a sync generator (run by FastAPI in its
+   threadpool) reads that queue and yields the SSE chunks, so tokens reach the
+   client (Chainlit, Continue) in real time. See the 'Streaming handler' comment
+   in chat_completions() for the current design. (Docstring corrected 20 Sep 2026:
+   it previously described an asyncio.Queue design that the code does not use.)
 
 3. Keepalive thread  — Intel Arc iGPU reclaims shared memory pages when the GPU
    goes idle. A 1-token generation every 55s keeps the model pinned in iGPU
@@ -28,14 +27,13 @@ FIXES (P2-059) — 2026-09-15
 
 from __future__ import annotations
 
-# ── P2-059 Fix 1: SYCL guard — must be set before openvino_genai import ──────
+# ── P2-089 Fix 1 (was P2-059): SYCL guard — must be set before openvino_genai import ──────
 import os
 os.environ.setdefault("SYCL_DEVICE_FILTER", "gpu")      # block CPU fallback
 os.environ.setdefault("SYCL_CACHE_PERSISTENT", "1")     # persist compiled cache
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse
-import asyncio
 import json
 import re
 import threading
@@ -79,6 +77,7 @@ _cache_dir: str   = os.path.expanduser("~/models/.ov_cache")
 # Toggled via launch_models.sh --debug (passed through as --debug here).
 # See chat_completions() for what gets logged when this is on.
 _debug: bool = False
+_warned_once: set[str] = set()   # one-time warnings, so they don't repeat on every request
 # ADDED (P2-068, 2026-09-17): needed by the new /admin/reload_pipeline endpoint
 # below, so pipeline reconstruction can happen outside main() too.
 _model_dir: str | None = None
@@ -490,7 +489,7 @@ def _try_parse_format(text: str, fmt: str) -> dict | None:
 
 
 # ===========================================================================
-# P2-059 Fix 3: Keepalive thread
+# P2-089 Fix 3 (was P2-059): Keepalive thread
 # Sends a 1-token generation every 55 seconds while the server is idle.
 # Prevents the Intel Arc iGPU driver from reclaiming shared memory pages
 # between requests, eliminating the cold-reload latency on subsequent prompts.
@@ -618,7 +617,7 @@ def call_tool(req: ToolCallRequest):
     URL fetching, toolkit functions, and DB queries.
     """
     try:
-        import sys, pathlib, dotenv, os
+        import sys, pathlib, dotenv
         src_dir = str(pathlib.Path(__file__).parent)
         if src_dir not in sys.path:
             sys.path.insert(0, src_dir)
@@ -821,8 +820,14 @@ def chat_completions(req: ChatRequest):
     # <tool_call><web_search>...<tool_call><web_search> loop
     try:
         config.stop_strings = ["</tool_call>", "</function>", "<|im_end|>"]
-    except Exception:
-        pass  # older OpenVINO builds may not support stop_strings
+    except Exception as _stop_err:
+        # Older OpenVINO builds may not support stop_strings. Don't fail the request,
+        # but say so once: without it the tool-call loop guard (P2-080) is inactive.
+        if "stop_strings" not in _warned_once:
+            _warned_once.add("stop_strings")
+            print(f"  WARNING: stop_strings not supported by this OpenVINO build "
+                  f"({type(_stop_err).__name__}) -- tool-call loop guard (P2-080) is INACTIVE",
+                  flush=True)
 
     if req.temperature > 0.05:
         config.do_sample  = True
@@ -840,19 +845,10 @@ def chat_completions(req: ChatRequest):
     # (running on a different thread) safely.
     # ──────────────────────────────────────────────────────────────────────────
     if req.stream:
-        import collections
-
         def stream_generator():
             call_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
             created = int(time.time())
-            buf: collections.deque[str] = collections.deque()
-            done = [False]
-            error = [None]
             _tok_count = [0]   # for the debug summary at the end
-
-            def streamer_cb(subword: str):
-                buf.append(subword)
-                return ov_genai.StreamingStatus.RUNNING
 
             import queue as _q
             _stream_q: _q.SimpleQueue[str | None] = _q.SimpleQueue()
@@ -1123,7 +1119,7 @@ def main() -> None:
 
     if _is_vlm:
         # Qwen3.8-27B is a native multimodal model — must use VLMPipeline.
-        print(f"  Architecture: VLMPipeline (Qwen3.8 native multimodal)")
+        print("  Architecture: VLMPipeline (Qwen3.8 native multimodal)")
         _pipe = ov_genai.VLMPipeline(
             str(model_dir),
             args.device,
@@ -1141,9 +1137,9 @@ def main() -> None:
         print("  ✓ Thinking mode: off by default, available per-request via `thinking: true`")
     else:
         if args.force_llm and vision_xml.exists():
-            print(f"  Architecture: LLMPipeline (--force-llm: vision files present but ignored)")
+            print("  Architecture: LLMPipeline (--force-llm: vision files present but ignored)")
         else:
-            print(f"  Architecture: LLMPipeline")
+            print("  Architecture: LLMPipeline")
         _pipe = ov_genai.LLMPipeline(
             str(model_dir),
             args.device,
@@ -1168,17 +1164,17 @@ def main() -> None:
         try:
             with open(_fixed_tpl) as _f:
                 _tok.chat_template = _f.read()
-            print(f"  ✓ Fixed chat template loaded (eemin/Qwen-Fixed-Chat-Templates)")
+            print("  ✓ Fixed chat template loaded (eemin/Qwen-Fixed-Chat-Templates)")
         except Exception as e:
             print(f"  ⚠ Could not apply fixed template: {e}")
     else:
-        print(f"  ⚠ No fixed chat template found — tool calls may loop")
+        print("  ⚠ No fixed chat template found — tool calls may loop")
         print(f"    Fix: bash scripts/download_fixed_template.sh {model_dir}")
 
     elapsed_load = time.monotonic() - t0
     print(f"  ✓ Model ready in {elapsed_load:.1f}s on {args.device}")
-    print(f"  ✓ Streaming: queue-based SSE (P2-059 fix)")
-    print(f"  ✓ Keepalive: 1-token ping every 55s (iGPU memory retention)")
+    print("  ✓ Streaming: queue-based SSE (P2-089 fix)")
+    print("  ✓ Keepalive: 1-token ping every 55s (iGPU memory retention)")
     print(f"  →  http://127.0.0.1:{args.port}/v1\n")
 
     # Start keepalive thread after model is loaded

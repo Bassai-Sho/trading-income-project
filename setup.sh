@@ -265,7 +265,7 @@ if ! $MODELS_ONLY; then
     # Brave Search Key
     CURR_BRAVE=$(get_env_val "BRAVE_SEARCH_API_KEY")
     if [[ -z "$CURR_BRAVE" || "$CURR_BRAVE" == "your_brave_api_key_here" ]]; then
-        info "Brave News Search Key (free at https://api.search.brave.com):"
+        info "Brave Search API key - optional (no free tier since Feb 2026: \$5/month credit ~ 1,000 queries, card required): https://api.search.brave.com"
         enter "Enter Brave Search Key (press Enter for DuckDuckGo fallback)"; [[ -n "$REPLY" ]] && set_env_val "BRAVE_SEARCH_API_KEY" "$REPLY"
     else
         ok "Brave Search Key already set"

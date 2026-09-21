@@ -100,13 +100,18 @@ WEB_N_RESULTS    = 10    # default number of search results — more options for
 #      api.search.brave.com. Error was "Connection reset by peer" on a
 #      follow-up fetch_url attempt — an actively torn-down connection, more
 #      consistent with bot-detection/blocking than ordinary slowness.
-#   4. Current: dropped ddgs's scraping "brave" backend too, now confirmed
-#      bad on the real network, not just suspected. Two scraping backends
-#      failing on the same real network is a pattern, not one bad engine —
-#      the actual fix is setting BRAVE_SEARCH_API_KEY in .env so
-#      _brave_search() (the real API, tried BEFORE this fallback ever runs)
-#      handles requests instead of depending on scraping at all. This list
-#      is a stopgap for when that key isn't set, not a substitute for it.
+#   4. Dropped ddgs's scraping "brave" backend too, confirmed bad on the real
+#      network, not just suspected. Two scraping backends failing on the same
+#      real network is a pattern, not one bad engine.
+#   5. Current (20 Sep 2026, P2-083): expanded to the five backends below
+#      (bing, google, duckduckgo, yahoo, ecosia), validated on the production
+#      NUC by a parallel session. SearXNG public instances were considered and
+#      rejected -- ddgs's multi-engine pool is the pip-native answer.
+# BRAVE (corrected 20 Sep 2026): earlier revisions of this comment called setting
+# BRAVE_SEARCH_API_KEY "the actual fix". Brave removed its free tier in Feb 2026
+# (new accounts get $5/month in credits, ~1,000 queries, card required, billed
+# beyond that), so the key is now OPTIONAL. _brave_search() is still tried first
+# when the key is set, but the ddgs list below is the default path.
 # ddgs v0.3+ supports 9 engines: duckduckgo, bing, google, brave, ecosia,
 # qwant, yahoo, yandex, wikipedia. More engines = more resilience. If one
 # is blocked/rate-limited, ddgs tries the next automatically.
@@ -145,9 +150,10 @@ def _with_timeout(fn, args: tuple = (), kwargs: dict | None = None, timeout: int
 
 def _brave_search(query: str, n_results: int, api_key: str) -> str | None:
     """
-    Brave Search API — independent index, 2,000 free queries/month.
+    Brave Search API -- independent index. No free tier since Feb 2026: new accounts get
+    $5/month in credits (~1,000 queries), then usage is billed.
     Returns formatted results string or None on failure.
-    API key: api.search.brave.com  (free tier, credit card required for fraud prevention)
+    API key: api.search.brave.com  (credit card required; usage beyond the monthly credit is billed)
     """
     try:
         import requests as _req
@@ -253,7 +259,7 @@ def tool_web_search(query: str, n_results: int = WEB_N_RESULTS) -> str:
     from repeated same-IP requests.
 
     Set BRAVE_SEARCH_API_KEY in .env to activate Brave.
-    Get a free key at: https://api.search.brave.com  (2,000 queries/month free)
+    Get a key at: https://api.search.brave.com  (no free tier since Feb 2026; $5/month credit, card required)
     """
     # yfinance pre-flight: zero-scraping official news for ticker queries
     yf_prefix = _yfinance_headlines(query)
