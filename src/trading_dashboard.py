@@ -14,7 +14,11 @@ import re
 import sys
 import time
 import math
+import json
+import sqlite3
 import statistics
+import urllib.error
+import urllib.request
 from datetime import datetime, time as Time, date, timedelta, timezone
 from typing import Any
 
@@ -182,6 +186,7 @@ def _init_state():
         "pause":            False,
         "trade_count":      0,
         "psych_confirmed":  False,
+        "engine_db_path":   "paper_account.db",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -262,6 +267,59 @@ def _rolling_stats(journal: list[dict]) -> dict:
             sharpe = round(statistics.mean(rs) / sd, 3)
     return {"n": n, "wr": wr, "aw": aw, "al": al, "ev": ev, "sharpe": sharpe}
 
+# ---------------------------------------------------------------------------
+# System status helpers (P2-062) — read-only. No new heartbeat mechanism:
+# reads the engine's existing `heartbeat` table (PaperAccountDB.update_heartbeat)
+# and hits each model server's /health directly.
+# ---------------------------------------------------------------------------
+STALE_AMBER_S = 90
+STALE_RED_S = 180
+MODEL_HEALTH_PORTS = (8000, 8001)
+MODEL_HEALTH_TIMEOUT_S = 2
+
+
+def _get_engine_heartbeat(db_path: str) -> dict | None:
+    """Read-only fetch of the single heartbeat row. Returns None if the DB
+    file doesn't exist (engine never started) or the table is empty —
+    never creates or writes to the file."""
+    try:
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT * FROM heartbeat WHERE id=1").fetchone()
+        finally:
+            conn.close()
+        return dict(row) if row else None
+    except sqlite3.OperationalError:
+        return None
+
+
+def _heartbeat_age_s(ts: str) -> float:
+    # engine writes _now_iso() = datetime.utcnow().isoformat(timespec="seconds") — naive UTC
+    return (datetime.utcnow() - datetime.fromisoformat(ts)).total_seconds()
+
+
+def _staleness_colour(age_s: float) -> str:
+    if age_s < STALE_AMBER_S:
+        return "green"
+    if age_s < STALE_RED_S:
+        return "amber"
+    return "red"
+
+
+def _check_model_health(port: int) -> dict:
+    """GET /health on a model server. 2s timeout, never raises — returns
+    a dict describing reachability and the reported model, if any."""
+    url = f"http://localhost:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=MODEL_HEALTH_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return {"reachable": True, "model": data.get("model", "unknown")}
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return {"reachable": False, "model": None}
+
+
 def _badge(text: str, colour: str) -> str:
     return f'<span class="badge-{colour}">{text}</span>'
 
@@ -316,6 +374,41 @@ with st.sidebar:
         "Pre-market script read",
         value=st.session_state["psych_confirmed"])
     st.caption("PDH/PDL marked  ·  VIX assessed  ·  Gap identified")
+
+    st.markdown("---")
+    st.markdown("## ⬡ SYSTEM STATUS")
+    st.session_state["engine_db_path"] = st.text_input(
+        "Engine --db file", value=st.session_state["engine_db_path"],
+        help="Path to the paper-trading engine's SQLite DB (the --db argument "
+             "it was launched with). One dashboard instance watches one account; "
+             "for multiple concurrent accounts, run a dashboard per --db (P2-069).")
+
+    hb = _get_engine_heartbeat(st.session_state["engine_db_path"])
+    if hb is None:
+        st.markdown(_badge("● NO HEARTBEAT", "red"), unsafe_allow_html=True)
+        st.caption(f"No readable heartbeat in {st.session_state['engine_db_path']} — "
+                    "engine not running or DB not found.")
+    else:
+        age_s = _heartbeat_age_s(hb["ts"])
+        colour = _staleness_colour(age_s)
+        status_label = f"● ENGINE — {hb['status'].upper()}"
+        st.markdown(
+            f'{_badge(status_label, colour)} '
+            f'<span style="opacity:0.7;font-size:0.75rem">{age_s:.0f}s ago</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(hb.get("message") or "—")
+
+    for port in MODEL_HEALTH_PORTS:
+        health = _check_model_health(port)
+        if health["reachable"]:
+            st.markdown(
+                f'{_badge(f"● :{port}", "green")} '
+                f'<span style="opacity:0.7;font-size:0.75rem">{health["model"]}</span>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(_badge(f"● :{port} UNREACHABLE", "red"), unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # TOP COCKPIT HEADER BAR

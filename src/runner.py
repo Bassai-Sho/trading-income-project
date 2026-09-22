@@ -36,11 +36,16 @@ DEPENDENCIES
 PROCESS MANAGEMENT
 ──────────────────
   All child processes run as subprocesses of this runner.
-  If a subprocess dies unexpectedly:
-    - Runner logs the failure and sends Discord alert
-    - Trading engine: restart attempted immediately
-    - Dashboard: restart attempted after 30 seconds
-    - Analyser: log the failure, skip (non-critical)
+  If a subprocess dies unexpectedly (P2-061):
+    - Runner logs the failure and sends a Discord/Telegram alert
+    - Engine and dashboard: restart attempted with exponential backoff
+      (5s, 15s, 45s), up to 3 attempts per service
+    - After 3 failed attempts, that service is HALTED — no further
+      auto-restarts — and a HALT alert is sent. Manual restart required
+      (just re-run `python runner.py`, which starts fresh).
+    - A service that stays alive through one health-check cycle has its
+      restart counter and halted flag reset.
+    - Analyser: log the failure, skip (non-critical, not restarted)
   Runner itself can be run as a systemd service on the NUC:
     sudo systemctl enable trading-runner
     sudo systemctl start  trading-runner
@@ -55,6 +60,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -103,6 +109,62 @@ HERE = Path(__file__).parent.resolve()
 _procs: dict[str, subprocess.Popen] = {}
 
 # ---------------------------------------------------------------------------
+# Restart bookkeeping (P2-061): per-service attempt count, halted flag, and
+# whether a backoff-delayed restart is already pending — so a health check
+# that fires while a restart is still sleeping doesn't stack another one.
+# ---------------------------------------------------------------------------
+RESTART_BACKOFF_S = [5, 15, 45]
+MAX_RESTART_ATTEMPTS = len(RESTART_BACKOFF_S)   # 3, per Rulebook/P2-061 spec
+
+_restart_state: dict[str, dict[str, Any]] = {}
+
+
+def _restart_info(name: str) -> dict[str, Any]:
+    return _restart_state.setdefault(
+        name, {"attempts": 0, "halted": False, "pending": False}
+    )
+
+
+def _schedule_restart(name: str, launch_fn) -> None:
+    """Restart a crashed service with exponential backoff, up to
+    MAX_RESTART_ATTEMPTS. After that, halt and notify rather than loop
+    forever. Safe to call repeatedly while a restart is already pending —
+    it's a no-op until that attempt resolves."""
+    info = _restart_info(name)
+    if info["halted"] or info["pending"]:
+        return
+
+    if info["attempts"] >= MAX_RESTART_ATTEMPTS:
+        info["halted"] = True
+        log.error("%s crashed %d times — halting auto-restart. "
+                   "Manual restart required.", name, info["attempts"])
+        _notify(f"{name} crashed {info['attempts']} times in a row — "
+                f"halting auto-restart. Manual restart required.", "HALT")
+        return
+
+    backoff = RESTART_BACKOFF_S[info["attempts"]]
+    info["attempts"] += 1
+    info["pending"] = True
+    attempt_n = info["attempts"]
+
+    log.warning("%s crashed — restart %d/%d scheduled in %ds",
+                name, attempt_n, MAX_RESTART_ATTEMPTS, backoff)
+    _notify(f"{name} crashed — restart {attempt_n}/{MAX_RESTART_ATTEMPTS} "
+            f"in {backoff}s", "WARN")
+
+    def _do_restart():
+        time.sleep(backoff)
+        info["pending"] = False
+        if info["halted"]:
+            return
+        log.info("Restarting %s (attempt %d/%d)...",
+                  name, attempt_n, MAX_RESTART_ATTEMPTS)
+        launch_fn()
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -134,7 +196,6 @@ def _notify(message: str, level: str = "INFO") -> None:
     ts   = _now_est().strftime("%H:%M EST")
     text = f"{emoji} **RUNNER** [{ts}] {message}"
 
-    import threading
     def _send():
         import urllib.request, json as _j
         if webhook:
@@ -404,17 +465,23 @@ def health_check(db_path: str) -> dict:
             status[f"{name}_alive"] = False
         elif proc.poll() is None:
             status[f"{name}_alive"] = True
+            # Alive through a health-check cycle — clear any restart history
+            info = _restart_info(name)
+            if info["attempts"] or info["halted"]:
+                log.info("%s is alive again — resetting restart counter.", name)
+                info["attempts"] = 0
+                info["halted"] = False
         else:
             status[f"{name}_alive"] = False
             log.warning("Process '%s' has died (code %s)", name, proc.returncode)
-            # Restart engine if configured
             if name == "engine" and DEFAULT_CONFIG.get("restart_engine_on_crash"):
-                log.warning("Restarting engine...")
-                _notify("Engine crashed — attempting restart", "WARN")
-                launch_engine()
+                _schedule_restart("engine", launch_engine)
             elif name == "dashboard":
-                log.warning("Restarting dashboard...")
-                launch_dashboard()
+                _schedule_restart("dashboard", launch_dashboard)
+
+        info = _restart_info(name)
+        status[f"{name}_restart_attempts"] = info["attempts"]
+        status[f"{name}_halted"] = info["halted"]
 
     return status
 
@@ -426,7 +493,12 @@ def print_status(db_path: str) -> None:
     print("  TRADING SYSTEM STATUS")
     print("="*55)
     for k, v in status.items():
-        icon = "✅" if v is True or v == "running" else "❌" if v is False else "—"
+        if k.endswith("_halted"):
+            icon = "🛑" if v else "—"
+        elif k.endswith("_restart_attempts"):
+            icon = "⚠️" if v else "—"
+        else:
+            icon = "✅" if v is True or v == "running" else "❌" if v is False else "—"
         print(f"  {icon}  {k}: {v}")
     print(f"\n  Time (EST): {_now_est().strftime('%H:%M')}")
     print(f"  Market hours: {'YES' if _is_market_hours() else 'NO'}")

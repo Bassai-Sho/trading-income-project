@@ -125,6 +125,7 @@ CONFIG: dict[str, Any] = {
     "db_path":           "paper_account.db",
     "log_level":         "INFO",
     "max_daily_loss_pct": 0.03,
+    "max_drawdown_pct":  0.25,           # Rule 16 Tier 1 (P2-073) — lifetime hard stop
     "consec_loss_pause": 3,
     "min_rvol":          1.0,            # stocks in play filter
     "vwap_lookback":     3,
@@ -268,6 +269,22 @@ class PaperAccountDB:
         session_date TEXT,
         account_balance REAL,
         open_position_id INTEGER
+    );
+
+    -- Account-lifetime state (Rule 16 Tier 1, P2-073). starting_balance is
+    -- set exactly once, on this --db file's first ever run, and never
+    -- changed again — even if a later restart passes a different
+    -- --account value — so drawdown stays anchored to the true origin.
+    -- retired is a one-way flag: once Tier 1 trips, the strategy stays
+    -- retired (across session resets AND process restarts) until a human
+    -- clears it or starts a fresh --db.
+    CREATE TABLE IF NOT EXISTS account_meta (
+        id               INTEGER PRIMARY KEY DEFAULT 1,
+        starting_balance REAL,
+        peak_equity      REAL,
+        retired          INTEGER DEFAULT 0,
+        retired_reason   TEXT,
+        retired_at       TEXT
     );
 
     -- Session learning reports (from SessionLearner after each session)
@@ -414,6 +431,76 @@ class PaperAccountDB:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM heartbeat WHERE id=1").fetchone()
         return dict(row) if row else None
+
+    # ── Account-lifetime equity & retirement (Rule 16 Tier 1, P2-073) ──────
+
+    def ensure_account_meta(self, starting_balance: float) -> None:
+        """Set starting_balance once, the first time this --db file is
+        used. A no-op on every later call (including a restart with a
+        different --account value) — this is the account's one true
+        origin point for lifetime drawdown."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO account_meta (id, starting_balance, peak_equity, retired)
+                   VALUES (1, ?, ?, 0)
+                   ON CONFLICT(id) DO NOTHING""",
+                (starting_balance, starting_balance)
+            )
+
+    def get_account_summary(self) -> dict:
+        """Lifetime equity: starting_balance + all realized P&L from closed
+        trades, plus the peak equity ever reached (advanced here if a new
+        high has been made since it was last checked) and the resulting
+        drawdown_pct. Empty dict if ensure_account_meta() was never called."""
+        with self._conn() as conn:
+            meta = conn.execute(
+                "SELECT starting_balance, peak_equity FROM account_meta WHERE id=1"
+            ).fetchone()
+            if meta is None:
+                return {}
+            starting_balance = meta["starting_balance"]
+            peak_equity = meta["peak_equity"]
+            realized = conn.execute(
+                "SELECT COALESCE(SUM(pnl_gbp), 0) FROM positions "
+                "WHERE status='closed' AND pnl_gbp IS NOT NULL"
+            ).fetchone()[0]
+            current_equity = starting_balance + realized
+            if current_equity > peak_equity:
+                peak_equity = current_equity
+                conn.execute(
+                    "UPDATE account_meta SET peak_equity=? WHERE id=1",
+                    (peak_equity,)
+                )
+        drawdown_pct = ((peak_equity - current_equity) / peak_equity
+                         if peak_equity > 0 else 0.0)
+        return {
+            "starting_balance": starting_balance,
+            "current_equity":   current_equity,
+            "peak_equity":      peak_equity,
+            "drawdown_pct":     drawdown_pct,
+        }
+
+    def get_retired_status(self) -> dict:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT retired, retired_reason, retired_at "
+                "FROM account_meta WHERE id=1"
+            ).fetchone()
+        if row is None:
+            return {"retired": False, "reason": None, "retired_at": None}
+        return {"retired": bool(row["retired"]), "reason": row["retired_reason"],
+                "retired_at": row["retired_at"]}
+
+    def mark_retired(self, reason: str) -> None:
+        """One-way: WHERE retired=0 means the first trigger wins and keeps
+        its original reason/timestamp — later ticks that also see
+        drawdown past the threshold don't overwrite it."""
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE account_meta SET retired=1, retired_reason=?, retired_at=?
+                   WHERE id=1 AND retired=0""",
+                (reason, _now_iso())
+            )
 
     # ── WFA results ────────────────────────────────────────────────────────
 
@@ -1183,6 +1270,7 @@ class TradingEngine:
     def __init__(self, cfg: dict) -> None:
         self.cfg      = cfg
         self.db       = PaperAccountDB(cfg["db_path"])
+        self.db.ensure_account_meta(cfg["account_balance"])   # Rule 16 Tier 1 (P2-073)
         self.running  = False
         self.session: dict[str, Any] = self._fresh_session()
 
@@ -1260,6 +1348,15 @@ class TradingEngine:
 
     def _tick(self) -> None:
         """One evaluation cycle."""
+        # ── Rule 16 Tier 1: permanent retirement check (P2-073) ──────────
+        # Persisted in account_meta, checked before anything else — this
+        # is what makes it survive _fresh_session() resets and engine
+        # restarts, unlike the daily stop below.
+        retired = self.db.get_retired_status()
+        if retired["retired"]:
+            self._heartbeat("halted", f"RETIRED — {retired['reason']}")
+            return
+
         now    = _now_est(self.cfg)
         today  = str(now.date())
         in_wnd = _in_session(self.cfg)
@@ -1279,6 +1376,7 @@ class TradingEngine:
                 df_5m_close = _fetch_live(self.cfg["ticker"])
                 vwap = _vwap(df_5m_close)
                 manage_open_position(pos, df_5m_close, vwap, self.db, self.cfg, self.session)
+                self._check_drawdown_stop()
             else:
                 # Fetch bars for SessionLearner ATR even if no position open
                 try:
@@ -1317,6 +1415,7 @@ class TradingEngine:
             outcome = manage_open_position(pos, df_5m, vwap, self.db, self.cfg, self.session)
             if outcome == "exited":
                 self._check_daily_stop(today)
+                self._check_drawdown_stop()
             self._heartbeat("running",
                              f"Position #{pos['id']} open — P&L {self.session['pnl_r']:+.2f}R")
             return
@@ -1396,6 +1495,30 @@ class TradingEngine:
             self.session["halted"] = True
             log.warning("DAILY STOP TRIGGERED — halting for rest of session")
             _notify(self.cfg, "🛑 DAILY STOP TRIGGERED — session halted. No more entries today.", "HALT")
+
+    def _check_drawdown_stop(self) -> None:
+        """Rule 16 Tier 1 (P2-073): 25% equity drawdown from peak, tracked
+        across the account's whole lifetime — not the current session.
+        Unlike _check_daily_stop (self.session['halted'], cleared by
+        _fresh_session() every day), this persists to account_meta and is
+        checked at the top of every _tick(), so once tripped the strategy
+        stays retired across session resets AND engine restarts.
+
+        Tier 2 (30-trade rolling expectancy + DSR<50%) is NOT implemented
+        here — it has a genuinely open design question (how an isolated
+        per-strategy process learns the concurrent-strategy count for its
+        own DSR n_trials) that needs a decision first, per the P2-073 notes."""
+        acc = self.db.get_account_summary()
+        if not acc:
+            return
+        if acc["drawdown_pct"] >= self.cfg["max_drawdown_pct"]:
+            reason = (f"TIER 1 DRAWDOWN STOP — equity down {acc['drawdown_pct']:.1%} "
+                      f"from peak £{acc['peak_equity']:,.0f} to "
+                      f"£{acc['current_equity']:,.0f} (limit "
+                      f"{self.cfg['max_drawdown_pct']:.0%})")
+            self.db.mark_retired(reason)
+            log.error(reason)
+            _notify(self.cfg, f"🛑 {reason} — strategy retired.", "HALT")
 
     def _persist_session(self, today: str) -> None:
         """Write running session stats to DB. Called on every tick."""

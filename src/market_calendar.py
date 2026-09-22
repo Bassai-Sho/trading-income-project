@@ -16,8 +16,9 @@ Fallback:  if exchange_calendars is unavailable, falls back to a hardcoded
 Usage:
     from market_calendar import check_market_session
 
-    result = check_market_session()          # uses today's date (EST)
+    result = check_market_session()          # uses today's date (EST), NYSE equities
     result = check_market_session("2026-11-26")   # Thanksgiving
+    result = check_market_session(market_type="forex")   # P2-072: simplified FX gate
 
     result.is_open         → bool
     result.session_end     → datetime.time  (EST) — 11:00 for strategy, but
@@ -25,6 +26,17 @@ Usage:
     result.reason          → str  e.g. "NYSE closed — Thanksgiving Day"
     result.is_early_close  → bool
     result.normal_close    → datetime.time  (EST) e.g. 15:00 normal, 13:00 early
+
+market_type (P2-072):
+    'nyse_equities' (default) — full NYSE holiday/early-close calendar via
+        exchange_calendars, or the hardcoded fallback below. Unchanged from
+        the original implementation.
+    'forex'         — simplified date-level gate: closed Saturday/Sunday and
+        a short major-holiday list only. No early-close or single-session-
+        window concept — forex trades roughly 24/5, so is_early_close is
+        always False and normal_close is unused for this market_type.
+        Intentionally minimal for a first cut (see P2-072 notes); revisit
+        if/when a forex account actually goes live.
 """
 
 from __future__ import annotations
@@ -61,6 +73,16 @@ _EARLY_CLOSES_2026: dict[str, Time] = {
 # this cap prevents the engine attempting to fetch data after market close.
 _NORMAL_CLOSE_EST = Time(15, 0)   # 16:00 EST actually, but 15:00 is safe cap
 
+# ---------------------------------------------------------------------------
+# Forex (P2-072): deliberately minimal. Major global forex liquidity centres
+# effectively close only for Christmas and New Year's Day; every other
+# weekday is treated as open. No early-close concept for this market_type.
+# ---------------------------------------------------------------------------
+_FOREX_HOLIDAYS_2026: dict[str, str] = {
+    "2026-01-01": "New Year's Day",
+    "2026-12-25": "Christmas Day",
+}
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -89,9 +111,10 @@ class MarketSessionResult:
 def check_market_session(
     date_str: Optional[str] = None,
     tz_offset_hours: int = -5,
+    market_type: str = "nyse_equities",
 ) -> MarketSessionResult:
     """
-    Check whether the NYSE is open on the given date.
+    Check whether the given market is open on the given date.
 
     Args:
         date_str:         ISO date string 'YYYY-MM-DD'.  If None, uses today
@@ -99,10 +122,18 @@ def check_market_session(
         tz_offset_hours:  UTC offset for EST.  -5 standard, -4 during DST.
                           The engine CONFIG['tz_offset_hours'] should be
                           passed here for consistency.
+        market_type:      'nyse_equities' (default, unchanged behaviour) or
+                          'forex' (P2-072 — see module docstring).
 
     Returns:
         MarketSessionResult
     """
+    if market_type not in ("nyse_equities", "forex"):
+        raise ValueError(
+            f"Unknown market_type: {market_type!r} — expected "
+            f"'nyse_equities' or 'forex'"
+        )
+
     # Resolve target date
     if date_str is None:
         now_est = datetime.utcnow() + timedelta(hours=tz_offset_hours)
@@ -112,14 +143,19 @@ def check_market_session(
 
     date_iso = str(target_date)
 
-    # ── Weekend check (fast path, no library needed) ──
+    # ── Weekend check (fast path, no library needed) — shared by both
+    #    market types; wording keeps "NYSE"/"FX" so log lines stay accurate ──
     if target_date.weekday() >= 5:
         day_name = "Saturday" if target_date.weekday() == 5 else "Sunday"
+        label = "FX" if market_type == "forex" else "NYSE"
         return MarketSessionResult(
             is_open=False,
-            reason=f"NYSE closed — {day_name}",
+            reason=f"{label} closed — {day_name}",
             session_date=date_iso,
         )
+
+    if market_type == "forex":
+        return _check_forex_session(target_date, date_iso)
 
     # ── Try exchange_calendars (preferred) ──
     try:
@@ -191,6 +227,27 @@ def check_market_session(
 
 
 # ---------------------------------------------------------------------------
+# Forex (P2-072): simplified date-level gate
+# ---------------------------------------------------------------------------
+def _check_forex_session(target_date: date, date_iso: str) -> MarketSessionResult:
+    """Weekend already ruled out by the caller. Closed only on the short
+    major-holiday list above; every other weekday is open, no early-close
+    concept (forex trades roughly 24/5)."""
+    if date_iso in _FOREX_HOLIDAYS_2026:
+        reason = _FOREX_HOLIDAYS_2026[date_iso]
+        return MarketSessionResult(
+            is_open=False,
+            reason=f"FX closed — {reason}",
+            session_date=date_iso,
+        )
+    return MarketSessionResult(
+        is_open=True,
+        reason="FX open — 24/5 session",
+        session_date=date_iso,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Convenience: holiday name lookup
 # ---------------------------------------------------------------------------
 _NAMED_HOLIDAYS: dict[str, str] = {
@@ -226,12 +283,28 @@ if __name__ == "__main__":
         ("2026-09-20", "Sunday — weekend"),
     ]
 
-    print("\n  MARKET CALENDAR SELF-TEST")
+    print("\n  MARKET CALENDAR SELF-TEST — NYSE EQUITIES (unchanged path)")
     print("  " + "─" * 56)
     for date_s, label in test_dates:
         r = check_market_session(date_s)
         status = "✅ OPEN " if r.is_open else "🚫 CLOSED"
         early  = f"  [early close {r.normal_close.strftime('%H:%M')} EST]" if r.is_early_close else ""
         print(f"  {date_s}  {status}  {r.reason}{early}")
+        print(f"             ({label})")
+
+    forex_test_dates = [
+        ("2026-09-15", "Normal weekday (today)"),
+        ("2026-11-26", "Thanksgiving — NYSE holiday, FX stays open"),
+        ("2026-12-25", "Christmas Day — closed for both"),
+        ("2026-01-01", "New Year's Day — closed for both"),
+        ("2026-09-19", "Saturday — weekend"),
+        ("2026-09-20", "Sunday — weekend"),
+    ]
+    print("\n  MARKET CALENDAR SELF-TEST — FOREX (P2-072)")
+    print("  " + "─" * 56)
+    for date_s, label in forex_test_dates:
+        r = check_market_session(date_s, market_type="forex")
+        status = "✅ OPEN " if r.is_open else "🚫 CLOSED"
+        print(f"  {date_s}  {status}  {r.reason}")
         print(f"             ({label})")
     print()
