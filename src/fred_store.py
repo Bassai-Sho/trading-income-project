@@ -56,7 +56,7 @@ import logging
 import os
 import sqlite3
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -264,7 +264,7 @@ class FredDataStore:
                  rows[0][1] if rows else None,
                  rows[-1][1] if rows else None,
                  len(rows),
-                 datetime.utcnow().isoformat(timespec="seconds"))
+                 datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"))
             )
             # Upsert observations
             conn.executemany(

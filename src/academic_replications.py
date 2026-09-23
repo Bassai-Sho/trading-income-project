@@ -48,7 +48,7 @@ import os
 import random
 import sqlite3
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -647,7 +647,7 @@ def run_all_comparisons(
         return [{"error": "No session bar data. Run historical_sim first."}]
 
     log.info("Academic replications: %d strategies × %d sessions", len(STRATEGIES), len(sessions))
-    ts = datetime.utcnow().isoformat(timespec="seconds")
+    ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
     all_results: list[dict] = []
 
     for strat_key, strat_cfg in STRATEGIES.items():

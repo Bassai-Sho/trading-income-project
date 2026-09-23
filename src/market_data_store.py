@@ -65,7 +65,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -495,7 +495,7 @@ class MarketDataStore:
                             "(ticker, session_date, issue_type, detail, logged_at) "
                             "VALUES (?,?,?,?,?)",
                             (ticker, day_str, iss["issue_type"],
-                             iss["detail"], datetime.utcnow().isoformat())
+                             iss["detail"], datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
                         )
 
             # Write bars
@@ -624,7 +624,7 @@ class MarketDataStore:
                   COALESCE((SELECT total_bars FROM data_store_meta WHERE id=1),0) + ?,
                   COALESCE((SELECT total_sessions FROM data_store_meta WHERE id=1),0) + ?,
                   ?)""",
-                (bars, sessions, datetime.utcnow().isoformat())
+                (bars, sessions, datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
             )
 
     # ── Retrieval API (used by historical_sim.py) ─────────────────────────────

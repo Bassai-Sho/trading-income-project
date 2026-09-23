@@ -43,7 +43,7 @@ import os
 import sqlite3
 import statistics
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -223,7 +223,7 @@ def run_tournament(lookback_days: int = 30) -> dict:
     winner = ranked[0] if ranked else None
 
     # Build report
-    ts = datetime.utcnow().isoformat(timespec="seconds")
+    ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
     # ── Design Studio cycle (Phase 3+: needs >= 2 active variants) ──
     studio_result = None
     if GENE_MIXER and len(ranked) >= 2:
@@ -445,7 +445,7 @@ def main() -> None:
     args = p.parse_args()
 
     print("=" * 60)
-    print(f"  TOURNAMENT EVALUATOR  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  TOURNAMENT EVALUATOR  {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M UTC')}")
     print("=" * 60)
 
     if args.run_autoref:

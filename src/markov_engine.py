@@ -69,7 +69,7 @@ import math
 import sqlite3
 import statistics
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -235,12 +235,12 @@ class RegimeMarkovChain:
         self.P     = build_transition_matrix(self.STATES, state_seq)
         self.n_obs = len(vix_series)
         self.stationary = stationary_distribution(self.P)
-        self.fitted_on = datetime.utcnow().isoformat(timespec="seconds")
+        self.fitted_on = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
     def fit_from_yfinance(self, years: int = 2, ticker: str = "^VIX") -> dict:
         """Fetch VIX history and fit the transition matrix."""
         import yfinance as yf
-        end   = datetime.utcnow()
+        end   = datetime.now(timezone.utc).replace(tzinfo=None)
         start = end - timedelta(days=years * 365)
         df    = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
                              auto_adjust=True, progress=False)

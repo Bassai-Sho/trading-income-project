@@ -98,7 +98,7 @@ def _db_save_message(thread_id: str, role: str, content: str,
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_steps_thread ON steps(thread_id, created_at)
             """)
-            ts = datetime.datetime.utcnow().isoformat()
+            ts = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
             conn.execute(
                 "INSERT OR IGNORE INTO threads VALUES (?,?,?,?,?)",
                 (thread_id, ts, None, profile, "local")

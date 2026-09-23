@@ -63,7 +63,7 @@ import os
 import random
 import sqlite3
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -346,7 +346,7 @@ def run_random_baseline(
             log.info("  Path %d/%d complete", path_i + 1, n_paths)
 
     # Save individual path metrics
-    ts_now = datetime.utcnow().isoformat(timespec="seconds")
+    ts_now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
     with sqlite3.connect(db_path) as c:
         c.executemany(
             "INSERT INTO random_baseline_paths "

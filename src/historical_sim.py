@@ -57,7 +57,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -252,7 +252,7 @@ def save_sim_trades(db_path: str, trades: list[dict]) -> None:
             vwap_slope_at_entry   TEXT,
             sim_run_ts   TEXT
         )""")
-        ts_now = datetime.utcnow().isoformat(timespec="seconds")
+        ts_now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
         conn.executemany(
             "INSERT INTO sim_trades (session_date,direction,entry_price,exit_price,"
             "stop_price,actual_r,exit_reason,entry_candle_body_pct,entry_candle_type,"
@@ -397,7 +397,7 @@ class SimBootstrapper:
                 "n":      int(len(cng._observations)),
                 "counts": {str(k): {s2: int(n2) for s2,n2 in dict(v).items()} for k, v in cng._counts.items()},
                 "n_gram": cng.n,
-                "fitted_ts": datetime.utcnow().isoformat(),
+                "fitted_ts": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 "independence_test": test,
             }
             json_path = os.path.join(os.path.dirname(self.db_path), "candle_ngram.json")
@@ -424,7 +424,7 @@ class SimBootstrapper:
                 "n": int(len(r_vals)),
                 "outcomes": [str(o)[0] for o in omc.outcomes],  # W/L chars
                 "independence_test": test,
-                "fitted_ts": datetime.utcnow().isoformat(),
+                "fitted_ts": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             }
             json_path = os.path.join(os.path.dirname(self.db_path), "outcome_mc.json")
             with open(json_path, "w") as f:
@@ -470,7 +470,7 @@ class SimBootstrapper:
                         "INSERT INTO wfa_results (run_ts,ticker,is_start,is_end,"
                         "oos_start,oos_end,n_is_trades,n_oos_trades,is_sharpe,"
                         "oos_sharpe,wfe,wfe_verdict,source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (datetime.utcnow().isoformat(), "SPY",
+                        (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), "SPY",
                          f"sim_split_{i}_is_start", f"sim_split_{i}_is_end",
                          f"sim_split_{i}_oos_start", f"sim_split_{i}_oos_end",
                          len(is_rs), len(oos_rs),
@@ -493,7 +493,7 @@ class SimBootstrapper:
             import json
             # Build a synthetic DB with sim stats preloaded
             report = {
-                "generated_at": datetime.utcnow().isoformat(),
+                "generated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 "n_trades_history": metrics.get("n", 0),
                 "assumed_parameters": False,
                 "win_rate": metrics.get("win_rate", 0.44),
@@ -553,7 +553,7 @@ class SimBootstrapper:
                 (len(trades), metrics.get("win_rate"), metrics.get("ev"),
                  metrics.get("sharpe"),
                  "2020-01-01", "2022-12-31",
-                 datetime.utcnow().isoformat(),
+                 datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                  results["wfa"].get("mean_wfe"),
                  int(results["outcome_chain"].get("verdict") in ("INDEPENDENT","MARKOV_VALID")),
                  int(results["candle_ngram"].get("test",{}).get("verdict") == "NGRAM_VALID"),

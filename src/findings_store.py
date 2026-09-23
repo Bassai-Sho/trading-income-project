@@ -48,7 +48,7 @@ import json
 import logging
 import sqlite3
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 log = logging.getLogger("findings_store")
@@ -133,7 +133,7 @@ def store_findings(
     overall  = findings_json.get("overall_verdict", "")
     concern  = findings_json.get("top_concern", "")
     quality  = findings_json.get("analysis_quality", "")
-    now_ts   = datetime.utcnow().isoformat(timespec="seconds")
+    now_ts   = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
     stored   = 0
 
     with _conn(db_path) as c:
@@ -237,7 +237,7 @@ def dismiss_pattern(db_path: str, obs_hash: str, reason: str) -> bool:
             c.execute(
                 "UPDATE confirmed_patterns SET status='dismissed', "
                 "dismissed_at=?, dismiss_reason=? WHERE obs_hash=?",
-                (datetime.utcnow().isoformat(), reason, obs_hash)
+                (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), reason, obs_hash)
             )
         return True
     except Exception:

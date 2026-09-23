@@ -47,7 +47,7 @@ import math
 import sqlite3
 import statistics
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, time as Time
+from datetime import datetime, time as Time, timezone
 from typing import Any
 
 # ── Enumerations ──────────────────────────────────────────────────────────────
@@ -352,7 +352,7 @@ def build_auto_fields(
     except Exception:
         pass
 
-    fields["logged_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    fields["logged_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
     return fields
 
 
@@ -451,7 +451,7 @@ def update_psychology_fields(db_path: str, position_id: int, fields: dict) -> No
     Update psychology + reflection fields after a trade closes.
     Called from the dashboard post-trade input form.
     """
-    fields["modified_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    fields["modified_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values     = list(fields.values()) + [position_id]
     with sqlite3.connect(db_path) as conn:
@@ -625,7 +625,7 @@ if __name__ == "__main__":
         "what_went_right": "Waited for clean retest of ORB level.",
         "what_went_wrong": "Exited first ladder target slightly early.",
         "lesson_learned": "Trust the VWAP trailing stop — let it run.",
-        "logged_at": datetime.utcnow().isoformat(),
+        "logged_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     }
     row_id = save_journal_entry(tmp, entry)
     assert row_id > 0

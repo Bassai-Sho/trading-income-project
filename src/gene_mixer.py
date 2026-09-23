@@ -54,7 +54,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -248,7 +248,7 @@ def crossover(
         **{k: v for k, v in child_genes.items()},
         parents  = [parent_a.variant_name, parent_b.variant_name],
         generation = gen,
-        bred_at  = datetime.utcnow().isoformat(timespec="seconds"),
+        bred_at  = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"),
     )
     return child
 
@@ -522,7 +522,7 @@ class GeneMixer:
                  and dac_result["confidence"] in ("HIGH", "MEDIUM"))
 
         result = {
-            "cycle_ts":         datetime.utcnow().isoformat(timespec="seconds"),
+            "cycle_ts":         datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"),
             "generation":       child.generation,
             "winner_name":      winner_v.name,
             "winner_ev":        chr_winner.ev,

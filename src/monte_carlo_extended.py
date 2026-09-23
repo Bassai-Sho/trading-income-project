@@ -45,7 +45,7 @@ import random
 import sqlite3
 import statistics
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -496,7 +496,7 @@ def forecast_report(
     )
 
     return {
-        "generated_at":       datetime.utcnow().isoformat(timespec="seconds"),
+        "generated_at":       datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"),
         "n_trades_history":   n,
         "assumed_parameters": assumed,
         "win_rate":           round(wr, 4),

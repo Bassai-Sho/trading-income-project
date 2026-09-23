@@ -25,6 +25,7 @@ import argparse
 import os
 import sys
 from datetime import datetime, timedelta, time as Time
+from zoneinfo import ZoneInfo
 
 # ── Try toolkit import ──────────────────────────────────────────────────────
 try:
@@ -80,7 +81,8 @@ def _fetch(ticker: str, period: str, interval: str):
 def run_brief(ticker: str = "SPY", orb_method: str = "15min",
               account: float = 10_000.0, risk_pct: float = 0.01) -> None:
 
-    now_est = datetime.utcnow() - timedelta(hours=5)
+    # Was utcnow() - 5h: an hour wrong for the whole of EDT (P2-110 bug class).
+    now_et = datetime.now(ZoneInfo("America/New_York"))
     go_signals   = 0
     total_checks = 0
 
@@ -103,7 +105,7 @@ def run_brief(ticker: str = "SPY", orb_method: str = "15min",
 
     # ── HEADER ────────────────────────────────────────────────────────────────
     print(f"\n{BOLD}{'='*52}{RESET}")
-    print(f"{BOLD}  ⬡ TRADING MORNING BRIEF  {now_est.strftime('%a %d %b %Y  %H:%M EST')}{RESET}")
+    print(f"{BOLD}  ⬡ TRADING MORNING BRIEF  {now_et.strftime('%a %d %b %Y  %H:%M %Z')}{RESET}")
     print(f"{BOLD}  Ticker: {ticker}   ORB: {orb_method}   Account: £{account:,.0f}{RESET}")
     print(f"{BOLD}{'='*52}{RESET}")
 
