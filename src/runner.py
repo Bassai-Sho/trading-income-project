@@ -62,7 +62,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -168,8 +168,13 @@ def _schedule_restart(name: str, launch_fn) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _utcnow() -> datetime:
+    """Naive UTC 'now' — same value as the removed datetime.utcnow(), via
+    the non-deprecated timezone-aware path."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 def _now_est() -> datetime:
-    return datetime.utcnow() + timedelta(hours=DEFAULT_CONFIG["tz_offset_hours"])
+    return _utcnow() + timedelta(hours=DEFAULT_CONFIG["tz_offset_hours"])
 
 def _is_market_day() -> bool:
     """Rough NYSE market-day check (weekday only; does not check holidays)."""
@@ -452,7 +457,7 @@ def health_check(db_path: str) -> dict:
             # Stale if > 5 minutes old
             if row[1]:
                 tick_dt = datetime.fromisoformat(row[1])
-                age_min = (datetime.utcnow() - tick_dt).total_seconds() / 60
+                age_min = (_utcnow() - tick_dt).total_seconds() / 60
                 status["engine_tick_age_min"] = round(age_min, 1)
                 if age_min > 5 and _is_market_hours():
                     log.warning("Engine heartbeat stale (%d min)", age_min)

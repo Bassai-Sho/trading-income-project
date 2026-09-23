@@ -43,10 +43,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, time as Time, timedelta
+from datetime import date, datetime, time as Time, timedelta, timezone
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    """Naive UTC 'now' — same value as the removed datetime.utcnow(), via
+    the non-deprecated timezone-aware path."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # ---------------------------------------------------------------------------
 # Hardcoded 2026 holiday fallback (used if exchange_calendars unavailable)
@@ -136,7 +142,7 @@ def check_market_session(
 
     # Resolve target date
     if date_str is None:
-        now_est = datetime.utcnow() + timedelta(hours=tz_offset_hours)
+        now_est = _utcnow() + timedelta(hours=tz_offset_hours)
         target_date = now_est.date()
     else:
         target_date = date.fromisoformat(date_str)

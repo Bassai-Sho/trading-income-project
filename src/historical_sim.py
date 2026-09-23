@@ -63,13 +63,26 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# P2-116: this file no longer implements its own copy of the ORB+VWAP
+# strategy. It previously had a separate simulate_session()/_define_orb()/
+# _compute_vwap() that had drifted from trading_engine.py's live logic —
+# a different exit model (fixed target_rr vs. the live engine's flat 1R +
+# VWAP trailing), a different cost model, and a max_per_dir cap that was
+# actually dead code (an `entered` flag blocked any session from ever
+# reaching a second trade regardless of the cap). Now delegates to
+# trading_engine.py's _backtest_orb_full_gate() — the same function
+# trading_engine.py's own --wfa-5m and DSR tooling use — so there is
+# exactly one place that defines what the strategy does, used for both
+# fast 60-day yfinance checks and full multi-year Alpaca/store runs.
+from trading_engine import _backtest_orb_full_gate, CONFIG as _ENGINE_CONFIG
+
 try:
     from market_data_store import MarketDataStore, get_store_or_fetch, REGIMES, IS_END as _DS_IS_END
     HAS_DATA_STORE = True
 except ImportError:
     HAS_DATA_STORE = False
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 log = logging.getLogger("historical_sim")
 
@@ -165,169 +178,15 @@ def fetch_yfinance_bars(ticker: str, start: date, end: date) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------------------------
-# Strategy signal evaluator (same logic as trading_engine.py, vectorised)
+# Strategy signal evaluator — REMOVED (P2-116)
 # ---------------------------------------------------------------------------
-
-def _compute_vwap(df: pd.DataFrame) -> pd.Series:
-    """Session-anchored VWAP (resets at 09:30 each day)."""
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
-    pv = tp * df["Volume"]
-    vwap_vals = pd.Series(index=df.index, dtype=float)
-    for day in set(df.index.date):
-        mask = (df.index.date == day) & (df.index.time >= pd.Timestamp("09:30").time())
-        cv   = df["Volume"][mask].cumsum()
-        vwap_vals[mask] = (pv[mask].cumsum() / cv.replace(0, float("nan"))).values
-    return vwap_vals
-
-def _define_orb(day_df: pd.DataFrame, method: str = "15min") -> dict | None:
-    orb_end = {"5min": 5, "15min": 15, "30min": 30}.get(method, 15)
-    open_t  = pd.Timestamp("09:30", tz="America/New_York").time()
-    end_t   = (pd.Timestamp("09:30", tz="America/New_York") +
-                pd.Timedelta(minutes=orb_end)).time()
-    orb_bars = day_df[(day_df.index.time >= open_t) & (day_df.index.time <= end_t)]
-    if len(orb_bars) < 2:
-        return None
-    return {
-        "orb_high": float(orb_bars["High"].max()),
-        "orb_low":  float(orb_bars["Low"].min()),
-        "orb_size": float(orb_bars["High"].max() - orb_bars["Low"].min()),
-    }
-
-def simulate_session(
-    day_df:     pd.DataFrame,
-    vwap:       pd.Series,
-    orb_method: str   = "15min",
-    target_rr:  float = 2.0,
-    risk_pct:   float = 0.01,
-    account:    float = 10_000.0,
-    entry_cutoff_hour: int = 11,
-) -> list[dict]:
-    """
-    Simulate the ORB strategy on one trading session.
-    Returns list of trade dicts (may be empty if no signals).
-    """
-    orb = _define_orb(day_df, orb_method)
-    if not orb:
-        return []
-
-    cutoff_time = pd.Timestamp(f"{entry_cutoff_hour}:00", tz="America/New_York").time()
-    trades: list[dict] = []
-    entered   = False
-    n_long    = 0
-    n_short   = 0
-    max_per_dir = 2
-
-    # Iterate bars after ORB window
-    orb_end_t = (pd.Timestamp("09:30", tz="America/New_York") +
-                  pd.Timedelta(minutes={"5min":5,"15min":15,"30min":30}.get(orb_method,15))).time()
-    signal_bars = day_df[day_df.index.time > orb_end_t]
-
-    for ts, bar in signal_bars.iterrows():
-        if entered:
-            break
-        if ts.time() > cutoff_time:
-            break
-
-        close = float(bar["Close"])
-        v     = float(vwap.loc[ts]) if ts in vwap.index else None
-        if v is None or v == 0:
-            continue
-
-        # Gate 1: ORB breakout
-        if close > orb["orb_high"] and n_long < max_per_dir:
-            direction = "long"
-        elif close < orb["orb_low"] and n_short < max_per_dir:
-            direction = "short"
-        else:
-            continue
-
-        # Gate 2: VWAP direction (simplified slope)
-        v_slope = "flat"
-        vwap_window = vwap.loc[:ts].dropna().iloc[-5:]
-        if len(vwap_window) >= 3:
-            slope = float(vwap_window.iloc[-1] - vwap_window.iloc[0]) / len(vwap_window)
-            thresh = float(vwap_window.mean()) * 0.0001
-            if slope > thresh:   v_slope = "up"
-            elif slope < -thresh: v_slope = "down"
-        if (direction == "long" and v_slope != "up") or \
-           (direction == "short" and v_slope != "down"):
-            continue
-
-        # Entry (1-bar delay: fill at next bar's open)
-        future_bars = day_df[day_df.index > ts]
-        if future_bars.empty:
-            continue
-        entry_bar  = future_bars.iloc[0]
-        entry_price = float(entry_bar["Open"])
-        stop_dist  = orb["orb_size"]
-        if stop_dist < 1e-4:
-            continue
-
-        stop_price = (entry_price - stop_dist if direction == "long"
-                       else entry_price + stop_dist)
-        target     = (entry_price + target_rr * stop_dist if direction == "long"
-                       else entry_price - target_rr * stop_dist)
-
-        # Simulate outcome against remaining bars
-        result_r     = None
-        exit_reason  = "eod"
-        exit_price   = float(day_df["Close"].iloc[-1])
-        candle_type  = "doji"  # simplified
-        body_pct     = abs(float(bar["Close"]) - float(bar["Open"])) / max(float(bar["High"]) - float(bar["Low"]), 1e-6) * 100
-
-        for _, fbar in future_bars.iloc[1:].iterrows():
-            h, l = float(fbar["High"]), float(fbar["Low"])
-            if direction == "long":
-                if l <= stop_price:
-                    result_r   = round(-1.0 - 0.016, 3)  # loss + spread cost
-                    exit_price = stop_price
-                    exit_reason = "stop"
-                    break
-                if h >= target:
-                    result_r   = round(target_rr - 0.016, 3)
-                    exit_price = target
-                    exit_reason = "target"
-                    break
-            else:
-                if h >= stop_price:
-                    result_r   = round(-1.0 - 0.016, 3)
-                    exit_price = stop_price
-                    exit_reason = "stop"
-                    break
-                if l <= target:
-                    result_r   = round(target_rr - 0.016, 3)
-                    exit_price = target
-                    exit_reason = "target"
-                    break
-
-        if result_r is None:
-            # EOD exit
-            eod_price = float(day_df["Close"].iloc[-1])
-            raw_r     = ((eod_price - entry_price) / stop_dist *
-                          (1 if direction == "long" else -1))
-            result_r  = round(raw_r - 0.016, 3)
-            exit_price = eod_price
-
-        trades.append({
-            "session_date": str(ts.date()),
-            "direction":    direction,
-            "entry_price":  round(entry_price, 4),
-            "exit_price":   round(exit_price, 4),
-            "stop_price":   round(stop_price, 4),
-            "target_price": round(target, 4),
-            "actual_r":     result_r,
-            "exit_reason":  exit_reason,
-            "entry_candle_body_pct": round(body_pct, 1),
-            "entry_candle_type":     "strong_bull" if body_pct > 60 and direction == "long" else
-                                     "strong_bear" if body_pct > 60 and direction == "short" else
-                                     "doji" if body_pct < 20 else "moderate_bull",
-            "vwap_slope_at_entry":   v_slope,
-        })
-        entered = True
-        if direction == "long": n_long += 1
-        else: n_short += 1
-
-    return trades
+# This used to contain a separate simulate_session()/_define_orb()/
+# _compute_vwap() implementation of the ORB+VWAP strategy. It had drifted
+# from trading_engine.py's live logic (different exit model, different
+# cost model, a dead max_per_dir cap). Now delegates entirely to
+# trading_engine.py's _backtest_orb_full_gate() — imported at the top of
+# this file — so there is exactly one implementation of the strategy,
+# used everywhere. See _run_canonical_simulation() below.
 
 # ---------------------------------------------------------------------------
 # Save simulated trades to DB
@@ -683,7 +542,12 @@ def run_simulation(
     start:      date  = date(2020, 1, 1),
     end:        date  = date(2022, 12, 31),
     orb_method: str   = "15min",
-    target_rr:  float = 2.0,
+    exit_mode:  str   = "baseline",   # P2-116: was target_rr (float) — now the
+                                      # same three modes trading_engine.py's
+                                      # --wfa-5m and exit-experiment tooling use
+                                      # ("baseline"|"fixed_1_5r"|"trail_after_1r"),
+                                      # so this can never test a fourth, unvalidated
+                                      # exit model that the live engine doesn't have.
     risk_pct:   float = 0.01,
     account:    float = 10_000.0,
     db_path:    str   = "DATA/paper_account.db",
@@ -700,8 +564,8 @@ def run_simulation(
 
     log.info("="*55)
     log.info("HISTORICAL SIMULATION  %s  %s → %s", ticker, start, end)
-    log.info("Strategy: %s ORB  Target: %.1f:1  Risk: %.1f%%",
-             orb_method, target_rr, risk_pct*100)
+    log.info("Strategy: %s ORB  Exit mode: %s  Risk: %.1f%%",
+             orb_method, exit_mode, risk_pct*100)
     log.info("="*55)
 
     # Fetch data
@@ -740,9 +604,9 @@ def run_simulation(
     if df_1m.empty:
         return {"error": "No data returned"}
 
-    # Compute session-anchored VWAP for the full dataset
-    log.info("Computing VWAP...")
-    vwap = _compute_vwap(df_1m)
+    # (VWAP is no longer pre-computed here — _backtest_orb_full_gate computes
+    # it internally, per-day, via the same real _vwap() function the live
+    # engine uses.)
 
     # Fetch VIX for regime annotation — prefer FRED local store, fallback to yfinance
     vix_map: dict[str, float] = {}
@@ -767,25 +631,33 @@ def run_simulation(
         except Exception:
             pass
 
-    # Simulate day by day
-    all_trades: list[dict] = []
-    trading_days = sorted(set(df_1m.index.date))
+    # ── Run the canonical simulator (P2-116) ────────────────────────────────
+    # One call replaces the old day-by-day simulate_session() loop. Column
+    # names differ depending on the data source: MarketDataStore.get_bars_
+    # range() returns lowercase (open/high/low/close/volume), while direct
+    # Alpaca/yfinance fetches return capitalized — trading_engine.py's
+    # functions expect capitalized throughout, so normalize here rather
+    # than inside the canonical function itself (keeps that function
+    # source-agnostic).
+    df_norm = df_1m.rename(columns={c: c.capitalize() for c in df_1m.columns
+                                     if c.lower() in ("open","high","low","close","volume")})
+
+    trading_days = sorted(set(df_norm.index.date))
     if max_sessions:
         trading_days = trading_days[:max_sessions]
+        cutoff = trading_days[-1]
+        df_norm = df_norm[df_norm.index.date <= cutoff]
 
-    log.info("Simulating %d sessions...", len(trading_days))
+    log.info("Simulating %d sessions via trading_engine._backtest_orb_full_gate() "
+             "(exit_mode=%s)...", len(trading_days), exit_mode)
     t0 = time.monotonic()
 
-    for day in trading_days:
-        day_df = df_1m[df_1m.index.date == day]
-        if len(day_df) < 20:
-            continue
-        day_vwap = vwap[vwap.index.date == day]
-        trades = simulate_session(day_df, day_vwap, orb_method, target_rr, risk_pct, account)
-        vix_today = vix_map.get(str(day), 0.0)
-        for t in trades:
-            t["vix_at_entry"] = vix_today
-        all_trades.extend(trades)
+    sim_cfg = {**_ENGINE_CONFIG, "ticker": ticker, "orb_method": orb_method,
+               "account_balance": account, "risk_pct": risk_pct}
+    result = _backtest_orb_full_gate(df_norm, sim_cfg, exit_mode=exit_mode)
+    all_trades: list[dict] = result.get("trades", [])
+    for t in all_trades:
+        t["vix_at_entry"] = vix_map.get(t.get("session_date", ""), 0.0)
 
     elapsed = time.monotonic() - t0
     log.info("Simulation complete: %d sessions in %.1fs → %d trades",
@@ -927,7 +799,11 @@ if __name__ == "__main__":
     p.add_argument("--start",      default="2016-01-01")
     p.add_argument("--end",        default="2022-12-31")
     p.add_argument("--orb",        default="15min", choices=["5min","15min","30min"])
-    p.add_argument("--target-rr",  type=float, default=2.0)
+    p.add_argument("--exit-mode",  default="baseline",
+                   choices=["baseline","fixed_1_5r","trail_after_1r"],
+                   help="Same three modes as trading_engine.py's exit-mode "
+                        "experiment (P2-106) — replaces the old --target-rr, "
+                        "which tested an exit model the live engine doesn't have")
     p.add_argument("--risk",       type=float, default=0.01)
     p.add_argument("--account",    type=float, default=10_000.0)
     p.add_argument("--db",         default="DATA/paper_account.db")
@@ -950,7 +826,7 @@ if __name__ == "__main__":
             ticker=args.ticker.upper(),
             start=start, end=end,
             orb_method=args.orb,
-            target_rr=args.target_rr,
+            exit_mode=args.exit_mode,
             risk_pct=args.risk,
             account=args.account,
             db_path=args.db,

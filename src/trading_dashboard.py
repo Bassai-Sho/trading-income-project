@@ -295,9 +295,15 @@ def _get_engine_heartbeat(db_path: str) -> dict | None:
         return None
 
 
+def _utcnow() -> datetime:
+    """Naive UTC 'now' — same value as the removed datetime.utcnow(), via
+    the non-deprecated timezone-aware path."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def _heartbeat_age_s(ts: str) -> float:
-    # engine writes _now_iso() = datetime.utcnow().isoformat(timespec="seconds") — naive UTC
-    return (datetime.utcnow() - datetime.fromisoformat(ts)).total_seconds()
+    # engine writes _now_iso() = naive UTC isoformat(timespec="seconds")
+    return (_utcnow() - datetime.fromisoformat(ts)).total_seconds()
 
 
 def _staleness_colour(age_s: float) -> str:

@@ -17,7 +17,7 @@ Neither process depends on the other; they communicate only through the DB.
 
 WHAT THIS ENGINE DOES
 ---------------------
-Every POLL_INTERVAL seconds during the trading window (09:30–11:00 EST):
+Every POLL_INTERVAL seconds during the trading window (09:30–11:00 ET):
 
   1. Fetch live 5-min OHLCV, VWAP, PDH/PDL, VIX, gap
   2. Evaluate every signal in the strategy AND-gate
@@ -70,7 +70,8 @@ import statistics
 import sys
 import threading
 import time
-from datetime import date, datetime, time as Time, timedelta
+from datetime import date, datetime, time as Time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 
 import pandas as pd
@@ -119,6 +120,18 @@ CONFIG: dict[str, Any] = {
     "target_rr":         2.0,           # baseline R:R
     "use_vwap_trailing": True,           # VWAP trailing stop (Zarattini 2024)
     "use_ladder_exit":   True,           # 1R/2R/3R partial exits (Maroy 2025)
+    # P2-112 — future-proofing beyond NYSE/EST. This pilot trades NYSE
+    # equities in US Eastern time; session_start/session_end below are
+    # interpreted IN market_timezone, whatever it's set to. Trading a
+    # different session (UK, EU, Asia) means changing BOTH of these
+    # together — market_timezone to that market's IANA zone, and
+    # market_type to a key with REAL data populated in market_calendar.py's
+    # EQUITIES_MARKETS registry (not just a plausible-sounding string;
+    # check_market_session() raises clearly if the market_type you set
+    # here has no real holiday/session data behind it yet) — plus new
+    # session_start/session_end values in that market's local hours.
+    "market_type":       "nyse_equities",
+    "market_timezone":   "America/New_York",
     "session_start":     Time(9, 30),
     "session_end":       Time(11, 0),
     "poll_interval_s":   60,             # seconds between signal evaluations
@@ -129,7 +142,12 @@ CONFIG: dict[str, Any] = {
     "consec_loss_pause": 3,
     "min_rvol":          1.0,            # stocks in play filter
     "vwap_lookback":     3,
-    "tz_offset_hours":   -5,             # EST = UTC-5 (no DST adjustment; update manually)
+    "tz_offset_hours":   -5,             # DEPRECATED as of the DST fix — _now_market() uses
+                                          # zoneinfo("America/New_York") directly now, which
+                                          # handles EST/EDT automatically. This value is no
+                                          # longer read by _now_market() itself; kept only as a
+                                          # fallback default where a raw offset is still needed
+                                          # (e.g. passed into market_calendar's own signature).
     "discord_webhook":   "",             # optional: paste Discord webhook URL here
 }
 
@@ -143,7 +161,13 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler("trading_engine.log", mode="a"),
-    ]
+    ],
+    force=True,   # a bare logging.xxx() call anywhere above this (e.g. the
+                  # toolkit-not-found warning) silently self-configures the
+                  # root logger with Python's bare defaults first, which
+                  # makes basicConfig() a no-op without force=True — losing
+                  # INFO-level output, the custom format, AND file logging
+                  # entirely, exactly when something's already gone missing
 )
 log = logging.getLogger("engine")
 
@@ -166,6 +190,10 @@ class PaperAccountDB:
         direction   TEXT    NOT NULL,   -- 'long' | 'short'
         entry_price REAL    NOT NULL,
         stop_price  REAL    NOT NULL,
+        initial_stop REAL,              -- P2-105 (BUG-02): immutable, set once at
+                                         -- entry. stop_price trails; this never
+                                         -- changes. R is always computed against
+                                         -- this, never the current stop_price.
         target_1r   REAL,
         target_2r   REAL,
         target_3r   REAL,
@@ -284,7 +312,12 @@ class PaperAccountDB:
         peak_equity      REAL,
         retired          INTEGER DEFAULT 0,
         retired_reason   TEXT,
-        retired_at       TEXT
+        retired_at       TEXT,
+        ticker           TEXT    -- P2-105 (BUG-09): which ticker this account's
+                                  -- equity/drawdown history belongs to. Reusing
+                                  -- a --db file across a different --ticker
+                                  -- would otherwise silently blend both
+                                  -- tickers' P&L into one equity curve.
     );
 
     -- Session learning reports (from SessionLearner after each session)
@@ -319,13 +352,44 @@ class PaperAccountDB:
     def _setup(self) -> None:
         with self._conn() as conn:
             conn.executescript(self.SCHEMA)
+            self._migrate_schema(conn)
         log.info("DB ready: %s", self.db_path)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        """P2-105 (BUG-06): CREATE TABLE IF NOT EXISTS does not add new
+        columns to a table that already existed before this column was
+        introduced. Handles two cases: a --db file from before P2-105
+        (positions has no initial_stop), and one from after P2-073 but
+        before P2-105 (account_meta exists but has no ticker column)."""
+        pos_cols = [r["name"] for r in
+                    conn.execute("PRAGMA table_info(positions)").fetchall()]
+        if pos_cols and "initial_stop" not in pos_cols:
+            log.warning("Migrating 'positions': adding initial_stop "
+                        "(backfilled from stop_price for legacy rows — "
+                        "their true entry-time stop can't be recovered, "
+                        "this is the closest available approximation)")
+            conn.execute("ALTER TABLE positions ADD COLUMN initial_stop REAL")
+            conn.execute("UPDATE positions SET initial_stop = stop_price "
+                         "WHERE initial_stop IS NULL")
+
+        meta_cols = [r["name"] for r in
+                     conn.execute("PRAGMA table_info(account_meta)").fetchall()]
+        if meta_cols and "ticker" not in meta_cols:
+            log.warning("Migrating 'account_meta': adding ticker column "
+                        "(NULL for now — adopted on the next ensure_account_meta() call)")
+            conn.execute("ALTER TABLE account_meta ADD COLUMN ticker TEXT")
 
     # ── Positions ──────────────────────────────────────────────────────────
 
     def open_position(self, ticker: str, direction: str, entry_price: float,
                        stop_price: float, units: float, targets: list[float],
-                       notes: str = "") -> int:
+                       notes: str = "", initial_stop: float | None = None) -> int:
+        # P2-105 (BUG-02): initial_stop is the immutable entry-time risk
+        # anchor. Defaults to stop_price since that IS the initial stop
+        # at the moment a position opens — existing callers don't need
+        # to change.
+        if initial_stop is None:
+            initial_stop = stop_price
         t1 = targets[0] if len(targets) > 0 else None
         t2 = targets[1] if len(targets) > 1 else None
         t3 = targets[2] if len(targets) > 2 else None
@@ -333,10 +397,11 @@ class PaperAccountDB:
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT INTO positions
-                   (ticker, direction, entry_price, stop_price, target_1r, target_2r, target_3r,
-                    units, status, opened_at, notes)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (ticker, direction, entry_price, stop_price, t1, t2, t3, units, "open", ts, notes)
+                   (ticker, direction, entry_price, stop_price, initial_stop,
+                    target_1r, target_2r, target_3r, units, status, opened_at, notes)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (ticker, direction, entry_price, stop_price, initial_stop,
+                 t1, t2, t3, units, "open", ts, notes)
             )
             return cur.lastrowid  # type: ignore
 
@@ -355,6 +420,39 @@ class PaperAccountDB:
                    actual_r=?, pnl_gbp=?, exit_reason=? WHERE id=?""",
                 (_now_iso(), exit_price, actual_r, pnl_gbp, exit_reason, position_id)
             )
+            # Rule 16 Tier 1 (P2-073): advance peak_equity here, at the exact
+            # moment equity changes — not lazily whenever get_account_summary()
+            # next happens to be called. A closed trade closing this
+            # connection's transaction is the only place a new peak can be
+            # made; relying on a later read would leave the peak stale (and
+            # drawdown understated) if that read is ever skipped or delayed.
+            meta = conn.execute(
+                "SELECT starting_balance, peak_equity, ticker FROM account_meta WHERE id=1"
+            ).fetchone()
+            if meta is not None:
+                # P2-105 (BUG-09): scope the realized-P&L sum to this
+                # account's own ticker. meta["ticker"] is None only for a
+                # legacy row that hasn't been through ensure_account_meta()
+                # since the migration — falls back to the unscoped sum in
+                # that one case, matching the old (pre-fix) behaviour
+                # rather than silently returning zero.
+                if meta["ticker"]:
+                    realized = conn.execute(
+                        "SELECT COALESCE(SUM(pnl_gbp), 0) FROM positions "
+                        "WHERE status='closed' AND pnl_gbp IS NOT NULL AND ticker=?",
+                        (meta["ticker"],)
+                    ).fetchone()[0]
+                else:
+                    realized = conn.execute(
+                        "SELECT COALESCE(SUM(pnl_gbp), 0) FROM positions "
+                        "WHERE status='closed' AND pnl_gbp IS NOT NULL"
+                    ).fetchone()[0]
+                current_equity = meta["starting_balance"] + realized
+                if current_equity > meta["peak_equity"]:
+                    conn.execute(
+                        "UPDATE account_meta SET peak_equity=? WHERE id=1",
+                        (current_equity,)
+                    )
 
     def update_stop(self, position_id: int, new_stop: float) -> None:
         with self._conn() as conn:
@@ -434,18 +532,40 @@ class PaperAccountDB:
 
     # ── Account-lifetime equity & retirement (Rule 16 Tier 1, P2-073) ──────
 
-    def ensure_account_meta(self, starting_balance: float) -> None:
+    def ensure_account_meta(self, starting_balance: float, ticker: str) -> None:
         """Set starting_balance once, the first time this --db file is
         used. A no-op on every later call (including a restart with a
         different --account value) — this is the account's one true
-        origin point for lifetime drawdown."""
+        origin point for lifetime drawdown.
+
+        P2-105 (BUG-09): also records which ticker this account belongs
+        to. A --db file reused across a different --ticker would
+        otherwise silently blend both tickers' P&L into one equity
+        curve — this raises loudly instead, at startup, rather than
+        letting it happen quietly mid-session."""
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO account_meta (id, starting_balance, peak_equity, retired)
-                   VALUES (1, ?, ?, 0)
+                """INSERT INTO account_meta (id, starting_balance, peak_equity, retired, ticker)
+                   VALUES (1, ?, ?, 0, ?)
                    ON CONFLICT(id) DO NOTHING""",
-                (starting_balance, starting_balance)
+                (starting_balance, starting_balance, ticker)
             )
+            row = conn.execute("SELECT ticker FROM account_meta WHERE id=1").fetchone()
+            if row["ticker"] is None:
+                # Legacy DB from before per-ticker tracking existed (either
+                # pre-P2-105, or the INSERT above was a no-op because the
+                # row already existed with a NULL ticker from the schema
+                # migration) — adopt this run's ticker rather than treat
+                # a NULL as a mismatch.
+                conn.execute("UPDATE account_meta SET ticker=? WHERE id=1", (ticker,))
+            elif row["ticker"] != ticker:
+                raise RuntimeError(
+                    f"This --db file's account_meta is already tracking "
+                    f"{row['ticker']!r}, but --ticker {ticker!r} was requested. "
+                    f"Reusing a --db file across different tickers would blend "
+                    f"their equity/drawdown history together (P2-105/BUG-09). "
+                    f"Use a separate --db file per ticker."
+                )
 
     def get_account_summary(self) -> dict:
         """Lifetime equity: starting_balance + all realized P&L from closed
@@ -454,16 +574,25 @@ class PaperAccountDB:
         drawdown_pct. Empty dict if ensure_account_meta() was never called."""
         with self._conn() as conn:
             meta = conn.execute(
-                "SELECT starting_balance, peak_equity FROM account_meta WHERE id=1"
+                "SELECT starting_balance, peak_equity, ticker FROM account_meta WHERE id=1"
             ).fetchone()
             if meta is None:
                 return {}
             starting_balance = meta["starting_balance"]
             peak_equity = meta["peak_equity"]
-            realized = conn.execute(
-                "SELECT COALESCE(SUM(pnl_gbp), 0) FROM positions "
-                "WHERE status='closed' AND pnl_gbp IS NOT NULL"
-            ).fetchone()[0]
+            # P2-105 (BUG-09): scope to this account's own ticker; see
+            # close_position() for why a NULL ticker falls back unscoped.
+            if meta["ticker"]:
+                realized = conn.execute(
+                    "SELECT COALESCE(SUM(pnl_gbp), 0) FROM positions "
+                    "WHERE status='closed' AND pnl_gbp IS NOT NULL AND ticker=?",
+                    (meta["ticker"],)
+                ).fetchone()[0]
+            else:
+                realized = conn.execute(
+                    "SELECT COALESCE(SUM(pnl_gbp), 0) FROM positions "
+                    "WHERE status='closed' AND pnl_gbp IS NOT NULL"
+                ).fetchone()[0]
             current_equity = starting_balance + realized
             if current_equity > peak_equity:
                 peak_equity = current_equity
@@ -579,14 +708,34 @@ class PaperAccountDB:
 # MARKET DATA HELPERS
 # ===========================================================================
 
-def _now_est(cfg: dict) -> datetime:
-    return datetime.utcnow() + timedelta(hours=cfg["tz_offset_hours"])
+def _utcnow() -> datetime:
+    """Naive UTC 'now' — same value and naive-comparability as the removed
+    datetime.utcnow(), via the non-deprecated timezone-aware path. Every
+    stored timestamp in this project (heartbeat.ts, positions.opened_at,
+    etc.) is naive UTC text; this keeps that format unchanged."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _now_market(cfg: dict) -> datetime:
+    """Current time in the configured market's timezone
+    (cfg["market_timezone"], default "America/New_York" for the NYSE
+    pilot). Renamed from the NYSE-specific _now_et()/_now_est() (P2-112)
+    so the engine isn't hardcoded to one market's clock — trading a
+    different session (UK, EU, Asia) means changing market_timezone in
+    CONFIG, plus supplying that market's real holiday calendar in
+    market_calendar.py's EQUITIES_MARKETS registry. This function alone
+    handles the timezone/DST arithmetic correctly for whatever zone is
+    configured — it was previously hardcoded to zoneinfo("America/
+    New_York") directly, which handled EST/EDT correctly but only for
+    NYSE specifically, the same class of hardcoding that caused the
+    original DST bug this project had before P2-108."""
+    return datetime.now(ZoneInfo(cfg.get("market_timezone", "America/New_York")))
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return _utcnow().isoformat(timespec="seconds")
 
 def _in_session(cfg: dict) -> bool:
-    t = _now_est(cfg).time()
+    t = _now_market(cfg).time()
     return cfg["session_start"] <= t <= cfg["session_end"]
 
 def _flatten(df: pd.DataFrame) -> pd.DataFrame:
@@ -599,28 +748,86 @@ def _fetch_live(ticker: str) -> pd.DataFrame:
                      auto_adjust=True, progress=False)
     return _flatten(df)
 
+def _drop_forming_bar(df_5m: pd.DataFrame) -> pd.DataFrame:
+    """P2-105 item 7 (bar-phase asymmetry): yfinance 5-minute bars are
+    timestamped at their START. If "now" hasn't yet reached
+    (last_bar_start + 5min), that last bar is still forming — its Close
+    reflects only a partial window and can show a spurious breakout that
+    reverses before the bar actually settles.
+
+    Confirmed empirically (not just theoretically) against 7 real trading
+    days of 1-minute bars: reconstructing what a forming bar looked like
+    at each minute and comparing its gate decision to the eventual
+    settled bar found 9 disagreements out of 602 minute-by-minute checks
+    — all clustered in one 11-minute choppy stretch on one of the 7 days,
+    where price was oscillating back and forth across the ORB boundary.
+    Rare, but real.
+
+    Used ONLY for entry evaluation (evaluate_signals), not for exit
+    checks (manage_open_position) — a stop or target should react to the
+    live price immediately; waiting for bar-close there would add
+    latency to risk management instead of removing false signals. This
+    is a narrower fix than "always drop iloc[-1]": it only trims when the
+    last bar genuinely hasn't reached its 5-minute mark yet, so it adds
+    no lag on ticks where yfinance has already returned a settled bar.
+    """
+    if df_5m.empty:
+        return df_5m
+    last_bar_start = df_5m.index[-1]
+    now = (pd.Timestamp.now(tz=last_bar_start.tz) if last_bar_start.tzinfo is not None
+           else pd.Timestamp.now())
+    if now < last_bar_start + pd.Timedelta(minutes=5):
+        return df_5m.iloc[:-1]
+    return df_5m
+
 def _fetch_daily(ticker: str) -> pd.DataFrame:
     df = yf.download(ticker, period="20d", interval="1d",
                      auto_adjust=True, progress=False)
     return _flatten(df)
 
-def _vwap(df: pd.DataFrame) -> pd.Series:
+def _vwap(df: pd.DataFrame, session_start: Time = Time(9, 30)) -> pd.Series:
+    # P2-112 follow-up: session_start defaults to the pilot's 9:30 (NYSE
+    # open) for backward compatibility, but every call site below passes
+    # cfg["session_start"] explicitly — a future non-NYSE market_type
+    # changes this correctly instead of VWAP silently still anchoring to
+    # 9:30 regardless of what session_start is actually configured to.
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
     pv = tp * df["Volume"]
     result = pd.Series(index=df.index, dtype=float)
     for day in set(df.index.date):
-        mask = (df.index.date == day) & (df.index.time >= Time(9, 30))
+        mask = (df.index.date == day) & (df.index.time >= session_start)
         cv = df["Volume"][mask].cumsum()
         result[mask] = (pv[mask].cumsum() / cv.replace(0, float("nan"))).values
     return result
 
-def _orb_range(df: pd.DataFrame, method: str) -> dict | None:
-    end_map = {"5min": Time(9, 34), "15min": Time(9, 44), "30min": Time(9, 55)}
-    end_t = end_map.get(method)
-    if not end_t:
+# P2-112 follow-up: ORB formation window end, as an OFFSET in minutes from
+# session_start, per method — preserves the exact original NYSE-pilot end
+# times (9:34/9:44/9:55 at a 9:30 open) as data rather than a derived
+# formula. These three offsets are NOT a clean N-1 pattern (4, 14, 25 —
+# not 4, 14, 29) — tested this before assuming a formula and a "session_
+# start + (minutes-1)" derivation would have silently widened the 30min
+# ORB's window by 4 minutes (9:59 instead of 9:55), a real behavioral
+# change, not just a refactor. Keeping the offsets as explicit data avoids
+# that trap for whatever a future market's own offsets turn out to be too.
+_ORB_METHOD_OFFSET_MIN: dict[str, int] = {"5min": 4, "15min": 14, "30min": 25}
+
+def _orb_range(df: pd.DataFrame, method: str,
+               session_start: Time = Time(9, 30)) -> dict | None:
+    if df.empty:
+        # An external review claimed this was already safely guarded —
+        # tested directly and it wasn't: df.index[-1] on an empty frame
+        # raises IndexError. _drop_forming_bar() (P2-105 item 7) can now
+        # produce an empty frame if a live fetch ever returns unusually
+        # little data, so this guard is newly reachable, not just
+        # theoretical.
         return None
+    offset = _ORB_METHOD_OFFSET_MIN.get(method)
+    if offset is None:
+        return None
+    end_t = (datetime.combine(date.today(), session_start)
+              + timedelta(minutes=offset)).time()
     today = df.index[-1].date()
-    mask = (df.index.date == today) & (df.index.time >= Time(9, 30)) & (df.index.time <= end_t)
+    mask = (df.index.date == today) & (df.index.time >= session_start) & (df.index.time <= end_t)
     bars = df[mask]
     if bars.empty:
         return None
@@ -633,6 +840,17 @@ def _orb_range(df: pd.DataFrame, method: str) -> dict | None:
 
 def _vwap_slope(vwap: pd.Series, lookback: int = 3) -> dict:
     clean = vwap.dropna()
+    if clean.empty:
+        return {"slope": 0.0, "direction": "flat"}
+    # P2-105 (BUG-08): without this, clean.iloc[-lookback:] can reach back
+    # across the overnight gap early in a session (e.g. at 09:35 with only
+    # 2 bars accumulated since today's open, lookback=3 pulls in
+    # yesterday's 15:55 close) — confirmed empirically against real data.
+    # Restricting to today's bars means an early session correctly reports
+    # "flat" via the len(clean) < lookback guard below, rather than a
+    # slope driven by the gap instead of today's actual momentum.
+    today = clean.index[-1].date()
+    clean = clean[clean.index.date == today]
     if len(clean) < lookback:
         return {"slope": 0.0, "direction": "flat"}
     recent = clean.iloc[-lookback:]
@@ -679,7 +897,7 @@ def evaluate_signals(df_5m: pd.DataFrame, df_1d: pd.DataFrame,
     """
     ctx: dict[str, Any] = {
         "ts":           _now_iso(),
-        "session_date": str(datetime.utcnow().date()),
+        "session_date": str(_utcnow().date()),
         "ticker":       cfg["ticker"],
         "action":       "EVALUATE",
         "orb_method":   cfg["orb_method"],
@@ -694,11 +912,16 @@ def evaluate_signals(df_5m: pd.DataFrame, df_1d: pd.DataFrame,
     except Exception:
         ctx["vix"] = None
 
-    if len(df_1d) >= 2:
+    if len(df_1d) >= 2 and not df_5m.empty:
         pdh = float(df_1d["High"].iloc[-2])
         pdl = float(df_1d["Low"].iloc[-2])
         prev_close = float(df_1d["Close"].iloc[-2])
-        today_open = float(df_5m["Open"].iloc[0]) if not df_5m.empty else prev_close
+        # df_5m spans 5 trading days (_fetch_live's period="5d") — iloc[0]
+        # is 5 days ago's open, not today's. Same today-filtering pattern
+        # already used by _orb_range() and the RVOL calculation below.
+        today = df_5m.index[-1].date()
+        df_today = df_5m[df_5m.index.date == today]
+        today_open = float(df_today["Open"].iloc[0]) if not df_today.empty else prev_close
         ctx["gap_pct"] = round((today_open - prev_close) / prev_close * 100, 3)
     else:
         ctx["gap_pct"] = None
@@ -712,20 +935,26 @@ def evaluate_signals(df_5m: pd.DataFrame, df_1d: pd.DataFrame,
     vs = _vwap_slope(vwap, lookback=cfg.get("vwap_lookback", 3))
     ctx["vwap_slope"] = vs["direction"]
 
-    orb = _orb_range(df_5m, cfg["orb_method"])
+    orb = _orb_range(df_5m, cfg["orb_method"], cfg["session_start"])
     ctx["orb_high"]      = orb["orb_high"]  if orb else None
     ctx["orb_low"]       = orb["orb_low"]   if orb else None
     ctx["orb_bars_used"] = orb["bars_used"] if orb else None
 
     # RVOL estimation from 5-min data
     try:
+        # P2-112 follow-up: "first 5 minutes" cutoff derived from
+        # session_start using the same offset _orb_range() uses for the
+        # 5min method, instead of hardcoding 9:34 (only correct for a
+        # 9:30 open).
+        first5_end = (datetime.combine(date.today(), cfg["session_start"])
+                       + timedelta(minutes=_ORB_METHOD_OFFSET_MIN["5min"])).time()
         today = df_5m.index[-1].date()
         df_today = df_5m[df_5m.index.date == today]
-        first5 = df_today[df_today.index.time <= Time(9, 34)]
+        first5 = df_today[df_today.index.time <= first5_end]
         past_days = [d for d in set(df_5m.index.date) if d != today]
         avg_first5_vols = []
         for d in past_days:
-            dd = df_5m[(df_5m.index.date == d) & (df_5m.index.time <= Time(9, 34))]
+            dd = df_5m[(df_5m.index.date == d) & (df_5m.index.time <= first5_end)]
             if not dd.empty:
                 avg_first5_vols.append(float(dd["Volume"].sum()))
         avg_first5 = statistics.mean(avg_first5_vols) if avg_first5_vols else 1.0
@@ -885,42 +1114,83 @@ def manage_open_position(pos: dict, df_5m: pd.DataFrame,
     """
     Check an open position for exit conditions each bar.
     Returns: 'exited' | 'continue' | 'stop_moved'
+
+    P2-105: R is now anchored to the immutable initial_stop captured at
+    entry (r0) — never recomputed from the current/trailed stop_price.
+    The old `risk_dist = abs(entry - stop)` made (stop-entry)/risk_dist
+    mathematically collapse to exactly +-1.0 on every single stop-hit
+    exit, trailed or not (BUG-02, "the signum trap" — confirmed with
+    concrete numbers: a stop trailed to lock in $3 of a $5 R0 showed
+    +1.0R, not the true +0.6R). Cash P&L is now computed directly from
+    (exit-entry)*units*direction (BUG-03) instead of the old fixed
+    actual_r * account * risk_pct, which ignored the trade's actual
+    (possibly VIX/Kelly-scaled) size entirely.
     """
-    last_close = float(df_5m["Close"].dropna().iloc[-1])
-    direction  = pos["direction"]
-    entry      = pos["entry_price"]
-    stop       = pos["stop_price"]
+    last_close   = float(df_5m["Close"].dropna().iloc[-1])
+    direction    = pos["direction"]
+    entry        = pos["entry_price"]
+    stop         = pos["stop_price"]
+    initial_stop = pos.get("initial_stop") or pos["stop_price"]
+    units        = pos["units"]
     t1 = pos.get("target_1r")
-    risk_dist  = abs(entry - stop)
-    actual_r   = ((last_close - entry) / risk_dist *
-                   (1 if direction == "long" else -1))
+
+    r0 = abs(entry - initial_stop)
+
+    # P2-105 (BUG-05): guard against a corrupted/zero-risk position
+    # crashing the tick with an unhandled ZeroDivisionError. Previously
+    # unguarded — manage_open_position() isn't wrapped in try/except at
+    # its _tick() call site, so this would have killed the process
+    # (runner.py's restart/backoff would catch it, but better not to
+    # crash at all).
+    if r0 < 1e-6:
+        log.critical("Position #%d has invalid initial risk r0=0. Force-closing.", pos["id"])
+        _exit_position(pos, last_close, "corrupted_r0_abort", 0.0, 0.0, db, cfg, session)
+        return "exited"
 
     # ── Check stop hit ──
     if direction == "long" and last_close <= stop:
-        actual_r_final = round((stop - entry) / risk_dist * -1, 3)
-        _exit_position(pos, stop, "trailing_stop", actual_r_final, db, cfg, session)
-        log.info("STOP HIT: %s at $%.2f  actual_r=%.2f",
-                 pos["ticker"], stop, actual_r_final)
+        actual_r, pnl_gbp = _calc_exit(entry, stop, direction, r0, units)
+        _exit_position(pos, stop, "trailing_stop", actual_r, pnl_gbp, db, cfg, session)
+        log.info("STOP HIT: %s at $%.2f  actual_r=%.2f  pnl=£%.2f",
+                 pos["ticker"], stop, actual_r, pnl_gbp)
         return "exited"
     if direction == "short" and last_close >= stop:
-        actual_r_final = round((entry - stop) / risk_dist * -1, 3)
-        _exit_position(pos, stop, "trailing_stop", actual_r_final, db, cfg, session)
-        log.info("STOP HIT (short): %s at $%.2f  actual_r=%.2f",
-                 pos["ticker"], stop, actual_r_final)
+        actual_r, pnl_gbp = _calc_exit(entry, stop, direction, r0, units)
+        _exit_position(pos, stop, "trailing_stop", actual_r, pnl_gbp, db, cfg, session)
+        log.info("STOP HIT (short): %s at $%.2f  actual_r=%.2f  pnl=£%.2f",
+                 pos["ticker"], stop, actual_r, pnl_gbp)
         return "exited"
 
     # ── Check 1R target (first ladder) ──
     if t1 and direction == "long" and last_close >= t1:
-        actual_r_final = round((t1 - entry) / risk_dist, 3)
-        _exit_position(pos, t1, "target_1r", actual_r_final, db, cfg, session)
-        log.info("TARGET 1R: %s at $%.2f  actual_r=%.2f",
-                 pos["ticker"], t1, actual_r_final)
+        actual_r, pnl_gbp = _calc_exit(entry, t1, direction, r0, units)
+        _exit_position(pos, t1, "target_1r", actual_r, pnl_gbp, db, cfg, session)
+        log.info("TARGET 1R: %s at $%.2f  actual_r=%.2f  pnl=£%.2f",
+                 pos["ticker"], t1, actual_r, pnl_gbp)
         return "exited"
     if t1 and direction == "short" and last_close <= t1:
-        actual_r_final = round((entry - t1) / risk_dist, 3)
-        _exit_position(pos, t1, "target_1r", actual_r_final, db, cfg, session)
-        log.info("TARGET 1R (short): %s at $%.2f  actual_r=%.2f",
-                 pos["ticker"], t1, actual_r_final)
+        actual_r, pnl_gbp = _calc_exit(entry, t1, direction, r0, units)
+        _exit_position(pos, t1, "target_1r", actual_r, pnl_gbp, db, cfg, session)
+        log.info("TARGET 1R (short): %s at $%.2f  actual_r=%.2f  pnl=£%.2f",
+                 pos["ticker"], t1, actual_r, pnl_gbp)
+        return "exited"
+
+    # ── End-of-session close ──
+    # Checked BEFORE the trailing-stop update below (not after, as this
+    # function originally had it) — a trailing stop update returns early
+    # with "stop_moved" whenever the stop actually moves, which would
+    # otherwise skip past a session-end close that should have fired on
+    # the very same poll. Confirmed reproducible: a position open at
+    # 11:05 with VWAP having drifted since the last check would return
+    # "stop_moved" and never reach the EOD block below, leaving it open
+    # past session_end until some later poll happened to see no VWAP
+    # movement.
+    now_t = _now_market(cfg).time()
+    if now_t >= cfg["session_end"]:
+        actual_r, pnl_gbp = _calc_exit(entry, last_close, direction, r0, units)
+        _exit_position(pos, last_close, "eod", actual_r, pnl_gbp, db, cfg, session)
+        log.info("EOD CLOSE: %s at $%.2f  actual_r=%.2f  pnl=£%.2f",
+                 pos["ticker"], last_close, actual_r, pnl_gbp)
         return "exited"
 
     # ── Update VWAP trailing stop ──
@@ -934,27 +1204,33 @@ def manage_open_position(pos: dict, df_5m: pd.DataFrame,
                           stop, new_stop, vwap_val)
                 return "stop_moved"
 
-    # ── End-of-session close ──
-    now_t = _now_est(cfg).time()
-    if now_t >= cfg["session_end"]:
-        actual_r_final = round(actual_r, 3)
-        _exit_position(pos, last_close, "eod", actual_r_final, db, cfg, session)
-        log.info("EOD CLOSE: %s at $%.2f  actual_r=%.2f",
-                 pos["ticker"], last_close, actual_r_final)
-        return "exited"
-
     return "continue"
 
 
+def _calc_exit(entry: float, exit_price: float, direction: str,
+               r0: float, units: float) -> tuple[float, float]:
+    """P2-105 (BUG-02/03): direct unit cash accounting, R normalized
+    against the immutable initial risk r0 — never the current/trailed
+    stop distance. `units` cancels out of actual_r algebraically
+    (pnl_gbp/(r0*units) = (exit-entry)*mult/r0), so R stays properly
+    size-independent while pnl_gbp correctly scales with the trade's
+    actual (possibly VIX/Kelly-reduced) size — verified against an
+    external audit's test suite before implementing this exact formula."""
+    mult = 1.0 if direction == "long" else -1.0
+    pnl_gbp = round((exit_price - entry) * units * mult, 2)
+    cash_risk = r0 * units
+    actual_r = round(pnl_gbp / cash_risk, 3) if cash_risk > 1e-6 else 0.0
+    return actual_r, pnl_gbp
+
+
 def _exit_position(pos: dict, exit_price: float, reason: str,
-                    actual_r: float, db: PaperAccountDB,
+                    actual_r: float, pnl_gbp: float, db: PaperAccountDB,
                     cfg: dict, session: dict) -> None:
-    pnl_gbp = actual_r * cfg["account_balance"] * cfg["risk_pct"]
     db.close_position(pos["id"], exit_price, reason, actual_r, pnl_gbp)
     level = "TRADE" if actual_r > 0 else "WARN"
     _notify(cfg,
             f"EXIT #{pos['id']} {pos['ticker']} {pos['direction']} "
-            f"@ ${exit_price:.2f}  {actual_r:+.2f}R  reason={reason}  "
+            f"@ ${exit_price:.2f}  {actual_r:+.2f}R  £{pnl_gbp:+.2f}  reason={reason}  "
             f"session_pnl={session['pnl_r']+actual_r:+.2f}R", level)
     session["pnl_r"]   += actual_r
     session["pnl_gbp"] += pnl_gbp
@@ -1074,6 +1350,116 @@ def wfa_run(
     return results
 
 
+def wfa_run_5m(
+    ticker: str,
+    db: PaperAccountDB,
+    cfg: dict,
+    is_days: int = 25,
+    oos_days: int = 10,
+    n_splits: int = 3,
+) -> list[dict]:
+    """
+    Walk-Forward Analysis using REAL 5-minute bars and the engine's actual
+    two-gate signal logic + exit priority, via _backtest_orb_full_gate().
+
+    This is the faithful counterpart to wfa_run() (hourly bars, a single-
+    gate one-trade/day approximation via _backtest_orb_simple()) — that
+    one stays as-is, it's still useful as a fast, long-horizon rough
+    sanity check. This one answers a different question: does the ACTUAL
+    2-gate strategy, on the resolution it actually trades at, hold up
+    walk-forward.
+
+    yfinance caps 5-minute intraday history at roughly 60 calendar days
+    (~40 trading days) — nowhere near enough for wfa_run()'s 6-month IS /
+    1-month OOS / 6-split design. Windows here are sized in trading days
+    to fit that budget instead; n_splits will silently come back short of
+    the requested count once the data runs out (same behaviour as
+    wfa_run()'s own index-exhaustion check).
+
+    Results are tagged strategy_ver="2.1.0-5m-fullgate" in wfa_results so
+    they're never conflated with wfa_run()'s hourly-proxy rows — the two
+    use different bar resolutions, different gate counts, and different
+    window sizes, and averaging or comparing them directly would be
+    meaningless.
+    """
+    log.info("WFA (5m, full-gate) starting: up to %d splits, IS=%dd, OOS=%dd",
+              n_splits, is_days, oos_days)
+
+    df_raw = _flatten(yf.download(ticker, period="60d", interval="5m",
+                                   auto_adjust=True, progress=False))
+    if df_raw.empty:
+        log.error("WFA (5m): no data for %s", ticker)
+        return []
+
+    run_ts  = _now_iso()
+    results = []
+    all_dates = sorted(set(df_raw.index.date))
+
+    for split_idx in range(n_splits):
+        oos_end_idx   = len(all_dates) - 1 - split_idx * oos_days
+        oos_start_idx = oos_end_idx - oos_days + 1
+        is_end_idx    = oos_start_idx - 1
+        is_start_idx  = max(0, is_end_idx - is_days + 1)
+
+        if is_start_idx >= is_end_idx or oos_start_idx > oos_end_idx or oos_start_idx < 0:
+            log.info("WFA (5m): out of data for split %d/%d — stopping (got %d splits)",
+                      split_idx + 1, n_splits, len(results))
+            break
+
+        is_start, is_end   = all_dates[is_start_idx], all_dates[is_end_idx]
+        oos_start, oos_end = all_dates[oos_start_idx], all_dates[oos_end_idx]
+
+        def _slice(start: date, end: date) -> pd.DataFrame:
+            return df_raw[(df_raw.index.date >= start) & (df_raw.index.date <= end)].copy()
+
+        is_metrics  = _backtest_orb_full_gate(_slice(is_start,  is_end),  cfg)
+        oos_metrics = _backtest_orb_full_gate(_slice(oos_start, oos_end), cfg)
+
+        is_sharpe  = is_metrics.get("sharpe")  or 0.0
+        oos_sharpe = oos_metrics.get("sharpe") or 0.0
+        wfe        = round(oos_sharpe / is_sharpe, 3) if is_sharpe > 0.01 else None
+        verdict    = ("PASS" if wfe and wfe >= 0.5 else
+                      "FAIL" if wfe is not None else "INCONCLUSIVE")
+
+        result = {
+            "run_ts":       run_ts,
+            "ticker":       ticker,
+            "strategy_ver": "2.1.0-5m-fullgate",
+            "config_json":  json.dumps({"orb_method": cfg["orb_method"],
+                                         "target_rr": cfg["target_rr"],
+                                         "is_days": is_days, "oos_days": oos_days}),
+            "is_start":     str(is_start),
+            "is_end":       str(is_end),
+            "oos_start":    str(oos_start),
+            "oos_end":      str(oos_end),
+            "n_is_trades":  is_metrics.get("n", 0),
+            "n_oos_trades": oos_metrics.get("n", 0),
+            "is_sharpe":    is_sharpe,
+            "oos_sharpe":   oos_sharpe,
+            "is_max_dd":    is_metrics.get("max_dd"),
+            "oos_max_dd":   oos_metrics.get("max_dd"),
+            "is_win_rate":  is_metrics.get("wr"),
+            "oos_win_rate": oos_metrics.get("wr"),
+            "wfe":          wfe,
+            "wfe_verdict":  verdict,
+        }
+        db.save_wfa_result(result)
+        results.append(result)
+
+        log.info(
+            "WFA(5m) split %d/%d  IS[%s→%s] n=%d SR=%.2f  OOS[%s→%s] n=%d SR=%.2f  WFE=%s  %s",
+            split_idx + 1, n_splits,
+            is_start, is_end, is_metrics.get("n", 0), is_sharpe,
+            oos_start, oos_end, oos_metrics.get("n", 0), oos_sharpe,
+            f"{wfe:.2f}" if wfe else "N/A", verdict
+        )
+
+    valid = [r["wfe"] for r in results if r["wfe"] is not None]
+    mean_wfe = round(statistics.mean(valid), 3) if valid else None
+    log.info("WFA(5m) complete. Mean WFE: %s (target > 0.5)", mean_wfe)
+    return results
+
+
 def _backtest_orb_simple(df: pd.DataFrame, cfg: dict) -> dict:
     """
     Minimal ORB backtest on hourly data for WFA.
@@ -1095,7 +1481,7 @@ def _backtest_orb_simple(df: pd.DataFrame, cfg: dict) -> dict:
 
     for day in sorted(set(df.index.date)):
         day_df  = df[df.index.date == day]
-        session = day_df[day_df.index.time >= Time(9, 30)]
+        session = day_df[day_df.index.time >= cfg["session_start"]]
         if len(session) < 2:
             continue
 
@@ -1162,6 +1548,513 @@ def _backtest_orb_simple(df: pd.DataFrame, cfg: dict) -> dict:
     return {"n": n, "wr": round(wr, 3), "aw": round(aw, 3), "al": round(al, 3),
             "ev": round(ev, 3), "sharpe": sharpe, "max_dd": round(abs(worst), 3),
             "avg_cost_r": round(statistics.mean(cost_r_list), 4) if cost_r_list else 0.0}
+
+
+def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
+                             exit_mode: str = "baseline") -> dict:
+    """
+    Full-gate ORB backtest on REAL 5-minute bars (added for the 5-minute
+    WFA variant — see wfa_run_5m()).
+
+    Replays the SAME two gates evaluate_signals() actually enforces —
+    ORB breakout direction + VWAP-slope confirmation. gate_retest is
+    intentionally NOT replicated: in the live engine it's hardcoded to
+    "WAIT" and never enters the AND-gate condition (see evaluate_signals,
+    "AND-gate" section) — it's a dashboard-only human-confirmation field,
+    not something trading_engine.py itself requires. Replicating it here
+    would make this backtest MORE restrictive than the code it's meant
+    to test.
+
+    Reuses the live engine's own _orb_range(), _vwap(), _vwap_slope(),
+    and _vwap_trailing() functions unmodified — fed only bars available
+    as-of each simulated timestamp (no look-ahead) — rather than
+    reimplementing their logic. EOD is judged against each bar's own
+    timestamp instead of live wall-clock, since this is replaying the past.
+
+    Deliberately NOT replicated: evaluate_signals()'s live VIX fetch and
+    compute_entry_params()'s VIX-based position-size modifier + Kelly
+    sizing + full broker cost/reject-reason model. None of those affect
+    WHETHER or WHEN a trade fires (VIX only scales size in the live
+    code), so they're out of scope for a signal-timing backtest — same
+    simplification _backtest_orb_simple() already makes for sizing, kept
+    here for consistency. Cost model is the same realistic_backtest_cost
+    (or flat 0.05R fallback) both backtests use.
+
+    Unlike _backtest_orb_simple() (one trade/day, breaks after the
+    first), this allows re-entry the same day after an exit, matching
+    the live engine's actual behaviour — _tick() re-evaluates for a new
+    signal immediately after a position closes, within the same session.
+
+    Also faithfully replicates a live characteristic worth knowing about
+    rather than quietly "fixing": _orb_range() has no formation-complete
+    gate — it computes high/low from whatever bars fall in the window so
+    far, so a breakout can fire mid-formation on a partial range. That's
+    the live engine's actual behaviour, not a bug in this replay.
+
+    exit_mode (P2-106 exit-restructuring experiment — pre-registered
+    hypothesis: current 1R flat exit caps the right tail; a strategy with
+    a sub-50% win rate needs bigger winners to survive realistic friction.
+    Entry/gate logic is IDENTICAL across all three modes — this only
+    changes what happens once in a trade, so any difference in results
+    isolates the exit rule's effect, not a signal-quality difference):
+      "baseline"       — current live behaviour: flat 1R target, VWAP
+                          trailing stop active from the moment of entry.
+      "fixed_1_5r"      — Candidate A: flat 1.5R target, NO trailing stop
+                          at all (stop stays at the initial structural
+                          stop for the life of the trade).
+      "trail_after_1r"  — Candidate B: no fixed target. Stop stays at the
+                          initial structural stop until price reaches
+                          +1R, then VWAP trailing arms and the trade rides
+                          until the trailing stop is hit or EOD.
+
+    Returns the same metrics shape as _backtest_orb_simple() so both feed
+    the same WFA split/verdict logic.
+    """
+    if exit_mode not in ("baseline", "fixed_1_5r", "trail_after_1r"):
+        raise ValueError(f"Unknown exit_mode: {exit_mode!r}")
+
+    if df_5m.empty:
+        return {}
+
+    broker   = cfg.get("broker", "alpaca")
+    account  = cfg.get("account_balance", 10_000.0)
+    risk_pct = cfg.get("risk_pct", 0.01)
+    adv      = cfg.get("avg_daily_volume", 150_000_000)
+    orb_method    = cfg["orb_method"]
+    vwap_lookback = cfg.get("vwap_lookback", 3)
+    use_trailing  = cfg.get("use_vwap_trailing", True) and exit_mode != "fixed_1_5r"
+
+    r_multiples: list[float] = []
+    cost_r_list: list[float] = []
+    trades: list[dict] = []   # P2-116: full per-trade records, not just R-multiples —
+                               # lets this be the single canonical simulator for any
+                               # downstream consumer (Markov chain, N-gram, journaling),
+                               # not just summary WFA metrics.
+
+    for day in sorted(set(df_5m.index.date)):
+        day_bars = df_5m[df_5m.index.date == day]
+        session_bars = day_bars[(day_bars.index.time >= cfg["session_start"]) &
+                                 (day_bars.index.time <= cfg["session_end"])]
+        if session_bars.empty:
+            continue
+
+        in_position = False
+        direction = stop = entry = t1 = risk_dist = None
+        trail_armed = False   # only meaningful for "trail_after_1r"
+        entry_meta: dict = {}
+
+        for bar_ts, bar in session_bars.iterrows():
+            asof_today = df_5m[(df_5m.index <= bar_ts) & (df_5m.index.date == day)]
+            last_close = float(bar["Close"])
+
+            if not in_position:
+                orb = _orb_range(asof_today, orb_method, cfg["session_start"])  # real function, unmodified
+                if orb is None:
+                    continue
+
+                # Gate 1: ORB breakout — mirrors evaluate_signals exactly
+                if last_close > orb["orb_high"]:
+                    breakout_dir = "long"
+                elif last_close < orb["orb_low"]:
+                    breakout_dir = "short"
+                else:
+                    continue
+
+                # Gate 2: VWAP slope aligned — mirrors evaluate_signals exactly
+                vwap_series = _vwap(asof_today, cfg["session_start"])         # real function, unmodified
+                vs = _vwap_slope(vwap_series, lookback=vwap_lookback)   # real function
+                gate_pass = ((breakout_dir == "long" and vs["direction"] == "up") or
+                             (breakout_dir == "short" and vs["direction"] == "down"))
+                if not gate_pass:
+                    continue
+
+                # Entry — mirrors compute_entry_params' stop/target math.
+                # Entry price, stop, and risk_dist are IDENTICAL across all
+                # three exit_modes — only what happens after entry differs.
+                risk_dist_orb = orb["orb_high"] - orb["orb_low"]
+                buffer = max(risk_dist_orb * 0.1, 0.02)
+                direction = breakout_dir
+                entry = last_close
+                stop  = (round(orb["orb_low"]  - buffer, 4) if direction == "long"
+                         else round(orb["orb_high"] + buffer, 4))
+                risk_dist = abs(entry - stop)
+                if risk_dist <= 1e-6:
+                    direction = None
+                    continue
+                target_mult = 1.5 if exit_mode == "fixed_1_5r" else 1.0
+                t1 = (entry + risk_dist * target_mult if direction == "long"
+                      else entry - risk_dist * target_mult)
+                trail_armed = (exit_mode != "trail_after_1r")  # baseline/fixed_1_5r: on immediately
+                in_position = True
+                # Per-trade record metadata captured at entry, for
+                # downstream consumers (Markov/N-gram) that need more than
+                # just the R-multiple.
+                entry_body = abs(float(bar["Close"]) - float(bar["Open"]))
+                entry_range = max(float(bar["High"]) - float(bar["Low"]), 1e-6)
+                entry_body_pct = entry_body / entry_range * 100
+                entry_meta = {
+                    "session_date": str(day),
+                    "entry_ts": bar_ts,
+                    "direction": direction,
+                    "entry_price": round(entry, 4),
+                    "stop_price": round(stop, 4),
+                    "entry_candle_body_pct": round(entry_body_pct, 1),
+                    "entry_candle_type": (
+                        "strong_bull" if entry_body_pct > 60 and direction == "long" else
+                        "strong_bear" if entry_body_pct > 60 and direction == "short" else
+                        "doji" if entry_body_pct < 20 else "moderate"),
+                    "vwap_slope_at_entry": vs["direction"],
+                }
+                continue   # opened on this bar's close; manage from the next bar
+
+            # ── In position ──
+            exit_reason = exit_r = None
+            has_fixed_target = exit_mode in ("baseline", "fixed_1_5r")
+
+            if direction == "long" and last_close <= stop:
+                exit_reason, exit_r = "trailing_stop", (stop - entry) / risk_dist
+            elif direction == "short" and last_close >= stop:
+                exit_reason, exit_r = "trailing_stop", (entry - stop) / risk_dist
+            elif has_fixed_target and direction == "long" and last_close >= t1:
+                exit_reason, exit_r = "target_hit", (t1 - entry) / risk_dist
+            elif has_fixed_target and direction == "short" and last_close <= t1:
+                exit_reason, exit_r = "target_hit", (entry - t1) / risk_dist
+            else:
+                # trail_after_1r: arm once price reaches the +1R marker (t1
+                # is still the +1R level here even though there's no fixed
+                # target to exit at — it's reused purely as the arming
+                # threshold, never checked as an exit condition itself)
+                if exit_mode == "trail_after_1r" and not trail_armed:
+                    if ((direction == "long" and last_close >= t1) or
+                        (direction == "short" and last_close <= t1)):
+                        trail_armed = True
+
+                if use_trailing and trail_armed:
+                    vwap_series = _vwap(asof_today, cfg["session_start"])
+                    vwap_val = (float(vwap_series.dropna().iloc[-1])
+                                if not vwap_series.dropna().empty else None)
+                    if vwap_val:
+                        stop = _vwap_trailing(stop, vwap_val, direction)   # real function
+                if bar_ts.time() >= cfg["session_end"]:
+                    exit_reason = "eod"
+                    exit_r = ((last_close - entry) / risk_dist *
+                              (1 if direction == "long" else -1))
+
+            if exit_reason is not None:
+                units = (account * risk_pct) / risk_dist if risk_dist > 1e-6 else 0.0
+                if TOOLKIT:
+                    try:
+                        cost_r = tk.realistic_backtest_cost(
+                            entry, units, account * risk_pct, adv, broker)
+                    except Exception:
+                        cost_r = 0.05
+                else:
+                    cost_r = 0.05
+                net_r = exit_r - cost_r
+                r_multiples.append(net_r)
+                cost_r_list.append(cost_r)
+                exit_price = (stop if exit_reason == "trailing_stop" else
+                              t1 if exit_reason == "target_hit" else last_close)
+                trades.append({
+                    **entry_meta,
+                    "exit_ts":     bar_ts,
+                    "exit_price":  round(exit_price, 4),
+                    "actual_r":    net_r,   # unrounded — must exactly match the
+                                            # corresponding r_multiples entry
+                    "exit_reason": exit_reason,
+                })
+                in_position = False
+                direction = stop = entry = t1 = risk_dist = None
+                trail_armed = False
+                entry_meta = {}
+
+    if not r_multiples:
+        return {"n": 0}
+
+    n    = len(r_multiples)
+    wins = [r for r in r_multiples if r > 0]
+    wr   = len(wins) / n
+    aw   = statistics.mean(wins) if wins else 0.0
+    al   = abs(statistics.mean([r for r in r_multiples if r < 0])) if any(r < 0 for r in r_multiples) else 0.0
+    ev   = (wr * aw) - ((1 - wr) * al)
+
+    equity = [0.0]
+    for r in r_multiples:
+        equity.append(equity[-1] + r)
+    peak, worst = equity[0], 0.0
+    for v in equity:
+        peak  = max(peak, v); worst = min(worst, v - peak)
+
+    sharpe = None
+    if n >= 2:
+        sd = statistics.stdev(r_multiples)
+        if sd > 0:
+            sharpe = round(statistics.mean(r_multiples) / sd, 3)
+
+    return {"n": n, "wr": round(wr, 3), "aw": round(aw, 3), "al": round(al, 3),
+            "ev": round(ev, 3), "sharpe": sharpe, "max_dd": round(abs(worst), 3),
+            "avg_cost_r": round(statistics.mean(cost_r_list), 4) if cost_r_list else 0.0,
+            # raw per-trade returns, for downstream statistical analysis
+            # (e.g. DSR needs actual skew/kurtosis, not just summary stats)
+            "r_multiples": r_multiples,
+            # full per-trade records (P2-116) — session_date, direction,
+            # entry/exit price+time, exit_reason, candle/VWAP-slope context
+            # at entry. Lets this be the single canonical simulator for any
+            # downstream consumer (Markov chain, N-gram, trade journaling),
+            # not just WFA summary metrics. Both new keys are additive —
+            # existing callers only read the keys they already used.
+            "trades": trades}
+
+
+def _backtest_orb_fade(df_5m: pd.DataFrame, cfg: dict) -> dict:
+    """
+    ORB Liquidity-Sweep Fade (P2-114 follow-up) — the inverse of the
+    breakout strategy: instead of confirming a breakout with VWAP slope,
+    wait for a breakout to FAIL (price pokes past the ORB boundary then
+    the very next bar closes back inside the range) and fade it,
+    targeting session VWAP rather than a fixed R-multiple.
+
+    Pre-registered hypothesis, stated before running: a high win rate is
+    expected in choppy conditions where most failed breakouts genuinely
+    revert, but real tail risk is expected on trend days where the
+    "failure" doesn't hold and price continues — net expectancy is
+    genuinely uncertain until tested, not assumed positive just because
+    the win rate should be high.
+
+    Mechanics:
+      - Gate 1 (same trigger as the breakout strategy): last_close
+        crosses orb_high or orb_low.
+      - Confirmation (INVERTED from the breakout strategy): the very
+        NEXT bar's close must be back INSIDE the range. If instead the
+        breakout confirms (next bar closes further outside), no fade
+        trade is taken — this is exactly the case where fading would be
+        on the losing side of a real move.
+      - Entry: at the confirmation bar's close, opposite the original
+        breakout direction.
+      - Stop: just beyond the swept extreme (the high/low made during
+        the failed poke), same 10%-of-ORB-range buffer convention the
+        breakout strategy uses.
+      - Target: session VWAP at the moment of entry (the fade thesis is
+        "price reverts to fair value", not "price runs a measured
+        distance") — falls back to the ORB range midpoint if VWAP isn't
+        available yet.
+      - Exit priority: stop -> VWAP target -> EOD.
+
+    Reuses the same real _orb_range()/_vwap() functions as the breakout
+    backtest, fed only as-of-bar data — same no-lookahead discipline.
+    Allows multiple fade trades per day, matching the live engine's own
+    re-entry behavior. Returns the same metrics shape (including
+    r_multiples) as _backtest_orb_full_gate() so this can feed
+    _deflated_sharpe_ratio() the same way.
+    """
+    if df_5m.empty:
+        return {}
+
+    broker   = cfg.get("broker", "alpaca")
+    account  = cfg.get("account_balance", 10_000.0)
+    risk_pct = cfg.get("risk_pct", 0.01)
+    adv      = cfg.get("avg_daily_volume", 150_000_000)
+    orb_method = cfg["orb_method"]
+
+    r_multiples: list[float] = []
+    cost_r_list: list[float] = []
+
+    for day in sorted(set(df_5m.index.date)):
+        day_bars = df_5m[df_5m.index.date == day]
+        session_bars = day_bars[(day_bars.index.time >= cfg["session_start"]) &
+                                 (day_bars.index.time <= cfg["session_end"])]
+        if session_bars.empty:
+            continue
+
+        in_position = False
+        awaiting_confirmation = False
+        breakout_dir = None
+        swept_extreme = None
+        direction = stop = entry = target = risk_dist = None
+
+        for bar_ts, bar in session_bars.iterrows():
+            asof_today = df_5m[(df_5m.index <= bar_ts) & (df_5m.index.date == day)]
+            last_close = float(bar["Close"])
+            last_high  = float(bar["High"])
+            last_low   = float(bar["Low"])
+
+            if in_position:
+                exit_reason = exit_r = None
+                if direction == "long" and last_close <= stop:
+                    exit_reason, exit_r = "trailing_stop", (stop - entry) / risk_dist
+                elif direction == "short" and last_close >= stop:
+                    exit_reason, exit_r = "trailing_stop", (entry - stop) / risk_dist
+                elif direction == "long" and last_close >= target:
+                    exit_reason, exit_r = "vwap_target", (target - entry) / risk_dist
+                elif direction == "short" and last_close <= target:
+                    exit_reason, exit_r = "vwap_target", (entry - target) / risk_dist
+                elif bar_ts.time() >= cfg["session_end"]:
+                    exit_reason = "eod"
+                    exit_r = ((last_close - entry) / risk_dist *
+                              (1 if direction == "long" else -1))
+
+                if exit_reason is not None:
+                    units = (account * risk_pct) / risk_dist if risk_dist > 1e-6 else 0.0
+                    if TOOLKIT:
+                        try:
+                            cost_r = tk.realistic_backtest_cost(
+                                entry, units, account * risk_pct, adv, broker)
+                        except Exception:
+                            cost_r = 0.05
+                    else:
+                        cost_r = 0.05
+                    r_multiples.append(exit_r - cost_r)
+                    cost_r_list.append(cost_r)
+                    in_position = False
+                    direction = stop = entry = target = risk_dist = None
+                continue
+
+            if awaiting_confirmation:
+                orb = _orb_range(asof_today, orb_method, cfg["session_start"])
+                if orb is None:
+                    awaiting_confirmation = False
+                    continue
+                failed = ((breakout_dir == "long" and last_close < orb["orb_high"]) or
+                          (breakout_dir == "short" and last_close > orb["orb_low"]))
+                if failed:
+                    direction = "short" if breakout_dir == "long" else "long"
+                    entry = last_close
+                    buffer = max(orb["orb_size"] * 0.1, 0.02)
+                    stop = (round(swept_extreme + buffer, 4) if direction == "short"
+                            else round(swept_extreme - buffer, 4))
+                    risk_dist = abs(entry - stop)
+                    if risk_dist > 1e-6:
+                        vwap_series = _vwap(asof_today, cfg["session_start"])
+                        vwap_val = (float(vwap_series.dropna().iloc[-1])
+                                    if not vwap_series.dropna().empty else None)
+                        target = (vwap_val if vwap_val is not None
+                                  else (orb["orb_high"] + orb["orb_low"]) / 2)
+                        in_position = True
+                awaiting_confirmation = False
+                continue
+
+            # Not in a position, not awaiting confirmation — look for a
+            # fresh breakout poke to potentially fade.
+            orb = _orb_range(asof_today, orb_method, cfg["session_start"])
+            if orb is None:
+                continue
+            if last_close > orb["orb_high"]:
+                breakout_dir = "long"
+                swept_extreme = last_high
+                awaiting_confirmation = True
+            elif last_close < orb["orb_low"]:
+                breakout_dir = "short"
+                swept_extreme = last_low
+                awaiting_confirmation = True
+
+    if not r_multiples:
+        return {"n": 0}
+
+    n    = len(r_multiples)
+    wins = [r for r in r_multiples if r > 0]
+    wr   = len(wins) / n
+    aw   = statistics.mean(wins) if wins else 0.0
+    al   = abs(statistics.mean([r for r in r_multiples if r < 0])) if any(r < 0 for r in r_multiples) else 0.0
+    ev   = (wr * aw) - ((1 - wr) * al)
+
+    equity = [0.0]
+    for r in r_multiples:
+        equity.append(equity[-1] + r)
+    peak, worst = equity[0], 0.0
+    for v in equity:
+        peak  = max(peak, v); worst = min(worst, v - peak)
+
+    sharpe = None
+    if n >= 2:
+        sd = statistics.stdev(r_multiples)
+        if sd > 0:
+            sharpe = round(statistics.mean(r_multiples) / sd, 3)
+
+    return {"n": n, "wr": round(wr, 3), "aw": round(aw, 3), "al": round(al, 3),
+            "ev": round(ev, 3), "sharpe": sharpe, "max_dd": round(abs(worst), 3),
+            "avg_cost_r": round(statistics.mean(cost_r_list), 4) if cost_r_list else 0.0,
+            "r_multiples": r_multiples}
+
+
+def _deflated_sharpe_ratio(returns: list[float], n_trials: int) -> dict:
+    """
+    Deflated Sharpe Ratio (Bailey & Lopez de Prado, 2014) — corrects the
+    observed per-trade Sharpe ratio for (1) sampling noise from a finite
+    N, and (2) selection bias from having screened n_trials candidates
+    (e.g. tickers) and reporting the best one(s). P2-114: built to
+    replace a reviewed report's DSR analysis that used SR~0.70/N=20 as
+    inputs — neither matched the actual measured results (this project's
+    real QQQ/TSLA figures were SR=0.116/n=33 and SR=0.138/n=54) — and
+    whose own arithmetic contradicted its own stated conclusion.
+
+        DSR = Phi[ (SR_hat - SR*) * sqrt(N-1)
+                   / sqrt(1 - skew*SR_hat + ((kurt-1)/4)*SR_hat^2) ]
+
+    SR* is the expected maximum Sharpe ratio achievable by pure luck
+    across n_trials independent zero-skill trials:
+
+        SR* ~= SE(SR_hat) * sqrt(2 * ln(n_trials))
+
+    an asymptotic approximation to the expected-maximum-of-M-Gaussians
+    result (drops the more precise Euler-Mascheroni correction term,
+    consistent with the commonly-cited simplified form). Critically, SR*
+    here is scaled by SE(SR_hat) — a z-score-like quantity multiplied by
+    the Sharpe estimator's own standard error to become comparable to an
+    actual Sharpe value. The reviewed report used a bare sqrt(2*ln(M))
+    (~1.665 for M=4) directly as SR*, with no SE scaling — a units error
+    that would make the DSR test fail almost any realistic per-trade
+    Sharpe ratio, not a meaningful bar.
+
+    SE(SR_hat) uses the standard Lo (2002) approximation:
+        SE(SR) ~= sqrt((1 + SR_hat^2/2) / N)
+
+    Args:
+        returns:   raw per-trade R-multiples (e.g. from
+                   _backtest_orb_full_gate's "r_multiples" key)
+        n_trials:  number of independent candidates screened (e.g. how
+                   many tickers were tested before selecting this one)
+
+    Returns a dict with n, sr_hat, se_sr, sr_star, skew, kurt, z, dsr.
+    dsr is None (with a "reason") if N<3 (skew/kurtosis undefined), the
+    return series has zero variance, or extreme skew/kurtosis make the
+    formula's denominator non-positive (the approximation breaks down).
+    """
+    n = len(returns)
+    if n < 3:
+        return {"n": n, "dsr": None, "reason": "N<3 — skew/kurtosis undefined"}
+
+    mean_r = statistics.mean(returns)
+    sd_r = statistics.stdev(returns)
+    if sd_r == 0:
+        return {"n": n, "dsr": None, "reason": "zero variance in returns"}
+
+    sr_hat = mean_r / sd_r
+
+    # Sample skewness and kurtosis (raw 4th moment convention — normal = 3,
+    # not "excess kurtosis" which would be 0 for normal).
+    m3 = sum((r - mean_r) ** 3 for r in returns) / n
+    m4 = sum((r - mean_r) ** 4 for r in returns) / n
+    skew = m3 / (sd_r ** 3)
+    kurt = m4 / (sd_r ** 4)
+
+    se_sr = math.sqrt((1 + sr_hat ** 2 / 2) / n)
+    sr_star = se_sr * math.sqrt(2 * math.log(max(n_trials, 2)))
+
+    denom_sq = 1 - skew * sr_hat + ((kurt - 1) / 4) * sr_hat ** 2
+    if denom_sq <= 0:
+        return {"n": n, "sr_hat": round(sr_hat, 4), "se_sr": round(se_sr, 4),
+                "sr_star": round(sr_star, 4), "skew": round(skew, 3),
+                "kurt": round(kurt, 3), "dsr": None,
+                "reason": "denominator non-positive — extreme skew/kurtosis, "
+                          "formula breaks down for this sample"}
+    denom = math.sqrt(denom_sq)
+
+    z = (sr_hat - sr_star) * math.sqrt(n - 1) / denom
+    dsr = 0.5 * (1 + math.erf(z / math.sqrt(2)))   # Phi(z) via erf — no scipy dependency
+
+    return {"n": n, "sr_hat": round(sr_hat, 4), "se_sr": round(se_sr, 4),
+            "sr_star": round(sr_star, 4), "skew": round(skew, 3),
+            "kurt": round(kurt, 3), "z": round(z, 3), "dsr": round(dsr, 4)}
 
 
 def _sim_trade(entry: float, stop: float, target: float,
@@ -1241,11 +2134,11 @@ def _notify(cfg: dict, message: str, level: str = "INFO") -> None:
         return
 
     emoji = {"INFO":"📡","TRADE":"✅","WARN":"⚠️","HALT":"🛑"}.get(level,"📡")
-    now_est = (datetime.utcnow() + timedelta(hours=cfg.get("tz_offset_hours",-5))).strftime("%H:%M EST")
+    now_str = _now_market(cfg).strftime("%H:%M %Z")
 
     def _send():
         import asyncio, json as _json
-        payload = _json.dumps({"content": f"{emoji} **{level}** [{now_est}]  {message}"})
+        payload = _json.dumps({"content": f"{emoji} **{level}** [{now_str}]  {message}"})
         async def _post():
             try:
                 async with _aiohttp.ClientSession() as session:
@@ -1270,9 +2163,31 @@ class TradingEngine:
     def __init__(self, cfg: dict) -> None:
         self.cfg      = cfg
         self.db       = PaperAccountDB(cfg["db_path"])
-        self.db.ensure_account_meta(cfg["account_balance"])   # Rule 16 Tier 1 (P2-073)
+        self.db.ensure_account_meta(cfg["account_balance"], cfg["ticker"])   # Rule 16 Tier 1 (P2-073) / BUG-09 (P2-105)
         self.running  = False
         self.session: dict[str, Any] = self._fresh_session()
+        # Daily bars only change once per trading day — cache rather than
+        # re-fetching over the network every 60s poll (was ~90 wasted
+        # yfinance calls per session, on top of the post-session spam
+        # fixed separately). See _get_daily_bars().
+        self._df_1d_cache: "pd.DataFrame | None" = None
+        self._df_1d_cache_date: "str | None" = None
+
+    def _get_daily_bars(self) -> pd.DataFrame:
+        today = str(_now_market(self.cfg).date())
+        if self._df_1d_cache is None or self._df_1d_cache_date != today:
+            df = _fetch_daily(self.cfg["ticker"])
+            # Only lock in today's cache date on a genuinely non-empty
+            # result. An exception here already skips the assignment below
+            # naturally (propagates before it's reached) — but yfinance can
+            # also fail "successfully", returning an empty frame without
+            # raising. Locking the date in that case would mean gap_pct
+            # stays None for the rest of the session, with no retry.
+            if not df.empty:
+                self._df_1d_cache = df
+                self._df_1d_cache_date = today
+            return df
+        return self._df_1d_cache
 
     def _fresh_session(self) -> dict:
         return {"pnl_r": 0.0, "pnl_gbp": 0.0, "n_trades": 0,
@@ -1282,7 +2197,7 @@ class TradingEngine:
 
     def _heartbeat(self, status: str, message: str) -> None:
         pos = self.db.get_open_position()
-        self.db.update_heartbeat(status, message, str(datetime.utcnow().date()),
+        self.db.update_heartbeat(status, message, str(_utcnow().date()),
                                   self.cfg["account_balance"],
                                   pos["id"] if pos else None)
 
@@ -1301,11 +2216,18 @@ class TradingEngine:
         # Check before any data fetch or session work.  Exits cleanly on
         # holidays; adjusts session_end on early-close days.
         if _CALENDAR:
-            cal = _check_market_session(
-                tz_offset_hours=self.cfg.get("tz_offset_hours", -5)
-            )
+            # No tz_offset_hours passed — check_market_session() computes
+            # its own DST-aware offset via zoneinfo by default now.
+            # market_type comes from CONFIG (P2-112) rather than being
+            # hardcoded to NYSE at this call site — trading a different
+            # session means changing cfg["market_type"] to a key with real
+            # data in market_calendar.py's EQUITIES_MARKETS registry.
+            cal = _check_market_session(market_type=self.cfg.get("market_type", "nyse_equities"))
             if not cal.is_open:
-                log.info("NYSE CLOSED — %s", cal.reason)
+                # cal.reason already names the correct market (e.g. "NYSE
+                # closed — ..."), not hardcoded here — stays accurate
+                # whichever market_type is configured.
+                log.info("MARKET CLOSED — %s", cal.reason)
                 log.info("No session today (%s). Exiting cleanly.", cal.session_date)
                 self._heartbeat("stopped", f"No session — {cal.reason}")
                 _notify(self.cfg, f"📅 No session today — {cal.reason}", "INFO")
@@ -1316,19 +2238,21 @@ class TradingEngine:
                 # is unaffected on most early-close days, but this guards
                 # against edge cases where market closes before 11:00.
                 early_cap = cal.normal_close
+                tz_label = _now_market(self.cfg).strftime('%Z')
                 if early_cap < self.cfg["session_end"]:
                     log.info(
-                        "EARLY CLOSE DAY — market closes %s EST. "
+                        "EARLY CLOSE DAY — market closes %s %s. "
                         "Capping session_end from %s to %s.",
-                        early_cap, self.cfg["session_end"], early_cap
+                        early_cap, tz_label, self.cfg["session_end"], early_cap
                     )
                     self.cfg = {**self.cfg, "session_end": early_cap}
                 else:
-                    log.info("EARLY CLOSE DAY — market closes %s EST "
+                    log.info("EARLY CLOSE DAY — market closes %s %s "
                              "(strategy window ends %s — unaffected).",
-                             early_cap, self.cfg["session_end"])
+                             early_cap, tz_label, self.cfg["session_end"])
                 _notify(self.cfg,
-                        f"⚠️ Early close day — market closes {early_cap.strftime('%H:%M')} EST",
+                        f"⚠️ Early close day — market closes {early_cap.strftime('%H:%M')} "
+                        f"{tz_label}",
                         "INFO")
             else:
                 log.info("Market check: %s", cal.reason)
@@ -1357,7 +2281,7 @@ class TradingEngine:
             self._heartbeat("halted", f"RETIRED — {retired['reason']}")
             return
 
-        now    = _now_est(self.cfg)
+        now    = _now_market(self.cfg)
         today  = str(now.date())
         in_wnd = _in_session(self.cfg)
 
@@ -1370,11 +2294,25 @@ class TradingEngine:
         # ── Post-session close ──
         if now.time() > self.cfg["session_end"]:
             pos = self.db.get_open_position()
+
+            # Nothing left to do this evening — skip the network fetch
+            # entirely rather than repeating it every tick until midnight.
+            # Previously this fetched every 60s regardless (~780 wasted
+            # yfinance calls per evening once learning_done flips true —
+            # a real rate-limit/IP-ban risk for the next day's session).
+            # The open-position branch below still runs unconditionally,
+            # every tick, regardless of learning_done — a stray open
+            # position should never stop being retried just because the
+            # session-close report already ran.
+            if not pos and self.session["learning_done"]:
+                self._heartbeat("stopped", f"Session closed at {now.strftime('%H:%M %Z')}")
+                return
+
             df_5m_close: "pd.DataFrame | None" = None
             if pos:
                 log.info("Post-session: force-closing open position %d", pos["id"])
                 df_5m_close = _fetch_live(self.cfg["ticker"])
-                vwap = _vwap(df_5m_close)
+                vwap = _vwap(df_5m_close, self.cfg["session_start"])
                 manage_open_position(pos, df_5m_close, vwap, self.db, self.cfg, self.session)
                 self._check_drawdown_stop()
             else:
@@ -1385,7 +2323,7 @@ class TradingEngine:
                     df_5m_close = None
             self._persist_session(today)
             self._run_session_close(today, df_5m=df_5m_close)   # P2-058
-            self._heartbeat("stopped", f"Session closed at {now.strftime('%H:%M')} EST")
+            self._heartbeat("stopped", f"Session closed at {now.strftime('%H:%M %Z')}")
             return
 
         # ── Halted for the day ──
@@ -1402,8 +2340,8 @@ class TradingEngine:
         # ── Fetch data ──
         try:
             df_5m  = _fetch_live(self.cfg["ticker"])
-            df_1d  = _fetch_daily(self.cfg["ticker"])
-            vwap   = _vwap(df_5m)
+            df_1d  = self._get_daily_bars()
+            vwap   = _vwap(df_5m, self.cfg["session_start"])
         except Exception as exc:
             log.warning("Data fetch error: %s", exc)
             self._heartbeat("running", f"Data fetch error: {exc}")
@@ -1421,7 +2359,15 @@ class TradingEngine:
             return
 
         # ── Evaluate signals for new entry ──
-        ctx = evaluate_signals(df_5m, df_1d, vwap, self.cfg)
+        # P2-105 item 7: entry evaluation uses only SETTLED bars — a still-
+        # forming last bar can show a spurious breakout that reverses
+        # before it closes. Exits above intentionally still saw the live
+        # (possibly forming) df_5m/vwap — waiting for bar-close there
+        # would add latency to stop/target execution, which is the
+        # opposite of what's wanted for risk management.
+        df_5m_settled = _drop_forming_bar(df_5m)
+        vwap_settled  = _vwap(df_5m_settled, self.cfg["session_start"])
+        ctx = evaluate_signals(df_5m_settled, df_1d, vwap_settled, self.cfg)
         log.info("[%s] %s | ORB:%s VWAP:%s Gate:%s | %s",
                   now.strftime("%H:%M"), ctx["ticker"],
                   ctx["gate_orb_break"], ctx["gate_vwap"],
@@ -1490,8 +2436,16 @@ class TradingEngine:
                          f"Last eval {now.strftime('%H:%M')}: {ctx['action']} | {ctx['gate_final']}")
 
     def _check_daily_stop(self, today: str) -> None:
-        if self.session["pnl_r"] / max(self.cfg["account_balance"] * self.cfg["risk_pct"], 1) \
-                <= -self.cfg["max_daily_loss_pct"]:
+        # BUG-04 fix: pnl_r (R-multiples) * risk_pct (fraction of account per
+        # R) directly gives fraction of account lost — that's what belongs
+        # on the left of this comparison. The previous version additionally
+        # divided by account_balance, which only produced the intended 3%
+        # trigger by coincidence at the exact default $10,000 balance (since
+        # account_balance == 1/risk_pct**2 only there) — at $50,000 it took
+        # 15 losing 1R trades to trigger instead of 3, and at $2,000 it
+        # triggered on a fraction of a single loss. Confirmed both ways by
+        # direct calculation before changing this.
+        if self.session["pnl_r"] * self.cfg["risk_pct"] <= -self.cfg["max_daily_loss_pct"]:
             self.session["halted"] = True
             log.warning("DAILY STOP TRIGGERED — halting for rest of session")
             _notify(self.cfg, "🛑 DAILY STOP TRIGGERED — session halted. No more entries today.", "HALT")
@@ -1662,8 +2616,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--poll",      type=int,   default=CONFIG["poll_interval_s"])
     p.add_argument("--kelly",     action="store_true")
     p.add_argument("--wfa-only",  action="store_true",
-                   help="Run walk-forward analysis then exit")
+                   help="Run walk-forward analysis (hourly bars, single-gate approximation) then exit")
     p.add_argument("--wfa-splits", type=int, default=6)
+    p.add_argument("--wfa-5m",    action="store_true",
+                   help="Run walk-forward analysis on real 5-minute bars with the "
+                        "engine's actual 2-gate signal logic, then exit")
+    p.add_argument("--wfa-5m-is-days",  type=int, default=25)
+    p.add_argument("--wfa-5m-oos-days", type=int, default=10)
+    p.add_argument("--wfa-5m-splits",   type=int, default=3)
     return p.parse_args()
 
 
@@ -1688,6 +2648,21 @@ if __name__ == "__main__":
             mean_wfe = statistics.mean(r["wfe"] for r in valid)
             passes   = sum(1 for r in valid if r["wfe_verdict"] == "PASS")
             log.info("WFA complete: mean WFE=%.3f  %d/%d splits PASS",
+                      mean_wfe, passes, len(valid))
+        sys.exit(0)
+
+    if args.wfa_5m:
+        log.info("Running WFA (5m, full-gate, up to %d splits) for %s...",
+                  args.wfa_5m_splits, cfg["ticker"])
+        results = wfa_run_5m(cfg["ticker"], db, cfg,
+                              is_days=args.wfa_5m_is_days,
+                              oos_days=args.wfa_5m_oos_days,
+                              n_splits=args.wfa_5m_splits)
+        valid = [r for r in results if r.get("wfe") is not None]
+        if valid:
+            mean_wfe = statistics.mean(r["wfe"] for r in valid)
+            passes   = sum(1 for r in valid if r["wfe_verdict"] == "PASS")
+            log.info("WFA(5m) complete: mean WFE=%.3f  %d/%d splits PASS",
                       mean_wfe, passes, len(valid))
         sys.exit(0)
 
