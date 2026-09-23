@@ -178,6 +178,37 @@ def fetch_yfinance_bars(ticker: str, start: date, end: date) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------------------------
+# Bar-interval normalisation
+# ---------------------------------------------------------------------------
+
+def _to_5min(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample intraday bars to 5-minute OHLCV, one session at a time.
+
+    _backtest_orb_full_gate() is written for 5-minute bars and counts in BARS
+    (vwap_lookback=3 means 15 minutes; entry-candle checks and stop fills are
+    per bar). MarketDataStore and Alpaca return 1-minute bars, so feeding them
+    straight in would replay the strategy at the wrong resolution without any
+    error. Bars are labelled by their START (09:30 covers 09:30-09:34), matching
+    yfinance's 5m bars and the live engine. Frames already at >= 5-minute
+    spacing are returned unchanged, so yfinance data passes straight through.
+    Expects capitalised Open/High/Low/Close/Volume columns.
+    """
+    if df.empty or len(df) < 2:
+        return df
+    step = pd.Series(df.index).diff().dropna().median()
+    if step >= pd.Timedelta(minutes=5):
+        return df
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last",
+           "Volume": "sum"}
+    agg = {k: v for k, v in agg.items() if k in df.columns}
+    out = []
+    for _, day in df.groupby(df.index.date):
+        r = day[list(agg)].resample("5min", label="left", closed="left").agg(agg)
+        out.append(r.dropna(subset=["Open"]))
+    return pd.concat(out) if out else df.iloc[0:0]
+
+
+# ---------------------------------------------------------------------------
 # Strategy signal evaluator — REMOVED (P2-116)
 # ---------------------------------------------------------------------------
 # This used to contain a separate simulate_session()/_define_orb()/
@@ -641,6 +672,9 @@ def run_simulation(
     # source-agnostic).
     df_norm = df_1m.rename(columns={c: c.capitalize() for c in df_1m.columns
                                      if c.lower() in ("open","high","low","close","volume")})
+    # Store/Alpaca paths deliver 1-minute bars; the canonical backtest is
+    # bar-count based and validated on 5-minute bars (see _to_5min).
+    df_norm = _to_5min(df_norm)
 
     trading_days = sorted(set(df_norm.index.date))
     if max_sessions:
