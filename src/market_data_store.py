@@ -73,6 +73,18 @@ import pandas as pd
 
 log = logging.getLogger("market_data_store")
 
+# Which Alpaca feed to download. Free (Basic) accounts may query the SIP feed
+# (100% of US volume) for any window ending more than 15 minutes ago; the
+# default on a free account would otherwise be IEX (~2.5% of volume), which
+# breaks every volume-based calculation (VWAP, RVOL). Override with
+# ALPACA_DATA_FEED=iex only for comparison.
+DEFAULT_FEED = os.environ.get("ALPACA_DATA_FEED", "sip").lower()
+
+
+class AlpacaFatalError(RuntimeError):
+    """Credential / permission problems. Retrying other chunks cannot help,
+    so download_and_store() stops instead of logging and moving on."""
+
 # ---------------------------------------------------------------------------
 # Regime definitions
 # ---------------------------------------------------------------------------
@@ -216,23 +228,30 @@ class MarketDataStore:
     # ── Fetching from Alpaca ──────────────────────────────────────────────────
 
     def _fetch_from_alpaca(
-        self, ticker: str, start: date, end: date
+        self, ticker: str, start: date, end: date, feed: str | None = None,
     ) -> pd.DataFrame:
-        """Fetch 1-min bars from Alpaca. Requires env vars."""
+        """Fetch 1-min bars from Alpaca. Requires ALPACA_API_KEY / ALPACA_SECRET_KEY.
+
+        feed defaults to DEFAULT_FEED ("sip"). Raises AlpacaFatalError for
+        missing keys, a missing SDK, or an auth/permission rejection.
+        """
         try:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests   import StockBarsRequest
             from alpaca.data.timeframe  import TimeFrame, TimeFrameUnit
+            from alpaca.data.enums      import DataFeed
+            from alpaca.common.exceptions import APIError
         except ImportError:
-            raise ImportError("pip install alpaca-py")
+            raise AlpacaFatalError("alpaca-py not installed: pip install alpaca-py")
 
         api_key    = os.environ.get("ALPACA_API_KEY")
         secret_key = os.environ.get("ALPACA_SECRET_KEY")
-        if not api_key:
-            raise EnvironmentError(
-                "Set ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables. "
-                "Free account at alpaca.markets — no funding required."
+        if not api_key or not secret_key:
+            raise AlpacaFatalError(
+                "Set BOTH ALPACA_API_KEY and ALPACA_SECRET_KEY (e.g. in .env). "
+                "Free paper account at alpaca.markets — no funding required."
             )
+        feed = (feed or DEFAULT_FEED).lower()
         client = StockHistoricalDataClient(api_key, secret_key)
         req    = StockBarsRequest(
             symbol_or_symbols=ticker,
@@ -240,8 +259,21 @@ class MarketDataStore:
             start=datetime.combine(start, datetime.min.time()),
             end=datetime.combine(end, datetime.max.time()),
             adjustment="all",
+            feed=DataFeed(feed),
         )
-        bars = client.get_stock_bars(req).df
+        try:
+            bars = client.get_stock_bars(req).df
+        except APIError as e:
+            code = getattr(e, "status_code", None)
+            msg  = str(e)
+            if code in (401, 403) or "subscription" in msg.lower() \
+                    or "forbidden" in msg.lower() or "unauthorized" in msg.lower():
+                raise AlpacaFatalError(
+                    f"Alpaca rejected the request (HTTP {code}, feed={feed}): {msg}"
+                ) from e
+            raise
+        if bars is None or len(bars) == 0:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.reset_index(level=0, drop=True)
         bars.index = pd.to_datetime(bars.index, utc=True).tz_convert("America/New_York")
@@ -358,6 +390,7 @@ class MarketDataStore:
         end:       date,
         vix_daily: dict[str, float] | None = None,
         chunk_months: int = 3,
+        feed: str | None = None,
     ) -> dict:
         """
         Download all bars for ticker in date range and store in SQLite.
@@ -366,7 +399,9 @@ class MarketDataStore:
 
         vix_daily: {date_str: vix_close} — fetched separately from yfinance.
         """
-        log.info("Downloading %s bars %s → %s", ticker, start, end)
+        feed = (feed or DEFAULT_FEED).lower()
+        log.info("Downloading %s bars %s → %s (feed=%s)", ticker, start, end, feed)
+        failed_chunks: list[dict] = []
         t0 = time.monotonic()
 
         # Fetch VIX if not provided
@@ -386,21 +421,30 @@ class MarketDataStore:
             )
             log.info("  Chunk %s → %s...", chunk_start, chunk_end)
             try:
-                df = self._fetch_from_alpaca(ticker, chunk_start, chunk_end)
+                df = self._fetch_from_alpaca(ticker, chunk_start, chunk_end, feed=feed)
                 bars_written, sessions_written = self._store_bars(ticker, df, vix_daily)
                 total_bars     += bars_written
                 total_sessions += sessions_written
                 log.info("  Stored %d bars, %d sessions", bars_written, sessions_written)
                 time.sleep(1)   # rate-limit guard
+            except AlpacaFatalError:
+                # Keys/permissions: every remaining chunk would fail the same way.
+                # Previously this was logged per chunk and the run "finished" with
+                # 0 bars — a plausible cause of the empty market_data.db (P2-116).
+                self._update_meta(ticker, total_bars, total_sessions)
+                raise
             except Exception as e:
                 log.error("  Chunk %s → %s FAILED: %s", chunk_start, chunk_end, e)
+                failed_chunks.append({"start": str(chunk_start), "end": str(chunk_end),
+                                      "error": f"{type(e).__name__}: {e}"})
             chunk_start = chunk_end + timedelta(days=1)
 
         elapsed = time.monotonic() - t0
         # Update meta
         self._update_meta(ticker, total_bars, total_sessions)
-        return {"ticker": ticker, "total_bars": total_bars,
-                "total_sessions": total_sessions, "elapsed_sec": round(elapsed, 1)}
+        return {"ticker": ticker, "feed": feed, "total_bars": total_bars,
+                "total_sessions": total_sessions, "elapsed_sec": round(elapsed, 1),
+                "failed_chunks": failed_chunks}
 
     def _store_bars(
         self,
@@ -414,6 +458,11 @@ class MarketDataStore:
 
         trading_days = sorted(set(df.index.date))
         prev_close, prev_high, prev_low = None, None, None
+        if trading_days:
+            # Seed from the last stored session before this chunk, so the first
+            # session of each chunk still gets gap_pct / PDH / PDL.
+            prev_close, prev_high, prev_low = self._prev_session_levels(
+                ticker, trading_days[0])
 
         for day in trading_days:
             day_str  = str(day)
@@ -514,6 +563,26 @@ class MarketDataStore:
 
         return bars_written, sessions_written
 
+    def _prev_session_levels(
+        self, ticker: str, before: date
+    ) -> tuple[float | None, float | None, float | None]:
+        """Close/high/low of the latest stored session strictly before `before`."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT ts_date FROM market_bars WHERE ticker=? AND ts_date<? "
+                "ORDER BY ts_date DESC LIMIT 1", (ticker, str(before))
+            ).fetchone()
+            if row is None:
+                return None, None, None
+            d = row[0]
+            agg = conn.execute(
+                "SELECT MAX(high), MIN(low) FROM market_bars WHERE ticker=? AND ts_date=?",
+                (ticker, d)).fetchone()
+            last = conn.execute(
+                "SELECT close FROM market_bars WHERE ticker=? AND ts_date=? "
+                "ORDER BY ts DESC LIMIT 1", (ticker, d)).fetchone()
+        return float(last[0]), float(agg[0]), float(agg[1])
+
     def _fetch_vix_daily(self, start: date, end: date) -> dict[str, float]:
         """
         Fetch VIX daily closes.
@@ -573,7 +642,9 @@ class MarketDataStore:
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame([dict(r) for r in rows])
-        df["ts"] = pd.to_datetime(df["ts"]).dt.tz_convert("America/New_York")
+        # utc=True: stored ISO strings carry -05:00 and -04:00 offsets; without it
+        # pandas raises "Mixed timezones" for any range spanning a DST change.
+        df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("America/New_York")
         df = df.set_index("ts")
         df.columns = [c.capitalize() if c != "vwap" else "vwap" for c in df.columns]
         return df
@@ -620,7 +691,9 @@ class MarketDataStore:
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame([dict(r) for r in rows])
-        df["ts"] = pd.to_datetime(df["ts"]).dt.tz_convert("America/New_York")
+        # utc=True: stored ISO strings carry -05:00 and -04:00 offsets; without it
+        # pandas raises "Mixed timezones" for any range spanning a DST change.
+        df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("America/New_York")
         return df.set_index("ts")
 
     # ── Status and analysis ───────────────────────────────────────────────────
@@ -793,11 +866,40 @@ if __name__ == "__main__":
     p.add_argument("--start",          default="2016-01-01")
     p.add_argument("--end",            default="2024-12-31")
     p.add_argument("--db",             default="DATA/market_data.db")
+    p.add_argument("--check",          action="store_true",
+                   help="Pre-flight: fetch one past session on SIP and IEX, no DB writes")
+    p.add_argument("--check-date",     default="2024-12-20")
+    p.add_argument("--feed",           default=None, choices=["sip", "iex"],
+                   help="Override ALPACA_DATA_FEED (default sip)")
     args = p.parse_args()
 
     store = MarketDataStore(args.db)
 
-    if args.status:
+    if args.check:
+        d = date.fromisoformat(args.check_date)
+        if d >= SEALED:
+            sys.exit(f"--check-date {d} is in the sealed window (>= {SEALED}); pick an earlier date.")
+        print(f"\n=== ALPACA PRE-FLIGHT: {args.ticker} {d} (no DB writes) ===")
+        vols = {}
+        try:
+            for f in ("sip", "iex"):
+                df = store._fetch_from_alpaca(args.ticker, d, d, feed=f)
+                rth = df[(df.index.time >= pd.Timestamp("09:30").time()) &
+                         (df.index.time <  pd.Timestamp("16:00").time())] if len(df) else df
+                vols[f] = int(rth["Volume"].sum()) if len(rth) else 0
+                first = rth.index[0].strftime("%H:%M") if len(rth) else "-"
+                print(f"  {f.upper():<4} regular-session bars={len(rth):>4}  "
+                      f"volume={vols[f]:>14,}  first bar={first}")
+        except AlpacaFatalError as e:
+            sys.exit(f"  ✗ {e}")
+        if vols.get("sip", 0) == 0:
+            sys.exit("  ✗ SIP returned no bars — check the date is a trading day.")
+        ratio = vols["iex"] / vols["sip"] if vols["sip"] else 0
+        print(f"  IEX/SIP volume ratio = {ratio:.1%}  (expect a few %; ~100% would mean "
+              "both calls silently hit the same feed)")
+        print("  ✓ Keys work and the SIP feed is available — safe to run --download.")
+
+    elif args.status:
         st = store.status()
         print("\n=== DATA STORE STATUS ===")
         for t in st["by_ticker"]:
@@ -809,6 +911,7 @@ if __name__ == "__main__":
             print(f"  Last updated: {m.get('last_updated','?')}")
 
     elif args.download:
+        any_failed = False
         for ticker in args.tickers:
             start = date.fromisoformat(args.start)
             end   = date.fromisoformat(args.end)
@@ -817,9 +920,24 @@ if __name__ == "__main__":
                 print(f"   Sealed data starts {SEALED}. Clamping to {OOS_END}.")
                 end = OOS_END
             print(f"\nDownloading {ticker} {start} → {end}...")
-            result = store.download_and_store(ticker, start, end)
+            try:
+                result = store.download_and_store(ticker, start, end, feed=args.feed)
+            except AlpacaFatalError as e:
+                sys.exit(f"✗ {ticker}: stopped — {e}")
             print(f"Stored: {result['total_bars']:,} bars, "
-                  f"{result['total_sessions']} sessions in {result['elapsed_sec']}s")
+                  f"{result['total_sessions']} sessions in {result['elapsed_sec']}s "
+                  f"(feed={result['feed']})")
+            if result["failed_chunks"]:
+                any_failed = True
+                print(f"⚠️  {len(result['failed_chunks'])} chunk(s) FAILED — re-run the same "
+                      "command; INSERT OR IGNORE makes it safe to repeat:")
+                for c in result["failed_chunks"]:
+                    print(f"     {c['start']} → {c['end']}: {c['error']}")
+            elif result["total_bars"] == 0:
+                any_failed = True
+                print("⚠️  0 bars stored — nothing failed loudly, but nothing arrived either.")
+        if any_failed:
+            sys.exit(1)
 
     elif args.update:
         for ticker in args.tickers:
