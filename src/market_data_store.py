@@ -80,6 +80,29 @@ log = logging.getLogger("market_data_store")
 # ALPACA_DATA_FEED=iex only for comparison.
 DEFAULT_FEED = os.environ.get("ALPACA_DATA_FEED", "sip").lower()
 
+# Price adjustment for downloaded bars. "raw" is correct for an intraday
+# strategy: splits never happen inside a session, and ORB/VWAP/stops only need
+# prices consistent within the day. Split-adjusted ("all"/"split") history
+# divides old prices (NVDA 2016 by 40, TSLA by 15); Alpaca then rounds them,
+# which manufactured ~95% of NVDA/TSLA's "stale bar" flags (verified: NVDA
+# 2020-07-08 had 66 stale bars adjusted vs 0 raw) and made the engine's
+# absolute $0.02 stop-buffer floor ~40x too large on old sessions.
+DEFAULT_ADJUSTMENT = os.environ.get("ALPACA_ADJUSTMENT", "raw").lower()
+
+# Quality issues that exclude a session from training (quality_ok=0). Anything
+# else is logged for information only.
+CRITICAL_ISSUES = {"phantom_spike", "stale_bars_critical", "price_error", "bar_count_low"}
+
+# Isolated-spike threshold: how far a bar's wick may extend beyond BOTH
+# neighbours and its own body, in multiples of the session's median bar range.
+# Calibrated 23 Sep 2026 on real 1-min bars (SPY/QQQ/NVDA/TSLA, 32 sessions):
+# genuine wicks never exceeded 3.5x; recorded bad prints are typically 10-20x.
+SPIKE_MULT      = 8.0
+SPIKE_MIN_FRAC  = 0.0005   # ...and at least 0.05% of price (ignores dead-quiet days)
+# Overnight open/prev-close ratio outside this band = split or similar event:
+# prior-day levels are not comparable, so gap/PDH/PDL are left NULL.
+DISCONTINUITY_BAND = (0.65, 1.6)
+
 
 class AlpacaFatalError(RuntimeError):
     """Credential / permission problems. Retrying other chunks cannot help,
@@ -193,9 +216,14 @@ CREATE TABLE IF NOT EXISTS data_quality_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker       TEXT,
     session_date TEXT,
-    issue_type   TEXT,     -- 'gap', 'price_error', 'volume_zero', 'bar_count_low'
+    issue_type   TEXT,     -- see _validate_day(); CRITICAL_ISSUES exclude a session
     detail       TEXT,
     logged_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS store_settings (
+    key   TEXT PRIMARY KEY,   -- e.g. 'adjustment:SPY'
+    value TEXT
 );
 """
 
@@ -224,11 +252,63 @@ class MarketDataStore:
     def _init_schema(self) -> None:
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # Migration: data_quality_log had no uniqueness rule, so every
+            # re-run duplicated its rows. Keep the first copy, then enforce.
+            c.execute("""DELETE FROM data_quality_log WHERE id NOT IN (
+                           SELECT MIN(id) FROM data_quality_log
+                           GROUP BY ticker, session_date, issue_type)""")
+            c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_dql_unique
+                         ON data_quality_log(ticker, session_date, issue_type)""")
+
+    # ── Settings / bookkeeping ────────────────────────────────────────────────
+
+    def _get_setting(self, key: str) -> str | None:
+        with self._conn() as c:
+            r = c.execute("SELECT value FROM store_settings WHERE key=?", (key,)).fetchone()
+        return r[0] if r else None
+
+    def _set_setting(self, key: str, value: str) -> None:
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO store_settings(key, value) VALUES (?,?)",
+                      (key, value))
+
+    def stored_adjustment(self, ticker: str) -> str | None:
+        """Adjustment of the bars stored for ticker. None = no bars stored.
+        Bars stored before this setting existed were downloaded as 'all'."""
+        with self._conn() as c:
+            has = c.execute("SELECT 1 FROM market_bars WHERE ticker=? LIMIT 1",
+                            (ticker,)).fetchone()
+        if not has:
+            return None
+        return self._get_setting(f"adjustment:{ticker}") or "all"
+
+    def wipe(self, ticker: str) -> dict:
+        """Delete every stored bar, session and quality row for ticker.
+        FRED / sentiment tables in the same file are untouched."""
+        with self._conn() as c:
+            n = {t: c.execute(f"DELETE FROM {t} WHERE ticker=?", (ticker,)).rowcount
+                 for t in ("market_bars", "session_context", "data_quality_log")}
+            c.execute("DELETE FROM store_settings WHERE key=?", (f"adjustment:{ticker}",))
+        self._refresh_meta()
+        return n
+
+    def _record_issues(self, conn: sqlite3.Connection, ticker: str,
+                       day_str: str, issues: list[dict]) -> None:
+        """Replace this session's quality rows (so a re-run never duplicates
+        and a changed check never leaves stale flags behind)."""
+        conn.execute("DELETE FROM data_quality_log WHERE ticker=? AND session_date=?",
+                     (ticker, day_str))
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        conn.executemany(
+            "INSERT OR REPLACE INTO data_quality_log "
+            "(ticker, session_date, issue_type, detail, logged_at) VALUES (?,?,?,?,?)",
+            [(ticker, day_str, i["issue_type"], i["detail"], now) for i in issues])
 
     # ── Fetching from Alpaca ──────────────────────────────────────────────────
 
     def _fetch_from_alpaca(
         self, ticker: str, start: date, end: date, feed: str | None = None,
+        adjustment: str | None = None,
     ) -> pd.DataFrame:
         """Fetch 1-min bars from Alpaca. Requires ALPACA_API_KEY / ALPACA_SECRET_KEY.
 
@@ -239,7 +319,7 @@ class MarketDataStore:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests   import StockBarsRequest
             from alpaca.data.timeframe  import TimeFrame, TimeFrameUnit
-            from alpaca.data.enums      import DataFeed
+            from alpaca.data.enums      import DataFeed, Adjustment
             from alpaca.common.exceptions import APIError
         except ImportError:
             raise AlpacaFatalError("alpaca-py not installed: pip install alpaca-py")
@@ -252,13 +332,14 @@ class MarketDataStore:
                 "Free paper account at alpaca.markets — no funding required."
             )
         feed = (feed or DEFAULT_FEED).lower()
+        adjustment = (adjustment or DEFAULT_ADJUSTMENT).lower()
         client = StockHistoricalDataClient(api_key, secret_key)
         req    = StockBarsRequest(
             symbol_or_symbols=ticker,
             timeframe=TimeFrame(1, TimeFrameUnit.Minute),
             start=datetime.combine(start, datetime.min.time()),
             end=datetime.combine(end, datetime.max.time()),
-            adjustment="all",
+            adjustment=Adjustment(adjustment),
             feed=DataFeed(feed),
         )
         try:
@@ -302,86 +383,103 @@ class MarketDataStore:
 
     def _validate_day(self, day_df: pd.DataFrame, session_date: date) -> list[dict]:
         """
-        Validate one session against the five data quality issues documented by
+        Validate one session. Returns issue dicts; types in CRITICAL_ISSUES make
+        the session quality_ok=0 (excluded from IS training), others are logged
+        for information. Checks follow the data problems documented by
         Zarattini et al. (Concretum Group, April 2026) for Alpaca SIP data:
 
-          1. Phantom Highs/Lows  — isolated spikes not replicated across providers
-          2. Stale Bars          — OHLC all equal; indicates missing/bad aggregation
-          3. Early-Close Leakage — enforced upstream (09:30-16:00 window)
-          4. Tick-to-Bar shift   — detectable via ORB range vs full-day range ratio
-          5. Venue coverage gaps — manifests as anomalous first-print volume
-
-        Sessions with critical issues get quality_ok=0 and are excluded from IS training.
-        Expected exclusion rate on Alpaca SIP data: 2-8%.
+          phantom_spike      (critical) a bar whose wick sticks out beyond BOTH
+                             neighbours and its own body by > SPIKE_MULT x the
+                             session's median bar range — an isolated print that
+                             immediately reverses. The first and last bar
+                             (opening/closing auctions) are not tested: they are
+                             legitimately wide. REPLACES the old 'phantom_hl'
+                             test (any bar range > mean+5 sigma), which fired on
+                             67-87% of sessions because the opening bar is
+                             routinely that wide.
+          stale_bars_critical (critical) > 50 bars with O=H=L=C
+          stale_bars         (info) 11-50 such bars
+          bar_count_low      (critical) < 350 bars on a full-length session;
+                             a session ending by 13:05 with >= 200 bars is an
+                             early close and is logged as 'early_close' (info)
+          orb_range_anomaly  (info) 09:30-09:45 range > 80% of the day's range —
+                             happens legitimately on quiet trend-less days
+          price_error        (critical) high < low or non-positive prices
         """
-        issues = []
+        issues: list[dict] = []
         n = len(day_df)
+        if n == 0:
+            return [{"issue_type": "bar_count_low", "detail": "0 bars"}]
+        h = day_df["High"].to_numpy(float);  l = day_df["Low"].to_numpy(float)
+        o = day_df["Open"].to_numpy(float);  c = day_df["Close"].to_numpy(float)
 
-        # ── Issue 1: Phantom Highs / Lows ────────────────────────────────────
-        hl_range = day_df["High"] - day_df["Low"]
-        hl_mean  = float(hl_range.mean())
-        hl_std   = float(hl_range.std())
-        if hl_std > 0:
-            n_phantom = int((hl_range > hl_mean + 5 * hl_std).sum())
-            if n_phantom > 0:
+        # Isolated spikes
+        med_range = float(np.median(h - l))
+        if n >= 3 and med_range > 0:
+            limit = max(SPIKE_MULT * med_range, SPIKE_MIN_FRAC * float(np.median(c)))
+            up = h[1:-1] - np.maximum.reduce([o[1:-1], c[1:-1], h[:-2], h[2:]])
+            dn = np.minimum.reduce([o[1:-1], c[1:-1], l[:-2], l[2:]]) - l[1:-1]
+            worst = np.maximum(up, dn)
+            hits = np.where(worst > limit)[0] + 1
+            if len(hits):
+                times = ", ".join(day_df.index[i].strftime("%H:%M") for i in hits[:5])
                 issues.append({
-                    "issue_type": "phantom_hl",
-                    "detail": f"{n_phantom} bar(s) with H/L > mean+5σ "
-                              "(phantom price spike not replicated across providers)",
+                    "issue_type": "phantom_spike",
+                    "detail": f"{len(hits)} isolated spike(s) at {times} "
+                              f"(max {worst.max()/med_range:.1f}x median bar range; "
+                              f"limit {SPIKE_MULT:g}x)",
                 })
 
-        # ── Issue 2: Stale Bars (Zarattini: up to 350/390 in IBKR 2026 data) ─
-        stale = (
-            (day_df["Open"]  == day_df["High"])  &
-            (day_df["High"]  == day_df["Low"])   &
-            (day_df["Low"]   == day_df["Close"])
-        )
-        n_stale = int(stale.sum())
+        # Stale bars
+        n_stale = int(((o == h) & (h == l) & (l == c)).sum())
         if n_stale > 10:
-            issue_type = "stale_bars_critical" if n_stale > 50 else "stale_bars"
             issues.append({
-                "issue_type": issue_type,
-                "detail": f"{n_stale}/{n} stale bars (OHLC all equal). "
-                          "Indicates missing or improperly aggregated data. "
-                          "EXCLUDE from IS training.",
+                "issue_type": "stale_bars_critical" if n_stale > 50 else "stale_bars",
+                "detail": f"{n_stale}/{n} bars with O=H=L=C",
             })
 
-        # ── Issue 3: Bar count ────────────────────────────────────────────────
+        # Bar count / early close
         if n < 350:
-            issues.append({
-                "issue_type": "bar_count_low",
-                "detail": f"{n} bars (expected ~390 for full 09:30-16:00 session)",
-            })
+            last_t = day_df.index[-1].time()
+            if last_t <= pd.Timestamp("13:05").time() and n >= 200:
+                issues.append({"issue_type": "early_close",
+                               "detail": f"{n} bars, last {last_t.strftime('%H:%M')}"})
+            else:
+                issues.append({"issue_type": "bar_count_low",
+                               "detail": f"{n} bars (expected ~390)"})
 
-        # ── Issue 4: ORB range anomaly (tick-to-bar / phantom indicator) ─────
-        orb_mask = day_df.index.time <= pd.Timestamp("09:45").time()
-        orb_bars = day_df[orb_mask]
-        if len(orb_bars) >= 3:
-            orb_range  = float(orb_bars["High"].max() - orb_bars["Low"].min())
-            full_range = float(day_df["High"].max()   - day_df["Low"].min())
-            if full_range > 0 and (orb_range / full_range) > 0.80:
-                issues.append({
-                    "issue_type": "orb_range_anomaly",
-                    "detail": f"ORB range ({orb_range:.3f}) = "
-                              f"{orb_range/full_range:.0%} of full-day range. "
-                              "Likely stale or phantom bars in the critical ORB window.",
-                })
+        # ORB range vs day range (informational)
+        orb = day_df[day_df.index.time < pd.Timestamp("09:45").time()]
+        if len(orb) >= 3:
+            orb_range  = float(orb["High"].max() - orb["Low"].min())
+            full_range = float(h.max() - l.min())
+            if full_range > 0 and orb_range / full_range > 0.80:
+                issues.append({"issue_type": "orb_range_anomaly",
+                               "detail": f"ORB range = {orb_range/full_range:.0%} of day range"})
 
-        # ── Issue 5: Price sanity / venue coverage ────────────────────────────
-        bad_price = day_df[
-            (day_df["High"] < day_df["Low"]) |
-            (day_df["Close"] <= 0) |
-            (day_df["Open"]  <= 0)
-        ]
-        if len(bad_price) > 0:
-            issues.append({
-                "issue_type": "price_error",
-                "detail": f"{len(bad_price)} bars with invalid OHLC values",
-            })
-
+        # Price sanity
+        n_bad = int(((h < l) | (c <= 0) | (o <= 0)).sum())
+        if n_bad:
+            issues.append({"issue_type": "price_error",
+                           "detail": f"{n_bad} bars with invalid OHLC"})
         return issues
 
-    # ── Download and store ────────────────────────────────────────────────────
+    @staticmethod
+    def _is_quality_ok(issues: list[dict]) -> int:
+        return 0 if any(i["issue_type"] in CRITICAL_ISSUES for i in issues) else 1
+
+    @staticmethod
+    def _discontinuity(open_p: float, prev_close: float | None) -> dict | None:
+        """Split-like overnight jump: prior-day levels are not comparable."""
+        if not prev_close:
+            return None
+        ratio = open_p / prev_close
+        lo, hi = DISCONTINUITY_BAND
+        if lo < ratio < hi:
+            return None
+        return {"issue_type": "overnight_discontinuity",
+                "detail": f"open/prev_close = {ratio:.3f} (split or similar); "
+                          "gap/PDH/PDL left NULL"}
 
     def download_and_store(
         self,
@@ -391,6 +489,7 @@ class MarketDataStore:
         vix_daily: dict[str, float] | None = None,
         chunk_months: int = 3,
         feed: str | None = None,
+        adjustment: str | None = None,
     ) -> dict:
         """
         Download all bars for ticker in date range and store in SQLite.
@@ -400,7 +499,17 @@ class MarketDataStore:
         vix_daily: {date_str: vix_close} — fetched separately from yfinance.
         """
         feed = (feed or DEFAULT_FEED).lower()
-        log.info("Downloading %s bars %s → %s (feed=%s)", ticker, start, end, feed)
+        adjustment = (adjustment or DEFAULT_ADJUSTMENT).lower()
+        stored = self.stored_adjustment(ticker)
+        if stored is not None and stored != adjustment:
+            # Mixing adjusted and raw prices in one series would corrupt
+            # prev-close/gap levels and every multi-day calculation.
+            raise AlpacaFatalError(
+                f"{ticker} is already stored with adjustment='{stored}'; refusing to "
+                f"add '{adjustment}' bars. Run --wipe --tickers {ticker} first.")
+        self._set_setting(f"adjustment:{ticker}", adjustment)
+        log.info("Downloading %s bars %s → %s (feed=%s, adjustment=%s)",
+                 ticker, start, end, feed, adjustment)
         failed_chunks: list[dict] = []
         t0 = time.monotonic()
 
@@ -421,7 +530,8 @@ class MarketDataStore:
             )
             log.info("  Chunk %s → %s...", chunk_start, chunk_end)
             try:
-                df = self._fetch_from_alpaca(ticker, chunk_start, chunk_end, feed=feed)
+                df = self._fetch_from_alpaca(ticker, chunk_start, chunk_end,
+                                             feed=feed, adjustment=adjustment)
                 bars_written, sessions_written = self._store_bars(ticker, df, vix_daily)
                 total_bars     += bars_written
                 total_sessions += sessions_written
@@ -431,7 +541,7 @@ class MarketDataStore:
                 # Keys/permissions: every remaining chunk would fail the same way.
                 # Previously this was logged per chunk and the run "finished" with
                 # 0 bars — a plausible cause of the empty market_data.db (P2-116).
-                self._update_meta(ticker, total_bars, total_sessions)
+                self._refresh_meta()
                 raise
             except Exception as e:
                 log.error("  Chunk %s → %s FAILED: %s", chunk_start, chunk_end, e)
@@ -440,9 +550,8 @@ class MarketDataStore:
             chunk_start = chunk_end + timedelta(days=1)
 
         elapsed = time.monotonic() - t0
-        # Update meta
-        self._update_meta(ticker, total_bars, total_sessions)
-        return {"ticker": ticker, "feed": feed, "total_bars": total_bars,
+        self._refresh_meta()
+        return {"ticker": ticker, "feed": feed, "adjustment": adjustment, "total_bars": total_bars,
                 "total_sessions": total_sessions, "elapsed_sec": round(elapsed, 1),
                 "failed_chunks": failed_chunks}
 
@@ -468,10 +577,11 @@ class MarketDataStore:
             day_str  = str(day)
             day_df   = df[df.index.date == day].copy()
 
-            # Market hours only: 09:30-16:00
+            # Regular session only: bars starting 09:30-15:59 (390 bars). A bar
+            # labelled 16:00 covers 16:00-16:01, i.e. after-hours trading.
             day_df = day_df[
                 (day_df.index.time >= pd.Timestamp("09:30").time()) &
-                (day_df.index.time <= pd.Timestamp("16:00").time())
+                (day_df.index.time <  pd.Timestamp("16:00").time())
             ]
             if len(day_df) < 10:
                 prev_close = prev_high = prev_low = None
@@ -482,21 +592,16 @@ class MarketDataStore:
             day_df["vwap"] = self._compute_vwap(day_df)
 
             # Validate
-            issues = self._validate_day(day_df, day)
-            quality_ok  = 1 if not issues else 0
+            issues  = self._validate_day(day_df, day)
+            open_p  = float(day_df["Open"].iloc[0])
+            disc    = self._discontinuity(open_p, prev_close)
+            if disc:
+                issues.append(disc)
+                prev_close = prev_high = prev_low = None
+            quality_ok  = self._is_quality_ok(issues)
             gap_session = 1 if any(i["issue_type"] == "bar_count_low" for i in issues) else 0
-
-            # Write to data_quality_log if issues found
-            if issues:
-                with self._conn() as conn:
-                    for iss in issues:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO data_quality_log "
-                            "(ticker, session_date, issue_type, detail, logged_at) "
-                            "VALUES (?,?,?,?,?)",
-                            (ticker, day_str, iss["issue_type"],
-                             iss["detail"], datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
-                        )
+            with self._conn() as conn:
+                self._record_issues(conn, ticker, day_str, issues)
 
             # Write bars
             bar_rows = []
@@ -511,13 +616,13 @@ class MarketDataStore:
                     "1m", 0,
                 ))
             with self._conn() as conn:
-                conn.executemany(
+                cur = conn.executemany(
                     "INSERT OR IGNORE INTO market_bars "
                     "(ticker,ts,ts_date,ts_time,open,high,low,close,volume,vwap,bar_interval,quality_flag) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     bar_rows
                 )
-            bars_written += len(bar_rows)
+                bars_written += max(cur.rowcount, 0)   # rows actually inserted, not attempted
 
             # Compute ORB levels
             orb_data = {}
@@ -533,7 +638,6 @@ class MarketDataStore:
                     orb_data[f"orb_{method}_low"]  = None
 
             # Gap
-            open_p   = float(day_df["Open"].iloc[0])
             gap_pct  = round((open_p - prev_close) / prev_close * 100, 3) if prev_close else None
             vix_val  = vix_daily.get(day_str, 0.0) or 0.0
             regime   = self._vix_to_regime(vix_val) if vix_val else "UNKNOWN"
@@ -614,18 +718,59 @@ class MarketDataStore:
             log.warning("VIX fetch failed (FRED + yfinance both unavailable): %s", e)
             return {}
 
-    def _update_meta(self, ticker: str, bars: int, sessions: int) -> None:
-        with self._conn() as conn:
-            conn.execute(
+    def _refresh_meta(self) -> None:
+        """Recompute data_store_meta from the tables (it used to ADD each run's
+        attempted counts, so re-runs inflated it)."""
+        import json
+        with self._conn() as c:
+            tickers = [r[0] for r in c.execute(
+                "SELECT DISTINCT ticker FROM session_context ORDER BY ticker")]
+            rng = c.execute("SELECT MIN(session_date), MAX(session_date), COUNT(*) "
+                            "FROM session_context").fetchone()
+            nbars = c.execute("SELECT COUNT(*) FROM market_bars").fetchone()[0]
+            c.execute(
                 """INSERT OR REPLACE INTO data_store_meta
-                (id, tickers, total_bars, total_sessions, last_updated)
-                VALUES (1,
-                  COALESCE((SELECT tickers FROM data_store_meta WHERE id=1),'[]'),
-                  COALESCE((SELECT total_bars FROM data_store_meta WHERE id=1),0) + ?,
-                  COALESCE((SELECT total_sessions FROM data_store_meta WHERE id=1),0) + ?,
-                  ?)""",
-                (bars, sessions, datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
-            )
+                   (id, tickers, earliest_date, latest_date, total_bars, total_sessions,
+                    last_updated, download_ts, quality_report)
+                   VALUES (1, ?, ?, ?, ?, ?, ?,
+                     (SELECT download_ts FROM data_store_meta WHERE id=1),
+                     (SELECT quality_report FROM data_store_meta WHERE id=1))""",
+                (json.dumps(tickers), rng[0], rng[1], nbars, rng[2],
+                 datetime.now(timezone.utc).replace(tzinfo=None).isoformat()))
+
+    def revalidate(self, ticker: str) -> dict:
+        """Re-run the quality checks on stored bars (no network). Use after a
+        check or threshold changes; updates session_context quality fields and
+        replaces the session's data_quality_log rows."""
+        with self._conn() as c:
+            days = [r[0] for r in c.execute(
+                "SELECT DISTINCT ts_date FROM market_bars WHERE ticker=? ORDER BY ts_date",
+                (ticker,))]
+        prev_close = None
+        n_ok = 0
+        for d in days:
+            day_df = self.get_session_bars(ticker, d)
+            if day_df.empty:
+                continue
+            day_df = day_df[day_df.index.time < pd.Timestamp("16:00").time()]
+            issues = self._validate_day(day_df, date.fromisoformat(d))
+            disc = self._discontinuity(float(day_df["Open"].iloc[0]), prev_close)
+            if disc:
+                issues.append(disc)
+            ok  = self._is_quality_ok(issues)
+            gap = 1 if any(i["issue_type"] == "bar_count_low" for i in issues) else 0
+            with self._conn() as c:
+                self._record_issues(c, ticker, d, issues)
+                if disc:
+                    c.execute("UPDATE session_context SET quality_ok=?, gap_session=?, "
+                              "prev_close=NULL, gap_pct=NULL, pdh=NULL, pdl=NULL "
+                              "WHERE ticker=? AND session_date=?", (ok, gap, ticker, d))
+                else:
+                    c.execute("UPDATE session_context SET quality_ok=?, gap_session=? "
+                              "WHERE ticker=? AND session_date=?", (ok, gap, ticker, d))
+            n_ok += ok
+            prev_close = float(day_df["Close"].iloc[-1])
+        return {"ticker": ticker, "sessions": len(days), "quality_ok": n_ok}
 
     # ── Retrieval API (used by historical_sim.py) ─────────────────────────────
 
@@ -735,12 +880,18 @@ class MarketDataStore:
             quality_issues = conn.execute(
                 "SELECT issue_type, COUNT(*) FROM data_quality_log GROUP BY issue_type"
             ).fetchall()
+            ok_rows = conn.execute(
+                "SELECT ticker, COUNT(*), SUM(quality_ok) FROM session_context GROUP BY ticker"
+            ).fetchall()
 
         result: dict[str, Any] = {
             "meta": dict(meta) if meta else {},
             "by_ticker": [dict(r) for r in by_ticker],
             "quality_issues": {r[0]: r[1] for r in quality_issues},
+            "quality_ok": {r[0]: (r[2] or 0, r[1]) for r in ok_rows},
         }
+        for t in result["by_ticker"]:
+            t["adjustment"] = self.stored_adjustment(t["ticker"])
         return result
 
     def regime_session_counts(self, ticker: str) -> dict:
@@ -871,6 +1022,13 @@ if __name__ == "__main__":
     p.add_argument("--check-date",     default="2024-12-20")
     p.add_argument("--feed",           default=None, choices=["sip", "iex"],
                    help="Override ALPACA_DATA_FEED (default sip)")
+    p.add_argument("--adjustment",     default=None, choices=["raw", "split", "all"],
+                   help="Override ALPACA_ADJUSTMENT (default raw — right for intraday)")
+    p.add_argument("--wipe",           action="store_true",
+                   help="Delete stored bars/sessions/quality rows for --tickers "
+                        "(FRED/sentiment tables untouched)")
+    p.add_argument("--revalidate",     action="store_true",
+                   help="Re-run quality checks on stored bars for --tickers (no network)")
     args = p.parse_args()
 
     store = MarketDataStore(args.db)
@@ -899,11 +1057,28 @@ if __name__ == "__main__":
               "both calls silently hit the same feed)")
         print("  ✓ Keys work and the SIP feed is available — safe to run --download.")
 
+    elif args.wipe:
+        for ticker in args.tickers:
+            n = store.wipe(ticker)
+            print(f"{ticker}: deleted {n['market_bars']:,} bars, "
+                  f"{n['session_context']:,} sessions, {n['data_quality_log']:,} quality rows")
+        print("Tip: run VACUUM to return the freed disk space (optional).")
+
+    elif args.revalidate:
+        for ticker in args.tickers:
+            r = store.revalidate(ticker)
+            n = r["sessions"]
+            print(f"{ticker}: quality_ok {r['quality_ok']}/{n}"
+                  + (f" ({r['quality_ok']/n:.0%})" if n else ""))
+
     elif args.status:
         st = store.status()
         print("\n=== DATA STORE STATUS ===")
         for t in st["by_ticker"]:
-            print(f"  {t['ticker']}: {t['sessions']} sessions, {t['bars']:,} bars")
+            ok, n = st["quality_ok"].get(t["ticker"], (0, 0))
+            print(f"  {t['ticker']}: {t['sessions']} sessions, {t['bars']:,} bars, "
+                  f"adjustment={t['adjustment']}, quality_ok {ok}/{n}"
+                  + (f" ({ok/n:.0%})" if n else ""))
         if st["quality_issues"]:
             print(f"  Quality issues: {st['quality_issues']}")
         m = st["meta"]
@@ -921,12 +1096,13 @@ if __name__ == "__main__":
                 end = OOS_END
             print(f"\nDownloading {ticker} {start} → {end}...")
             try:
-                result = store.download_and_store(ticker, start, end, feed=args.feed)
+                result = store.download_and_store(ticker, start, end, feed=args.feed,
+                                                  adjustment=args.adjustment)
             except AlpacaFatalError as e:
                 sys.exit(f"✗ {ticker}: stopped — {e}")
             print(f"Stored: {result['total_bars']:,} bars, "
                   f"{result['total_sessions']} sessions in {result['elapsed_sec']}s "
-                  f"(feed={result['feed']})")
+                  f"(feed={result['feed']}, adjustment={result['adjustment']})")
             if result["failed_chunks"]:
                 any_failed = True
                 print(f"⚠️  {len(result['failed_chunks'])} chunk(s) FAILED — re-run the same "

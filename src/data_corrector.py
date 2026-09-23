@@ -436,6 +436,20 @@ def correct_store(
     log.info("Correction run: %s %s → %s", ticker, start, end)
     store = MarketDataStore(db_path)
 
+    # GUARD (23 Sep 2026): the daily anchor below comes from yfinance, whose
+    # OHLC is always split-adjusted (and dividend-adjusted with auto_adjust=True).
+    # The store now holds RAW prices by default. Capping raw 1-min bars to an
+    # adjusted daily anchor would overwrite every pre-split NVDA/TSLA bar with a
+    # price 15-40x too low and trim SPY/QQQ highs by the dividend factor — it
+    # destroys the data instead of correcting it. Refuse until the anchor is
+    # rebuilt from bars of the same adjustment (e.g. Alpaca raw daily bars).
+    stored_adj = store.stored_adjustment(ticker)
+    if fetch_yf_daily and stored_adj != "all":
+        raise RuntimeError(
+            f"data_corrector: {ticker} is stored with adjustment={stored_adj!r}, but the "
+            "yfinance daily anchor is adjusted — running would corrupt the bars. "
+            "Not run. (Needs a same-adjustment anchor before it can be used.)")
+
     # ── Schema migration: add correction columns ────────────────────────────
     with sqlite3.connect(db_path) as conn:
         existing = {r[1] for r in conn.execute("PRAGMA table_info(market_bars)").fetchall()}
@@ -530,9 +544,7 @@ def correct_store(
 
             # Re-evaluate session quality after corrections
             issues_after = store._validate_day(corrected_df, sess_date)
-            critical = {"stale_bars_critical","stale_bars","price_error",
-                        "orb_range_anomaly","phantom_hl"}
-            new_quality_ok = 0 if any(i["issue_type"] in critical for i in issues_after) else 1
+            new_quality_ok = store._is_quality_ok(issues_after)   # one definition of "critical"
             conn.execute(
                 "UPDATE session_context SET quality_ok=? WHERE ticker=? AND session_date=?",
                 (new_quality_ok, ticker, sess_str)
