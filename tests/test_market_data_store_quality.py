@@ -155,3 +155,38 @@ def test_data_corrector_refuses_raw_bars(store):
     store.download_and_store("SPY", date(2024, 1, 2), date(2024, 1, 5), vix_daily={})
     with pytest.raises(RuntimeError, match="corrupt"):
         data_corrector.correct_store(store.db_path, "SPY", date(2024, 1, 2), date(2024, 1, 5))
+
+
+# ── Exchange calendar: early closes and non-sessions ───────────────────────
+
+def test_half_day_trimmed_at_real_close(store):
+    """Alpaca returns after-hours prints after a 13:00 close; they are dropped."""
+    store.download_and_store("SPY", date(2024, 11, 27), date(2024, 12, 2), vix_daily={})
+    n, last = _q(store, "SELECT COUNT(*), MAX(ts_time) FROM market_bars "
+                        "WHERE ticker='SPY' AND ts_date='2024-11-29'")[0]
+    assert (n, last) == (210, "12:59")
+    ctx = store.get_session_context("SPY", "2024-11-29")
+    assert ctx["quality_ok"] == 1 and ctx["n_bars"] == 210
+    assert ("early_close",) in _q(store, "SELECT issue_type FROM data_quality_log "
+                                         "WHERE session_date='2024-11-29'")
+    nxt = store.get_session_context("SPY", "2024-12-02")      # prev close = 12:59 bar
+    assert nxt["prev_close"] == _q(store, "SELECT close FROM market_bars WHERE ticker='SPY' "
+                                          "AND ts_date='2024-11-29' AND ts_time='12:59'")[0][0]
+
+def test_non_session_days_are_not_stored(store):
+    store.download_and_store("SPY", date(2024, 11, 26), date(2024, 11, 29), vix_daily={})
+    assert _q(store, "SELECT COUNT(*) FROM market_bars WHERE ts_date='2024-11-28'")[0][0] == 0
+
+def test_revalidate_trims_already_stored_post_close_bars(store, monkeypatch):
+    # Simulate the old store: no trimming at download time.
+    monkeypatch.setattr(mds, "session_close", lambda d: pd.Timestamp("16:00").time())
+    store.download_and_store("SPY", date(2024, 11, 27), date(2024, 12, 2), vix_daily={})
+    assert _q(store, "SELECT COUNT(*) FROM market_bars WHERE ts_date='2024-11-29'")[0][0] == 390
+    monkeypatch.undo()
+    r = store.revalidate("SPY")
+    assert r["bars_trimmed"] == 180
+    assert _q(store, "SELECT MAX(ts_time) FROM market_bars WHERE ts_date='2024-11-29'")[0][0] == "12:59"
+    ctx = store.get_session_context("SPY", "2024-12-02")
+    assert ctx["prev_close"] == _q(store, "SELECT close FROM market_bars WHERE ticker='SPY' "
+                                          "AND ts_date='2024-11-29' AND ts_time='12:59'")[0][0]
+    assert store.get_session_context("SPY", "2024-11-29")["quality_ok"] == 1

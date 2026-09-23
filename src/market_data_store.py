@@ -150,6 +150,40 @@ OOS_END  = date(2024, 12, 31)
 SEALED   = date(2025,  1,  1)
 
 # ---------------------------------------------------------------------------
+# Exchange calendar: each session's real close
+# ---------------------------------------------------------------------------
+
+_CLOSE_CACHE: dict[date, Any] = {}
+_CAL_WARNED = False
+
+def session_close(d: date):
+    """NYSE close time (America/New_York) for session d; None if d is not a
+    session. Uses exchange_calendars (already a project dependency, P1-008).
+    Returns the normal 16:00 if the library is unavailable — then early closes
+    are not trimmed (logged once)."""
+    global _CAL_WARNED
+    if not _CLOSE_CACHE:
+        try:
+            import exchange_calendars as xcals
+            sched = xcals.get_calendar("XNYS", start="2010-01-01").schedule
+            closes = sched["close"].dt.tz_convert("America/New_York")
+            _CLOSE_CACHE.update({ts.date(): c.time() for ts, c in closes.items()})
+        except Exception as e:                                   # pragma: no cover
+            if not _CAL_WARNED:
+                log.warning("exchange_calendars unavailable (%s): early closes not trimmed", e)
+                _CAL_WARNED = True
+            return pd.Timestamp("16:00").time()
+    if d > max(_CLOSE_CACHE):                                    # beyond calendar horizon
+        return pd.Timestamp("16:00").time()
+    return _CLOSE_CACHE.get(d)
+
+
+def expected_bars(close_t) -> int:
+    """1-min bars from 09:30 up to (not including) the close."""
+    return (close_t.hour * 60 + close_t.minute) - (9 * 60 + 30)
+
+
+# ---------------------------------------------------------------------------
 # SQLite schema
 # ---------------------------------------------------------------------------
 
@@ -399,9 +433,10 @@ class MarketDataStore:
                              routinely that wide.
           stale_bars_critical (critical) > 50 bars with O=H=L=C
           stale_bars         (info) 11-50 such bars
-          bar_count_low      (critical) < 350 bars on a full-length session;
-                             a session ending by 13:05 with >= 200 bars is an
-                             early close and is logged as 'early_close' (info)
+          bar_count_low      (critical) fewer than 90% of the bars the exchange
+                             calendar expects for that session
+          early_close        (info) calendar close before 16:00 (bars after the
+                             close are trimmed before validation)
           orb_range_anomaly  (info) 09:30-09:45 range > 80% of the day's range —
                              happens legitimately on quiet trend-less days
           price_error        (critical) high < low or non-positive prices
@@ -438,15 +473,15 @@ class MarketDataStore:
                 "detail": f"{n_stale}/{n} bars with O=H=L=C",
             })
 
-        # Bar count / early close
-        if n < 350:
-            last_t = day_df.index[-1].time()
-            if last_t <= pd.Timestamp("13:05").time() and n >= 200:
-                issues.append({"issue_type": "early_close",
-                               "detail": f"{n} bars, last {last_t.strftime('%H:%M')}"})
-            else:
-                issues.append({"issue_type": "bar_count_low",
-                               "detail": f"{n} bars (expected ~390)"})
+        # Bar count / early close (calendar-aware)
+        close_t = session_close(session_date) or pd.Timestamp("16:00").time()
+        expect  = expected_bars(close_t)
+        if expect < 390:
+            issues.append({"issue_type": "early_close",
+                           "detail": f"close {close_t.strftime('%H:%M')}; {n}/{expect} bars"})
+        if n < 0.9 * expect:
+            issues.append({"issue_type": "bar_count_low",
+                           "detail": f"{n} bars (expected {expect})"})
 
         # ORB range vs day range (informational)
         orb = day_df[day_df.index.time < pd.Timestamp("09:45").time()]
@@ -583,6 +618,12 @@ class MarketDataStore:
                 (day_df.index.time >= pd.Timestamp("09:30").time()) &
                 (day_df.index.time <  pd.Timestamp("16:00").time())
             ]
+            close_t = session_close(day)
+            if close_t is None:
+                log.warning("  %s %s is not an NYSE session — %d bars skipped",
+                            ticker, day_str, len(day_df))
+                continue
+            day_df = day_df[day_df.index.time < close_t]   # drops post-close prints on half-days
             if len(day_df) < 10:
                 prev_close = prev_high = prev_low = None
                 continue
@@ -739,38 +780,47 @@ class MarketDataStore:
                  datetime.now(timezone.utc).replace(tzinfo=None).isoformat()))
 
     def revalidate(self, ticker: str) -> dict:
-        """Re-run the quality checks on stored bars (no network). Use after a
-        check or threshold changes; updates session_context quality fields and
-        replaces the session's data_quality_log rows."""
+        """Re-run quality checks on stored bars (no network). Also removes bars
+        stored after each session's real close (half-day after-hours prints),
+        and recomputes n_bars and prior-day levels (prev_close/PDH/PDL/gap_pct)
+        from the trimmed sessions. Use after a check or threshold changes."""
         with self._conn() as c:
             days = [r[0] for r in c.execute(
                 "SELECT DISTINCT ts_date FROM market_bars WHERE ticker=? ORDER BY ts_date",
                 (ticker,))]
-        prev_close = None
-        n_ok = 0
+        prev = None                     # (close, high, low) of previous kept session
+        n_ok = trimmed = 0
         for d in days:
+            dd = date.fromisoformat(d)
+            close_t = session_close(dd) or pd.Timestamp("16:00").time()
+            with self._conn() as c:
+                trimmed += c.execute(
+                    "DELETE FROM market_bars WHERE ticker=? AND ts_date=? AND ts_time>=?",
+                    (ticker, d, close_t.strftime("%H:%M"))).rowcount
             day_df = self.get_session_bars(ticker, d)
             if day_df.empty:
                 continue
-            day_df = day_df[day_df.index.time < pd.Timestamp("16:00").time()]
-            issues = self._validate_day(day_df, date.fromisoformat(d))
-            disc = self._discontinuity(float(day_df["Open"].iloc[0]), prev_close)
+            issues = self._validate_day(day_df, dd)
+            open_p = float(day_df["Open"].iloc[0])
+            disc = self._discontinuity(open_p, prev[0] if prev else None)
             if disc:
                 issues.append(disc)
+            p_close, p_high, p_low = (None, None, None) if (disc or not prev) else prev
+            gap = round((open_p - p_close) / p_close * 100, 3) if p_close else None
             ok  = self._is_quality_ok(issues)
-            gap = 1 if any(i["issue_type"] == "bar_count_low" for i in issues) else 0
+            gs  = 1 if any(i["issue_type"] == "bar_count_low" for i in issues) else 0
             with self._conn() as c:
                 self._record_issues(c, ticker, d, issues)
-                if disc:
-                    c.execute("UPDATE session_context SET quality_ok=?, gap_session=?, "
-                              "prev_close=NULL, gap_pct=NULL, pdh=NULL, pdl=NULL "
-                              "WHERE ticker=? AND session_date=?", (ok, gap, ticker, d))
-                else:
-                    c.execute("UPDATE session_context SET quality_ok=?, gap_session=? "
-                              "WHERE ticker=? AND session_date=?", (ok, gap, ticker, d))
+                c.execute("UPDATE session_context SET quality_ok=?, gap_session=?, n_bars=?, "
+                          "prev_close=?, gap_pct=?, pdh=?, pdl=? "
+                          "WHERE ticker=? AND session_date=?",
+                          (ok, gs, len(day_df), p_close, gap, p_high, p_low, ticker, d))
             n_ok += ok
-            prev_close = float(day_df["Close"].iloc[-1])
-        return {"ticker": ticker, "sessions": len(days), "quality_ok": n_ok}
+            prev = (float(day_df["Close"].iloc[-1]), float(day_df["High"].max()),
+                    float(day_df["Low"].min()))
+        self._refresh_meta()
+        return {"ticker": ticker, "sessions": len(days), "quality_ok": n_ok,
+                "bars_trimmed": trimmed}
 
     # ── Retrieval API (used by historical_sim.py) ─────────────────────────────
 
@@ -1069,7 +1119,8 @@ if __name__ == "__main__":
             r = store.revalidate(ticker)
             n = r["sessions"]
             print(f"{ticker}: quality_ok {r['quality_ok']}/{n}"
-                  + (f" ({r['quality_ok']/n:.0%})" if n else ""))
+                  + (f" ({r['quality_ok']/n:.0%})" if n else "")
+                  + f"; {r['bars_trimmed']:,} post-close bars removed")
 
     elif args.status:
         st = store.status()
