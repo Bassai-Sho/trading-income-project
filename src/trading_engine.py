@@ -1551,7 +1551,10 @@ def _backtest_orb_simple(df: pd.DataFrame, cfg: dict) -> dict:
 
 
 def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
-                             exit_mode: str = "baseline") -> dict:
+                             exit_mode: str = "baseline",
+                             fill_model: str = "legacy",
+                             df_1m: pd.DataFrame | None = None,
+                             entry_fill: str = "next_open") -> dict:
     """
     Full-gate ORB backtest on REAL 5-minute bars (added for the 5-minute
     WFA variant — see wfa_run_5m()).
@@ -1607,11 +1610,46 @@ def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
                           +1R, then VWAP trailing arms and the trade rides
                           until the trailing stop is hit or EOD.
 
+    fill_model (P2-122 — how orders are FILLED; signals are identical):
+      "legacy"   — the original behaviour, kept as the default so every
+                   earlier result is reproducible: enter at the signal bar's
+                   close; a stop/target is DECIDED on a 5-min close but BOOKED
+                   at the stop/target price. No real order gets that fill —
+                   PR-001's diagnostic showed it inflated expectancy ~3-5x.
+      "resting"  — stop and target are resting broker orders, simulated on
+                   1-MINUTE bars (df_1m required):
+                     * entry: market order after the signal bar closes, filled
+                       at the next 1-min bar's open (entry_fill="next_open"),
+                       or at the signal close (entry_fill="signal_close", for
+                       attribution only). Stop is the same ORB level; R and the
+                       target are measured from the actual fill. An entry that
+                       fills at/through the stop is skipped (counted).
+                     * stop  : fills when a 1-min low (long) reaches it — at the
+                       stop, or at the bar's open if it gapped through.
+                     * target: fills when a 1-min high (long) reaches it — at t1,
+                       or at the open if it gapped through.
+                     * a 1-min bar that touches both: STOP first (conservative).
+                     * VWAP trailing / trail arming still update on each 5-min
+                       close; the moved stop applies from the next minute.
+                     * EOD: market exit at the open of the session_end minute.
+                     * no new entries on a signal bar at/after session_end
+                       (legacy would open one and never close it).
+
     Returns the same metrics shape as _backtest_orb_simple() so both feed
     the same WFA split/verdict logic.
     """
     if exit_mode not in ("baseline", "fixed_1_5r", "trail_after_1r"):
         raise ValueError(f"Unknown exit_mode: {exit_mode!r}")
+    if fill_model not in ("legacy", "resting"):
+        raise ValueError(f"Unknown fill_model: {fill_model!r}")
+    if entry_fill not in ("next_open", "signal_close"):
+        raise ValueError(f"Unknown entry_fill: {entry_fill!r}")
+    resting = fill_model == "resting"
+    if resting and (df_1m is None or df_1m.empty):
+        raise ValueError("fill_model='resting' needs the 1-minute bars (df_1m)")
+    one_min = ({d: g for d, g in df_1m.groupby(df_1m.index.date)} if resting else {})
+    skipped_entries = 0
+    _5min = pd.Timedelta(minutes=5)
 
     if df_5m.empty:
         return {}
@@ -1642,6 +1680,14 @@ def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
         direction = stop = entry = t1 = risk_dist = None
         trail_armed = False   # only meaningful for "trail_after_1r"
         entry_meta: dict = {}
+        if resting:
+            m1 = one_min.get(day)
+            if m1 is None or m1.empty:
+                continue
+            m1_ts = m1.index
+            m1_o, m1_h = m1["Open"].to_numpy(float), m1["High"].to_numpy(float)
+            m1_l = m1["Low"].to_numpy(float)
+        entry_fill_ts = None
 
         for bar_ts, bar in session_bars.iterrows():
             asof_today = df_5m[(df_5m.index <= bar_ts) & (df_5m.index.date == day)]
@@ -1677,7 +1723,27 @@ def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
                 entry = last_close
                 stop  = (round(orb["orb_low"]  - buffer, 4) if direction == "long"
                          else round(orb["orb_high"] + buffer, 4))
-                risk_dist = abs(entry - stop)
+                if resting:
+                    if bar_ts.time() >= cfg["session_end"]:
+                        direction = None
+                        continue
+                    k = m1_ts.searchsorted(bar_ts + _5min)
+                    if k >= len(m1_ts):
+                        direction = None
+                        continue
+                    entry_fill_ts = m1_ts[k]
+                    if entry_fill == "next_open":
+                        entry = float(m1_o[k])
+                    # Market order filled at/through the stop: the stop order
+                    # would trigger at once. Not a tradeable setup — skip.
+                    if (direction == "long" and entry <= stop) or \
+                       (direction == "short" and entry >= stop):
+                        skipped_entries += 1
+                        direction = None
+                        continue
+                    risk_dist = abs(entry - stop)
+                else:
+                    risk_dist = abs(entry - stop)
                 if risk_dist <= 1e-6:
                     direction = None
                     continue
@@ -1705,13 +1771,65 @@ def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
                         "doji" if entry_body_pct < 20 else "moderate"),
                     "vwap_slope_at_entry": vs["direction"],
                 }
+                if resting:
+                    entry_meta.update({"fill_model": "resting", "entry_fill": entry_fill,
+                                       "signal_close": round(last_close, 4),
+                                       "entry_fill_ts": entry_fill_ts})
                 continue   # opened on this bar's close; manage from the next bar
 
             # ── In position ──
             exit_reason = exit_r = None
+            exit_px = None
             has_fixed_target = exit_mode in ("baseline", "fixed_1_5r")
+            sgn = 1 if direction == "long" else -1
 
-            if direction == "long" and last_close <= stop:
+            if resting:
+                a = m1_ts.searchsorted(max(bar_ts, entry_fill_ts))
+                b = m1_ts.searchsorted(bar_ts + _5min)
+                if bar_ts.time() >= cfg["session_end"]:
+                    # EOD market exit at the open of the session_end minute
+                    if a < len(m1_ts):
+                        exit_reason, exit_px = "eod", float(m1_o[a])
+                    else:
+                        exit_reason, exit_px = "eod", last_close
+                else:
+                    for j in range(a, b):
+                        o, h, l = m1_o[j], m1_h[j], m1_l[j]
+                        stop_hit = (l <= stop) if direction == "long" else (h >= stop)
+                        tgt_hit  = has_fixed_target and (
+                            (h >= t1) if direction == "long" else (l <= t1))
+                        gap_stop = (o <= stop) if direction == "long" else (o >= stop)
+                        gap_tgt  = has_fixed_target and (
+                            (o >= t1) if direction == "long" else (o <= t1))
+                        if gap_stop:
+                            exit_reason, exit_px = "trailing_stop", float(o)
+                        elif gap_tgt:
+                            exit_reason, exit_px = "target_hit", float(o)
+                        elif stop_hit:                      # includes both-touched: stop first
+                            exit_reason, exit_px = "trailing_stop", float(stop)
+                        elif tgt_hit:
+                            exit_reason, exit_px = "target_hit", float(t1)
+                        if exit_reason:
+                            bar_ts_exit = m1_ts[j]
+                            break
+                    if exit_reason is None:
+                        # 5-min close: arm / trail exactly as the legacy model
+                        if exit_mode == "trail_after_1r" and not trail_armed:
+                            if ((direction == "long" and last_close >= t1) or
+                                    (direction == "short" and last_close <= t1)):
+                                trail_armed = True
+                        if use_trailing and trail_armed:
+                            vwap_series = _vwap(asof_today, cfg["session_start"])
+                            vwap_val = (float(vwap_series.dropna().iloc[-1])
+                                        if not vwap_series.dropna().empty else None)
+                            if vwap_val:
+                                stop = _vwap_trailing(stop, vwap_val, direction)
+                if exit_reason is not None:
+                    exit_r = (exit_px - entry) / risk_dist * sgn
+                    if exit_reason == "eod":
+                        bar_ts_exit = m1_ts[a] if a < len(m1_ts) else bar_ts
+
+            elif direction == "long" and last_close <= stop:
                 exit_reason, exit_r = "trailing_stop", (stop - entry) / risk_dist
             elif direction == "short" and last_close >= stop:
                 exit_reason, exit_r = "trailing_stop", (entry - stop) / risk_dist
@@ -1753,11 +1871,14 @@ def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
                 net_r = exit_r - cost_r
                 r_multiples.append(net_r)
                 cost_r_list.append(cost_r)
-                exit_price = (stop if exit_reason == "trailing_stop" else
-                              t1 if exit_reason == "target_hit" else last_close)
+                if resting:
+                    exit_price = exit_px
+                else:
+                    exit_price = (stop if exit_reason == "trailing_stop" else
+                                  t1 if exit_reason == "target_hit" else last_close)
                 trades.append({
                     **entry_meta,
-                    "exit_ts":     bar_ts,
+                    "exit_ts":     bar_ts_exit if resting else bar_ts,
                     "exit_price":  round(exit_price, 4),
                     "actual_r":    net_r,   # unrounded — must exactly match the
                                             # corresponding r_multiples entry
@@ -1767,9 +1888,12 @@ def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
                 direction = stop = entry = t1 = risk_dist = None
                 trail_armed = False
                 entry_meta = {}
+                if resting:
+                    # the next entry signal can only come from a LATER 5-min bar
+                    entry_fill_ts = None
 
     if not r_multiples:
-        return {"n": 0}
+        return {"n": 0, "skipped_entries": skipped_entries}
 
     n    = len(r_multiples)
     wins = [r for r in r_multiples if r > 0]
@@ -1803,7 +1927,9 @@ def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
             # downstream consumer (Markov chain, N-gram, trade journaling),
             # not just WFA summary metrics. Both new keys are additive —
             # existing callers only read the keys they already used.
-            "trades": trades}
+            "trades": trades,
+            "fill_model": fill_model,
+            "skipped_entries": skipped_entries}
 
 
 def _backtest_orb_fade(df_5m: pd.DataFrame, cfg: dict) -> dict:
