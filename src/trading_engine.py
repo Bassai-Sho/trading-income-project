@@ -1883,6 +1883,7 @@ def _backtest_orb_full_gate(df_5m: pd.DataFrame, cfg: dict,
                     "actual_r":    net_r,   # unrounded — must exactly match the
                                             # corresponding r_multiples entry
                     "exit_reason": exit_reason,
+                    "units":       units,   # fractional shares (legacy sizing; P2-123 golden export)
                 })
                 in_position = False
                 direction = stop = entry = t1 = risk_dist = None
