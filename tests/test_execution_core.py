@@ -195,3 +195,51 @@ def test_flip_through_zero_resets_average():
 def test_malformed_bar_fails_closed(o, h, l, cl):
     with pytest.raises(ValueError, match="fail closed"):
         core().process_bar(bar(o, h, l, cl))
+
+
+# ── Same-minute follow-on orders (bracket legs; slice 2) ────────────────────
+
+def test_follow_on_stop_uses_fill_price_not_bar_open():
+    """Entry filled mid-minute at 100.40; a stop at 100.50 placed after it is
+    already through: fills at the entry price, never at the stop or the open."""
+    c = core()
+    c.submit([sub("e", "BUY", "LIMIT", price=100.40)], T0)
+    b = bar(101.0, 101.2, 100.0, 100.8)
+    assert fills(c.process_bar(b)) == [("e", 100.40)]
+    c.submit([sub("s", "SELL", "STOP", stop=100.50)], T0, after_price=100.40)
+    assert fills(c.process_bar(b)) == [("s", 100.40)]
+
+
+def test_follow_on_bracket_triggers_in_rest_of_minute_stop_first():
+    c = core()
+    c.submit([sub("e", "BUY", "MARKET")], T0)
+    b = bar(100.0, 101.5, 98.5, 100.2)
+    assert fills(c.process_bar(b)) == [("e", 100.0)]
+    c.submit([sub("s", "SELL", "STOP", stop=99.0, oco="b"),
+              sub("t", "SELL", "LIMIT", price=101.0, oco="b")], T0, after_price=100.0)
+    r = c.process_bar(b)
+    assert fills(r) == [("s", 99.0)] and c.position("SPY") == 0
+
+
+def test_follow_on_market_fills_at_the_triggering_fill_price():
+    c = core()
+    c.submit([sub("e", "BUY", "MARKET")], T0)
+    b = bar(100.0, 100.5, 99.5, 100.2)
+    c.process_bar(b)
+    c.submit([sub("x", "SELL", "MARKET")], T0, after_price=100.0)
+    assert fills(c.process_bar(b)) == [("x", 100.0)]
+
+
+def test_follow_on_price_applies_only_to_its_own_minute():
+    c = core(); long_position(c)
+    c.submit([sub("s", "SELL", "STOP", stop=99.0)], T0, after_price=100.0)
+    nxt = bar(98.0, 98.5, 97.5, 98.0, T0.replace(minute=1))       # next minute gaps below the stop
+    assert fills(c.process_bar(nxt)) == [("s", 98.0)]              # its own open, not 100.0
+
+
+def test_reprocessing_a_bar_is_idempotent_for_existing_orders():
+    c = core(); long_position(c)
+    c.submit([sub("s", "SELL", "STOP", stop=95.0)], T0)
+    b = bar(100, 101, 99, 100, T0.replace(minute=1))
+    assert c.process_bar(b) == [] and c.process_bar(b) == []
+    assert len(c.view().open_orders) == 1

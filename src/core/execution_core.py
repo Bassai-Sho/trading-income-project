@@ -17,6 +17,17 @@ FILL RULES (1-minute bars; each rule pinned by tests/test_execution_core.py)
   An order is only eligible on bars starting at/after the time it became active
   (no filling on the bar that produced the signal).
 
+SAME-MINUTE FOLLOW-ON ORDERS (bracket behaviour)
+  Orders a box submits in response to a fill during minute m can be passed
+  with after_price = that fill price. They are matched against the REST of
+  minute m (call process_bar(m) again — already-evaluated orders cannot change
+  outcome on the same bar), with after_price standing in for the open:
+  a stop placed after a long entry fills at the stop if the minute's low
+  reaches it (at after_price if the entry itself was at/through the stop); a
+  target fills at the limit if the minute's high reaches it; a follow-on MARKET
+  order fills at after_price. Stops still precede targets. This mirrors a
+  broker bracket order whose legs go live the moment the entry fills.
+
 LIFECYCLE
   SUBMIT  -> ACCEPTED, or REJECTED (INVALID_ORDER, DUPLICATE_CLIENT_ORDER_ID,
              INSUFFICIENT_BUYING_POWER). A client_order_id can never be reused.
@@ -60,6 +71,7 @@ class _Order:
     a: OrderAction
     active_from: datetime
     seq: int
+    after_price: float | None = None   # same-minute follow-on (see module doc)
 
 
 @dataclass
@@ -118,10 +130,13 @@ class ExecutionCore:
 
     # ── Commands ─────────────────────────────────────────────────────────────
 
-    def submit(self, actions: list[OrderAction], now: datetime) -> list[ExecutionReport]:
+    def submit(self, actions: list[OrderAction], now: datetime,
+               after_price: float | None = None) -> list[ExecutionReport]:
         """Accept/reject actions. `now` = when they become active (e.g. the END
         of the 5-min bar the box just saw); they can fill on 1-min bars
-        starting at or after it."""
+        starting at or after it. after_price: see SAME-MINUTE FOLLOW-ON ORDERS
+        (then `now` is the start of the minute in which the triggering fill
+        happened)."""
         self._now = now
         out: list[ExecutionReport] = []
         for a in actions:
@@ -143,7 +158,7 @@ class ExecutionCore:
                 continue
             self._seen.add(a.client_order_id)
             self._seq += 1
-            self._orders[a.client_order_id] = _Order(a, now, self._seq)
+            self._orders[a.client_order_id] = _Order(a, now, self._seq, after_price)
             out.append(self._report(a, "ACCEPTED", now, leaves=a.qty))
         return out
 
@@ -163,7 +178,9 @@ class ExecutionCore:
         for o in mine:
             if o.a.client_order_id not in self._orders:      # cancelled by an OCO sibling
                 continue
-            px = self._fill_price(o.a, bar)
+            eff_open = (o.after_price if o.after_price is not None
+                        and bar.timestamp == o.active_from else bar.open)
+            px = self._fill_price(o.a, bar, eff_open)
             if px is None:
                 continue
             out += self._fill(o, px, bar.timestamp)
@@ -207,18 +224,20 @@ class ExecutionCore:
         return added > self.buying_power() + 1e-9
 
     @staticmethod
-    def _fill_price(a: OrderAction, b: Bar) -> float | None:
+    def _fill_price(a: OrderAction, b: Bar, o: float) -> float | None:
+        """o = the effective open: the bar's open, or after_price for a
+        same-minute follow-on order."""
         if a.order_type == "MARKET":
-            return b.open
+            return o
         if a.order_type == "STOP":
             s = a.stop_price
             if a.side == "SELL":
-                return b.open if b.open <= s else (s if b.low <= s else None)
-            return b.open if b.open >= s else (s if b.high >= s else None)
+                return o if o <= s else (s if b.low <= s else None)
+            return o if o >= s else (s if b.high >= s else None)
         lim = a.price
         if a.side == "SELL":
-            return b.open if b.open >= lim else (lim if b.high >= lim else None)
-        return b.open if b.open <= lim else (lim if b.low <= lim else None)
+            return o if o >= lim else (lim if b.high >= lim else None)
+        return o if o <= lim else (lim if b.low <= lim else None)
 
     def _fill(self, o: _Order, px: float, ts: datetime) -> list[ExecutionReport]:
         a = o.a
