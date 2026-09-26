@@ -269,3 +269,14 @@ def test_moc_on_a_symbol_with_no_trades_expires():
     c.submit([sub("m", "BUY", "MOC")], T0)
     r = c.end_session(T0.replace(hour=16))
     assert [(x.status, x.reason) for x in r] == [("EXPIRED", "SESSION_CLOSE")]
+
+
+def test_live_from_next_bar_ignores_the_same_minute():
+    c = core()
+    c.submit([sub("e", "BUY", "MARKET")], T0)
+    b = bar(100.0, 101.0, 98.5, 100.5)
+    c.process_bar(b)
+    c.submit([OrderAction("SUBMIT", "s", "SPY", "SELL", "STOP", 10, None, 99.0, "DAY", "", "stop",
+                          live_from_next_bar=True)], T0, after_price=100.0)
+    assert fills(c.process_bar(b)) == []                                   # not in the entry minute
+    assert fills(c.process_bar(bar(99.5, 99.6, 98.8, 99.0, T0.replace(minute=1)))) == [("s", 99.0)]

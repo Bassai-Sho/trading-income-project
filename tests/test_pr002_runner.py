@@ -103,3 +103,13 @@ def test_trade_frame_r_signs_and_flags():
     assert list(t["gross_r"].round(9)) == [3.0, 2.0, -1.0]
     assert list(t["entry_minute_stop"]) == [False, False, True]
     assert list(t["gapped_entry"]) == [False, True, False]
+
+
+def test_optimistic_diagnostic_is_labelled_and_never_gates(dbs):
+    udb, mdb, tmp = dbs
+    cons = pr.run_stage1(udb, mdb, None, skip_null=True, out_dir=tmp / "out")
+    opt = pr.run_stage1(udb, mdb, None, out_dir=tmp / "out", optimistic_ties=True)
+    assert opt["mode"] == "optimistic_ties" and opt["null"] is None
+    assert opt["verdict"].startswith("DIAGNOSTIC ONLY") and "stage1_optimistic_" in opt["path"]
+    assert opt["diagnostics"]["entry_minute_stop_share"] == 0.0
+    assert cons["diagnostics"]["entry_minute_stop_share"] > 0.0

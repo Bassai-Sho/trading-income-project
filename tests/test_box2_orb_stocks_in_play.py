@@ -115,3 +115,17 @@ def test_box_state_is_frozen():
     assert State.__dataclass_params__.frozen and Params.__dataclass_params__.frozen
     with pytest.raises(dataclasses.FrozenInstanceError):
         State().phase = "x"
+
+
+def test_optimistic_diagnostic_skips_the_entry_minute_stop():
+    """Same session as the conservative entry-minute loss: with the diagnostic
+    switch the stop only goes live the next minute, so the trade runs to the close."""
+    df = day(first5=BULL, path={20: (100.9, 101.1, 100.7, 101.05)})
+    for i in range(21, 390):
+        df.iloc[i, :4] = [101.05, 101.1, 101.0, 101.05]
+    d = str(df.index[0].date())
+    cons = run_box(OrbStocksInPlayBox(), Params(atr14={d: 2.0}), df, "XYZ", AccountConfig(leverage=None))
+    opt = run_box(OrbStocksInPlayBox(), Params(atr14={d: 2.0}, stop_from_next_minute=True), df, "XYZ",
+                  AccountConfig(leverage=None))
+    assert cons.state.journal[0].exit_reason == "stop"
+    assert opt.state.journal[0].exit_reason == "close" and opt.state.journal[0].exit_price == pytest.approx(101.05)

@@ -8,6 +8,11 @@ seen — SPEC is the pre-registration.
 
     python src/pr002_runner.py                  # full Stage 1 (null gate ~20-40 min)
     python src/pr002_runner.py --skip-null      # everything except G1 (quick look)
+    python src/pr002_runner.py --optimistic-ties
+        DIAGNOSTIC (pre-registered in P2-127): the stop loss goes live the minute
+        AFTER the entry instead of in the entry minute — the favourable reading
+        of the intrabar-ordering ambiguity. Not a gate; never replaces the frozen
+        (conservative) result. Output: stage1_optimistic_<utc>.json.
 
 Output: DATA/pr002/stage1_<utc>.json and a printed report.
 """
@@ -93,7 +98,7 @@ def data_error(df: pd.DataFrame, day_high: float, day_low: float, tol: float) ->
 # ── Trades ─────────────────────────────────────────────────────────────────────
 
 def run_trades(stock_days: list[StockDay], minutes: MarketDataStore, stop_atr_frac: float,
-               tol: float) -> tuple[list, dict, dict]:
+               tol: float, stop_from_next_minute: bool = False) -> tuple[list, dict, dict]:
     """Returns (trades, excluded counts, {(symbol, date): bars} for the null gate)."""
     box = OrbStocksInPlayBox()
     trades, excluded, bars = [], {}, {}
@@ -104,7 +109,8 @@ def run_trades(stock_days: list[StockDay], minutes: MarketDataStore, stop_atr_fr
             excluded[why] = excluded.get(why, 0) + 1
             continue
         df = df[["Open", "High", "Low", "Close", "Volume"]]
-        res = run_box(box, Params(atr14={sd.date: sd.atr}, stop_atr_frac=stop_atr_frac),
+        res = run_box(box, Params(atr14={sd.date: sd.atr}, stop_atr_frac=stop_atr_frac,
+                                  stop_from_next_minute=stop_from_next_minute),
                       df, sd.symbol, AccountConfig(leverage=None))
         trades += list(res.state.journal)
         if res.state.journal:
@@ -174,12 +180,16 @@ def spread_check(stock_days, minutes, market_db: str | None) -> dict:
             "selected_median_half_bps": sel, "sample_stock_days": len(sample)}
 
 
-def run_stage1(universe_db, minutes_db, market_db, skip_null=False, out_dir=Path("DATA/pr002")):
+def run_stage1(universe_db, minutes_db, market_db, skip_null=False, out_dir=Path("DATA/pr002"),
+               optimistic_ties=False):
     start, end = SPEC["is_window"]
     minutes = MarketDataStore(minutes_db)
     sds = load_stock_days(universe_db, start, end, SPEC["top_n"])
     log.info("stock-days: %d", len(sds))
-    trades, excluded, bars = run_trades(sds, minutes, SPEC["stop_atr_frac"], SPEC["data_error_tolerance"])
+    if optimistic_ties:
+        skip_null = True                                   # diagnostic only: no gates from it
+    trades, excluded, bars = run_trades(sds, minutes, SPEC["stop_atr_frac"],
+                                        SPEC["data_error_tolerance"], optimistic_ties)
     t = trade_frame(trades)
     if t.empty:
         raise SystemExit("no trades")
@@ -227,17 +237,21 @@ def run_stage1(universe_db, minutes_db, market_db, skip_null=False, out_dir=Path
     first_fail = next((g for g in order if gates[g] is False), None)
     verdict = ("FAIL at " + first_fail) if first_fail else (
         "PASS G1-G3 -> run G4 robustness audit" if gates["G1_null"] else "G2/G3 pass; G1 not run")
+    if optimistic_ties:
+        verdict = "DIAGNOSTIC ONLY (optimistic intrabar ordering) — not a gate; would-be: " + verdict
     try:
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
                                 text=True, timeout=5).stdout.strip()
     except Exception:
         commit = None
-    report = {"spec": SPEC, "run_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    report = {"spec": SPEC, "mode": "optimistic_ties" if optimistic_ties else "frozen",
+              "run_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "commit": commit, "h2_bps_used": bps, "spread": spread, "H1": h1, "H2": h2,
               "H2_cost_stress_expectancy": stress, "breakeven_bps_per_side": be,
               "G2_detail": g2, "null": null, "gates": gates, "verdict": verdict, "diagnostics": diag}
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"stage1_{report['run_at'].replace(':', '')}.json"
+    stem = "stage1_optimistic" if optimistic_ties else "stage1"
+    path = out_dir / f"{stem}_{report['run_at'].replace(':', '')}.json"
     path.write_text(json.dumps(report, indent=2, default=str))
     report["path"] = str(path)
     return report
@@ -246,7 +260,8 @@ def run_stage1(universe_db, minutes_db, market_db, skip_null=False, out_dir=Path
 def show(r: dict) -> None:
     f = lambda x, s="{:+.3f}": "—" if x is None else s.format(x)
     d = r["diagnostics"]
-    print(f"\n=== PR-002 Stage 1 (IS {SPEC['is_window'][0]}..{SPEC['is_window'][1]}) commit={r['commit']} ===")
+    mode = "  [DIAGNOSTIC: optimistic intrabar ordering]" if r.get("mode") == "optimistic_ties" else ""
+    print(f"\n=== PR-002 Stage 1 (IS {SPEC['is_window'][0]}..{SPEC['is_window'][1]}) commit={r['commit']}{mode} ===")
     print(f"stock-days {d['stock_days']}, excluded {d['excluded']}, trades {d['trades']} "
           f"(trigger rate {d['trade_rate']:.0%}, long {d['long_share']:.0%})")
     print(f"median stop = {d['median_stop_bps_of_price']:.0f} bps of price; gross expectancy {f(d['gross_expectancy'])}R")
@@ -284,5 +299,8 @@ if __name__ == "__main__":
     p.add_argument("--minutes-db", default="DATA/universe_minutes.db")
     p.add_argument("--market-db", default="DATA/market_data.db")
     p.add_argument("--skip-null", action="store_true")
+    p.add_argument("--optimistic-ties", action="store_true",
+                   help="diagnostic: stop live from the minute after entry (not a gate)")
     a = p.parse_args()
-    show(run_stage1(a.universe_db, a.minutes_db, a.market_db, skip_null=a.skip_null))
+    show(run_stage1(a.universe_db, a.minutes_db, a.market_db, skip_null=a.skip_null,
+                    optimistic_ties=a.optimistic_ties))

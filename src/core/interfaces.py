@@ -65,6 +65,8 @@ class OrderAction:
     time_in_force: TimeInForce = "DAY"
     oco_group: str = ""
     tag: str = ""                    # attribution, e.g. "entry", "stop", "target", "eod"
+    live_from_next_bar: bool = False # ignore a same-minute after_price: first eligible on the
+                                     # NEXT bar (the optimistic intrabar-ordering bound, PR-002)
 
 
 @dataclass(frozen=True, slots=True)

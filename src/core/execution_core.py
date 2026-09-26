@@ -161,7 +161,11 @@ class ExecutionCore:
                 continue
             self._seen.add(a.client_order_id)
             self._seq += 1
-            self._orders[a.client_order_id] = _Order(a, now, self._seq, after_price)
+            if a.live_from_next_bar and after_price is not None:
+                from datetime import timedelta
+                self._orders[a.client_order_id] = _Order(a, now + timedelta(minutes=1), self._seq, None)
+            else:
+                self._orders[a.client_order_id] = _Order(a, now, self._seq, after_price)
             out.append(self._report(a, "ACCEPTED", now, leaves=a.qty))
         return out
 

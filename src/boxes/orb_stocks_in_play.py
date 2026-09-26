@@ -39,6 +39,10 @@ class Params:
     opening_range_start: time = time(9, 30)
     account: float = 25_000.0
     risk_pct: float = 0.01
+    # DIAGNOSTIC ONLY (PR-002 'optimistic bound'): 1-min bars cannot show whether
+    # the entry or the stop came first inside the entry minute. False = assume the
+    # worst (the frozen rule). True = stop first live on the NEXT minute.
+    stop_from_next_minute: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,7 +118,8 @@ class OrbStocksInPlayBox:
                 side = "SELL" if long else "BUY"
                 grp = f"{s.day}-{r.symbol}"
                 acts = [OrderAction("SUBMIT", f"{grp}-stop", r.symbol, side, "STOP", r.fill_qty,
-                                    stop_price=stop, oco_group=grp, tag="stop"),
+                                    stop_price=stop, oco_group=grp, tag="stop",
+                                    live_from_next_bar=p.stop_from_next_minute),
                         OrderAction("SUBMIT", f"{grp}-moc", r.symbol, side, "MOC", r.fill_qty,
                                     oco_group=grp, tag="close")]
                 return replace(s, phase="in_position", entry_price=r.fill_price,
