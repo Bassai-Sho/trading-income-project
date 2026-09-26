@@ -80,27 +80,27 @@ def _future_move(g, t):
     return float(g["Close"].iloc[end] - g["Open"].iloc[at])
 
 
-def test_foresight_direction_passes_direction_test(data):
+def test_foresight_direction_passes_gate_and_direction(data):
     def pick(g, rng):
         t = g.index[0] + pd.Timedelta(minutes=5 * int(rng.integers(3, 15)))
         return t, "long" if _future_move(g, t) > 0 else "short"
     rep = run_null_gate(_log(data, pick), data, "X", END, draws=300)
-    assert rep.direction_p < 0.01 and rep.common_exit_expectancy > rep.direction_null_p95
+    assert rep.passed and rep.gate_p < 0.01 and rep.direction_p < 0.01
 
 
-def test_random_direction_and_time_fails(data):
+def test_random_entries_fail_the_gate(data):
     def pick(g, rng):
         return (g.index[0] + pd.Timedelta(minutes=5 * int(rng.integers(3, 15))),
                 "long" if rng.random() < 0.5 else "short")
     rep = run_null_gate(_log(data, pick, seed=3), data, "X", END, draws=300)
-    assert not rep.passed and rep.direction_p > 0.05 and rep.timing_p > 0.05
+    assert not rep.passed and rep.gate_p > 0.05 and rep.direction_p > 0.05
 
 
-def test_always_long_on_rising_market_does_not_pass_direction(data):
+def test_always_long_on_rising_market_does_not_pass(data):
     """Drift control: shuffling labels keeps the long/short mix, so a box that
     is simply always long gets no credit for the market going up."""
     up = data.copy()
-    k = np.arange(len(up)) * 0.0004                       # steady upward drift
+    k = np.arange(len(up)) * 0.0004
     for col in ("Open", "High", "Low", "Close"):
         up[col] = up[col] + k
     def pick(g, rng):
@@ -109,14 +109,41 @@ def test_always_long_on_rising_market_does_not_pass_direction(data):
     assert rep.direction_p == 1.0 and not rep.passed
 
 
-def test_foresight_timing_passes_timing_test(data):
+def test_side_kept_timing_null_leaks_the_future(data):
+    """Why review round 4's Test B was dropped: a side chosen from what happens
+    AFTER the signal, carried to earlier random times, makes the null look
+    skilled. The leak shows as side-kept 'before' >> the honest gate null."""
     def pick(g, rng):
-        grid = [g.index[0] + pd.Timedelta(minutes=5 * k) for k in range(3, 15)]
+        t = g.index[0] + pd.Timedelta(minutes=5 * int(rng.integers(10, 15)))    # late signals
+        first = g.index[0] + pd.Timedelta(minutes=15)
+        return t, "long" if _future_move(g, first) > 0 else "short"              # side from the morning's move
+    rep = run_null_gate(_log(data, pick), data, "X", END, draws=200)
+    assert rep.side_kept_timing_before > rep.gate_null_mean + 0.1
+
+
+@pytest.mark.parametrize("best, expect_low_p", [(True, True), (False, False)])
+def test_timing_diagnostic_detects_whipsaw_avoidance(data, best, expect_low_p):
+    """Direction-neutral timing: a tight stop makes whipsaws common; picking the
+    moments where neither side whipsaws must score p < 0.01, the worst ~1."""
+    from evaluation.null_baseline import _Day, simulate_bracket
+    F = 0.0008
+    rng = np.random.default_rng(0)
+    log = []
+    for d, g in data.groupby(data.index.date):
+        day = _Day("X", g)
+        vals = []
+        for k in range(3, 15):
+            t = g.index[0] + pd.Timedelta(minutes=5 * k)
+            a = simulate_bracket(day, t, "long", F, END)
+            b = simulate_bracket(day, t, "short", F, END)
+            if a is not None and b is not None:
+                vals.append((a[0] + b[0], t))
+        t = (max if best else min)(vals)[1]
         side = "long" if rng.random() < 0.5 else "short"
-        best = max(grid, key=lambda t: _future_move(g, t) * (1 if side == "long" else -1))
-        return best, side
-    rep = run_null_gate(_log(data, pick), data, "X", END, draws=300)
-    assert rep.timing_p < 0.01
+        e = float(g["Open"].iloc[g.index.searchsorted(t + pd.Timedelta(minutes=5))])
+        log.append(TradeIn(str(d), side, t, e, e * (1 - F) if side == "long" else e * (1 + F)))
+    rep = run_null_gate(log, data, "X", END, draws=300, window_start=time(9, 45))
+    assert (rep.timing_p < 0.01) if expect_low_p else (rep.timing_p > 0.9)
 
 
 def test_harness_never_imports_a_box():

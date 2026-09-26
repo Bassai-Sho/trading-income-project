@@ -13,17 +13,26 @@ Common exit (the harness cannot know box-specific exits such as a VWAP trail):
     so the comparison is like for like. The box's real expectancy is reported
     alongside, not used by the gate.
 
-Test A — DIRECTION (does the chosen side beat a shuffled side?)
-    Each trade is simulated both ways at its own signal time. Nulls shuffle the
-    long/short LABELS across trades (1,000 draws), preserving the box's
-    long/short mix so market drift helps box and null alike.
-Test B — TIMING (does the chosen moment beat a random moment the same day?)
-    Each trade keeps its date, side and stop distance; nulls move its signal
-    to a uniformly random 5-min bar close in the entry window (1,000 draws).
+GATE — FULL RANDOM ENTRY (does the entry decision beat random entries?)
+    Null: each trade keeps its date and stop distance; its time moves to a
+    uniformly random 5-min bar close in the entry window AND its side comes
+    from shuffling the long/short labels across trades (keeps the box's mix,
+    so market drift helps box and null alike). Pass: p < alpha.
+DIAGNOSTIC A — DIRECTION: the box's own times, labels shuffled.
+DIAGNOSTIC B — TIMING, direction-neutral: each moment is valued by the mean
+    of its long and short outcomes (does the box pick moments that avoid
+    whipsaw?), so the box's side is never carried to another time.
 
-p = (1 + #null means >= observed) / (1 + draws). Gate: p < 0.05 on BOTH.
-A box failing this gate is not evaluated further (no DSR / PBO / walk-forward).
-Design record: handover doc section 10 + review round 4 (25 Sep 2026).
+Why no "keep the side, move the time" test (review round 4's Test B): the
+side was chosen BECAUSE of what happened at the signal time; carrying it to an
+earlier random time leaks the future into the null. On box #1 (real IS data,
+25 Sep 2026) that null averaged +0.09..+0.13R and gave p = 1.000 on all four
+tickers. It is still computed, split before / after the signal time, as
+`side_kept_timing_before` / `_after`, purely as evidence of that leak.
+
+p = (1 + #null means >= observed) / (1 + draws).
+A box failing the gate is not evaluated further (no DSR / PBO / walk-forward).
+Design record: handover doc section 10; review round 4 + this correction.
 """
 from __future__ import annotations
 
@@ -60,12 +69,17 @@ class NullReport:
     n_trades: int
     box_expectancy: float | None
     common_exit_expectancy: float
+    gate_p: float
+    gate_null_mean: float
+    gate_null_p95: float
     direction_p: float
     direction_null_mean: float
     direction_null_p95: float
     timing_p: float
+    timing_observed: float
     timing_null_mean: float
-    timing_null_p95: float
+    side_kept_timing_before: float | None
+    side_kept_timing_after: float | None
     alpha: float
     passed: bool
     notes: list[str] = field(default_factory=list)
@@ -144,7 +158,7 @@ def run_null_gate(trades: Iterable[TradeIn], df_1m: pd.DataFrame, symbol: str,
     def net(res, date_):
         return None if res is None else res[0] - cost_fn(res[1], res[2], date_)
 
-    obs, both, cands = [], [], []
+    both, grids, sig_idx = [], [], []
     for t in trades:
         day = days.get(t.session_date)
         sig = pd.Timestamp(t.signal_ts)
@@ -152,43 +166,70 @@ def run_null_gate(trades: Iterable[TradeIn], df_1m: pd.DataFrame, symbol: str,
         frac = abs(t.entry_price - t.stop_price) / t.entry_price
         if day is None or frac <= 0:
             continue
-        mine = net(simulate_bracket(day, sig, t.direction, frac, session_end), t.session_date)
-        other = net(simulate_bracket(day, sig, "short" if t.direction == "long" else "long",
-                                     frac, session_end), t.session_date)
-        if mine is None or other is None:
+        lng = net(simulate_bracket(day, sig, "long", frac, session_end), t.session_date)
+        sht = net(simulate_bracket(day, sig, "short", frac, session_end), t.session_date)
+        if lng is None or sht is None:
             continue
-        # every 5-min bar close in the window, same side and stop distance
         grid = pd.date_range(pd.Timestamp.combine(sig.date(), window_start).tz_localize(tz),
                              pd.Timestamp.combine(sig.date(), session_end).tz_localize(tz) - FIVE * 2,
                              freq="5min")
-        alts = [x for x in (net(simulate_bracket(day, g, t.direction, frac, session_end),
-                                t.session_date) for g in grid) if x is not None]
-        if not alts:
+        rows = []                                   # (time, long R, short R) per candidate
+        for g in grid:
+            a = net(simulate_bracket(day, g, "long", frac, session_end), t.session_date)
+            b = net(simulate_bracket(day, g, "short", frac, session_end), t.session_date)
+            if a is not None and b is not None:
+                rows.append((g, a, b))
+        if not rows:
             continue
-        obs.append(mine)
-        both.append((mine, other, t.direction == "long"))
-        cands.append(np.array(alts))
-    if not obs:
+        both.append((lng, sht, t.direction == "long"))
+        grids.append(rows)
+        sig_idx.append(sig)
+    if not both:
         raise ValueError("no trades could be simulated")
-    if len(obs) < len(trades):
-        notes.append(f"{len(trades) - len(obs)} trade(s) skipped (no bars / no entry possible)")
+    if len(both) < len(trades):
+        notes.append(f"{len(trades) - len(both)} trade(s) skipped (no bars / no entry possible)")
 
     rng = np.random.default_rng(seed)
-    observed = float(np.mean(obs))
-    L = np.array([b[0] if b[2] else b[1] for b in both])    # outcome if long
-    S = np.array([b[1] if b[2] else b[0] for b in both])    # outcome if short
+    L = np.array([b[0] for b in both])              # outcome if long, at the box's time
+    S = np.array([b[1] for b in both])              # outcome if short, at the box's time
     is_long = np.array([b[2] for b in both])
-    dir_null = np.array([np.where(rng.permutation(is_long), L, S).mean() for _ in range(draws)])
-    tim_null = np.array([np.mean([c[rng.integers(len(c))] for c in cands]) for _ in range(draws)])
+    observed = float(np.where(is_long, L, S).mean())
+    GL = [np.array([r[1] for r in rows]) for rows in grids]
+    GS = [np.array([r[2] for r in rows]) for rows in grids]
 
-    p_dir = (1 + int((dir_null >= observed).sum())) / (1 + draws)
-    p_tim = (1 + int((tim_null >= observed).sum())) / (1 + draws)
+    def p_of(null, obs):
+        return (1 + int((null >= obs).sum())) / (1 + draws)
+
+    # Gate: random time AND shuffled label
+    gate_null = np.empty(draws)
+    for k in range(draws):
+        lab = rng.permutation(is_long)
+        pick = [rng.integers(len(gl)) for gl in GL]
+        gate_null[k] = np.mean([GL[i][pick[i]] if lab[i] else GS[i][pick[i]]
+                                for i in range(len(GL))])
+    # Diagnostic A: direction at the box's own times
+    dir_null = np.array([np.where(rng.permutation(is_long), L, S).mean() for _ in range(draws)])
+    # Diagnostic B: timing, direction-neutral
+    tim_obs = float(((L + S) / 2).mean())
+    NEU = [(gl + gs) / 2 for gl, gs in zip(GL, GS)]
+    tim_null = np.array([np.mean([n[rng.integers(len(n))] for n in NEU]) for _ in range(draws)])
+    # Evidence only: the leaky side-kept timing null, before vs after the signal
+    before, after = [], []
+    for rows, sig, lg in zip(grids, sig_idx, is_long):
+        for g, a, b in rows:
+            (before if g < sig else after).append(a if lg else b)
+
     box_exp = [t.net_r for t in trades if t.net_r is not None]
+    p_gate = p_of(gate_null, observed)
     return NullReport(
-        n_trades=len(obs), box_expectancy=float(np.mean(box_exp)) if box_exp else None,
+        n_trades=len(both), box_expectancy=float(np.mean(box_exp)) if box_exp else None,
         common_exit_expectancy=observed,
-        direction_p=p_dir, direction_null_mean=float(dir_null.mean()),
+        gate_p=p_gate, gate_null_mean=float(gate_null.mean()),
+        gate_null_p95=float(np.percentile(gate_null, 95)),
+        direction_p=p_of(dir_null, observed), direction_null_mean=float(dir_null.mean()),
         direction_null_p95=float(np.percentile(dir_null, 95)),
-        timing_p=p_tim, timing_null_mean=float(tim_null.mean()),
-        timing_null_p95=float(np.percentile(tim_null, 95)),
-        alpha=alpha, passed=(p_dir < alpha and p_tim < alpha), notes=notes)
+        timing_p=p_of(tim_null, tim_obs), timing_observed=tim_obs,
+        timing_null_mean=float(tim_null.mean()),
+        side_kept_timing_before=float(np.mean(before)) if before else None,
+        side_kept_timing_after=float(np.mean(after)) if after else None,
+        alpha=alpha, passed=p_gate < alpha, notes=notes)

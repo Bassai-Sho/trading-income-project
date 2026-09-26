@@ -3,7 +3,7 @@ null_gate_box1.py  (P2-123 slice 3 — first real use of the null-alpha gate)
 ===========================================================================
 Runs box #1 (the shelved PR-001 ORB) through the execution core on IS
 2016-2022, then grades its trades with evaluation/null_baseline (direction +
-timing permutation tests, 1,000 draws each, alpha 0.05). Glue only: the gate
+timing diagnostics; gate = full random entry, 1,000 draws, alpha 0.05). Glue only: the gate
 itself never sees the box.
 
 Pre-registered expectation (review round 4, 25 Sep 2026): box #1 is
@@ -47,23 +47,26 @@ def run(store, tickers, draws=1000):
         cost = lambda e, s, d: legacy_cost_r(e, s, adv.get(str(pd.Period(d, freq="Q")), 150e6), p)
         rep = run_null_gate(trades, df, tkr, p.session_end, cost_fn=cost, draws=draws)
         out[tkr] = asdict(rep)
-        logging.info("%s: direction p=%.3f timing p=%.3f", tkr, rep.direction_p, rep.timing_p)
+        logging.info("%s: gate p=%.3f direction p=%.3f timing p=%.3f", tkr, rep.gate_p,
+                     rep.direction_p, rep.timing_p)
     return out
 
 
 def show(rep):
     f = lambda x: "—" if x is None else f"{x:+.3f}"
     print("\n=== Null-alpha gate: box #1 (legacy ORB), IS 2016-2022, 1,000 draws, alpha 0.05 ===")
-    print(f"{'Ticker':<6}{'n':>6}{'box exp':>9}{'common':>9}{'dir null':>10}{'dir p':>8}"
-          f"{'time null':>11}{'time p':>8}  gate")
+    print(f"{'Ticker':<6}{'n':>6}{'box exp':>9}{'common':>9}{'gate null':>10}{'gate p':>8}"
+          f"{'dir p':>7}{'time p':>8}  gate   | leak check: side-kept null before / after signal")
     for t, v in rep.items():
         print(f"{t:<6}{v['n_trades']:>6}{f(v['box_expectancy']):>9}{f(v['common_exit_expectancy']):>9}"
-              f"{f(v['direction_null_mean']):>10}{v['direction_p']:>8.3f}{f(v['timing_null_mean']):>11}"
-              f"{v['timing_p']:>8.3f}  {'PASS' if v['passed'] else 'fail'}")
+              f"{f(v['gate_null_mean']):>10}{v['gate_p']:>8.3f}{v['direction_p']:>7.3f}"
+              f"{v['timing_p']:>8.3f}  {'PASS' if v['passed'] else 'fail'}   | "
+              f"{f(v['side_kept_timing_before'])} / {f(v['side_kept_timing_after'])}")
         for n in v["notes"]:
             print(f"       note: {n}")
-    print("\n'common' = the box's trades re-run under the harness's common exit (1R bracket, "
-          "time exit); the nulls use the same exit.")
+    print("\n'common' = the box's trades under the harness's common exit (1R bracket, time exit);"
+          "\nthe nulls use the same exit. Gate = random time + shuffled side. 'time p' is"
+          "\ndirection-neutral. The leak check should show 'before' well above the gate null.")
 
 
 if __name__ == "__main__":
