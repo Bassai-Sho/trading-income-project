@@ -54,3 +54,4 @@ pandas-market-calendars>=4.3  # US market calendar: early-close, OPEX, holidays
 chainlit>=1.0               # ChatGPT-style chat UI with native tool call accordions,
                             # async streaming, and per-session state isolation
                             # Launch: chainlit run chainlit_app.py --host 0.0.0.0 --port 8080
+purgedcv>=0.1.6,<0.2   # PBO (CSCV) + DSR for evaluation/robustness.py (MIT)
