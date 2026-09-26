@@ -11,6 +11,9 @@ FILL RULES (1-minute bars; each rule pinned by tests/test_execution_core.py)
   STOP  (buy)   mirror: open >= stop -> OPEN; high >= stop -> STOP
   LIMIT (sell)  bar.open >= limit -> fill at OPEN (price improvement); high >= limit -> LIMIT
   LIMIT (buy)   mirror: open <= limit -> OPEN; low <= limit -> LIMIT
+  MOC           never matched intrabar; filled by end_session() at the symbol's
+                last traded price (the close of its last bar that session), before
+                DAY orders expire. OCO siblings are cancelled as for any fill.
   Within a bar, per symbol: market orders, then stops, then limits. With an
   OCO group this makes a minute that touches both stop and target a STOP
   (conservative). When an order fills, its OCO siblings are cancelled at once.
@@ -173,7 +176,8 @@ class ExecutionCore:
         self._now = bar.timestamp
 
         mine = sorted((o for o in self._orders.values()
-                       if o.a.symbol == bar.symbol and bar.timestamp >= o.active_from),
+                       if o.a.symbol == bar.symbol and bar.timestamp >= o.active_from
+                       and o.a.order_type != "MOC"),
                       key=lambda o: ({"MARKET": 0, "STOP": 1, "LIMIT": 2}[o.a.order_type], o.seq))
         for o in mine:
             if o.a.client_order_id not in self._orders:      # cancelled by an OCO sibling
@@ -188,9 +192,19 @@ class ExecutionCore:
         return out
 
     def end_session(self, now: datetime) -> list[ExecutionReport]:
-        """Call at the exchange-calendar close: expire every open DAY order."""
+        """Call at the exchange-calendar close: fill market-on-close orders at
+        each symbol's last traded price, then expire every open DAY order."""
         self._now = now
-        return self._expire_day_orders(now, "SESSION_CLOSE")
+        out: list[ExecutionReport] = []
+        for o in sorted([o for o in self._orders.values() if o.a.order_type == "MOC"],
+                        key=lambda o: o.seq):
+            if o.a.client_order_id not in self._orders:      # cancelled by an OCO sibling
+                continue
+            px = self._last.get(o.a.symbol)
+            if px is None:
+                continue                                      # never traded: expires below
+            out += self._fill(o, px, now)
+        return out + self._expire_day_orders(now, "SESSION_CLOSE")
 
     def session_close_for(self, d: date) -> time | None:
         return self._session_close(d)
@@ -199,7 +213,7 @@ class ExecutionCore:
 
     @staticmethod
     def _invalid(a: OrderAction) -> str | None:
-        if a.side not in ("BUY", "SELL") or a.order_type not in ("MARKET", "LIMIT", "STOP"):
+        if a.side not in ("BUY", "SELL") or a.order_type not in ("MARKET", "LIMIT", "STOP", "MOC"):
             return "INVALID_ORDER"
         if not (a.qty > 0 and math.isfinite(a.qty)):
             return "INVALID_ORDER"
@@ -217,7 +231,7 @@ class ExecutionCore:
         if abs(cur + signed) <= abs(cur) + 1e-12:            # reduces or closes: always allowed
             return False
         ref = (a.price if a.order_type == "LIMIT" else
-               a.stop_price if a.order_type == "STOP" else self._last.get(a.symbol))
+               a.stop_price if a.order_type == "STOP" else self._last.get(a.symbol))   # MARKET / MOC
         if ref is None:
             return False                                      # no price yet: nothing to check against
         added = (abs(cur + signed) - abs(cur)) * ref

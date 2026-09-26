@@ -28,7 +28,7 @@ OrderStatus = Literal[
     "REJECTED",
 ]
 Side = Literal["BUY", "SELL"]
-OrderType = Literal["MARKET", "LIMIT", "STOP"]
+OrderType = Literal["MARKET", "LIMIT", "STOP", "MOC"]   # MOC = market on close
 TimeInForce = Literal["DAY", "GTC"]
 
 

@@ -151,3 +151,51 @@ def test_harness_never_imports_a_box():
     for f in pkg.glob("*.py"):
         code = [l for l in f.read_text().splitlines() if l.strip().startswith(("import", "from"))]
         assert not any("boxes" in l for l in code), f"{f.name} imports a strategy box"
+
+
+# ── PR-002 common exit: no target, exit at the close; candidate sampling ─────
+
+def test_no_target_exit_at_close_prices():
+    sig = _ts("10:00")                                    # entry 10:05 at 100, stop 99 (1%)
+    df = _flat_day(); df.loc[_ts("10:07"), "High"] = 101.5  # would hit a 1R target — none now
+    df.loc[_ts("15:59"), ["Open", "High", "Low", "Close"]] = [100.2, 100.4, 100.1, 100.3]
+    r = simulate_bracket(_Day("X", df), sig, "long", 0.01, time(16, 0), target_r=None, exit="close")
+    assert r[0] == pytest.approx(0.3)                     # closed at 100.3, not the 101 target
+    df = _flat_day(); df.loc[_ts("10:07"), "Low"] = 98.9
+    r = simulate_bracket(_Day("X", df), sig, "long", 0.01, time(16, 0), target_r=None, exit="close")
+    assert r[0] == pytest.approx(-1.0)                    # stop still works
+
+
+def test_exit_at_close_on_a_half_day():
+    idx = pd.date_range("2019-11-29 09:30", periods=210, freq="1min", tz="America/New_York")
+    df = pd.DataFrame({"Open": 100.0, "High": 100.01, "Low": 99.99, "Close": 100.0, "Volume": 1.0}, index=idx)
+    df.iloc[-1, :4] = [100.5, 100.6, 100.4, 100.5]
+    r = simulate_bracket(_Day("X", df), pd.Timestamp("2019-11-29 10:00", tz="America/New_York"),
+                         "long", 0.01, time(16, 0), target_r=None, exit="close")
+    assert r[0] == pytest.approx(0.5)                     # the 12:59 close
+
+
+def test_candidate_sampling_is_deterministic_and_still_works(data):
+    def pick(g, rng):
+        t = g.index[0] + pd.Timedelta(minutes=5 * int(rng.integers(3, 15)))
+        return t, "long" if _future_move(g, t) > 0 else "short"
+    log = _log(data, pick)
+    kw = dict(draws=200, target_r=None, exit="close", n_candidates=6, window_start=time(9, 45))
+    a = run_null_gate(log, data, "X", time(16, 0), **kw)
+    b = run_null_gate(log, data, "X", time(16, 0), **kw)
+    assert a == b and a.passed and a.direction_p < 0.01
+
+
+def test_pooled_multi_symbol_input_matches_single_symbol_result(data):
+    """The dict form (many symbols) must give exactly the single-symbol result."""
+    def pick(g, rng):
+        t = g.index[0] + pd.Timedelta(minutes=5 * int(rng.integers(3, 15)))
+        return t, "long" if rng.random() < .5 else "short"
+    log = _log(data, pick, seed=5)[:40]
+    kw = dict(draws=100, target_r=None, exit="close", n_candidates=4, window_start=time(9, 45))
+    single = run_null_gate(log, data, "X", time(16, 0), **kw)
+    import dataclasses
+    tagged = [dataclasses.replace(t, symbol="X") for t in log]
+    by_day = {("X", str(d)): g for d, g in data.groupby(data.index.date)}
+    pooled = run_null_gate(tagged, by_day, "", time(16, 0), **kw)
+    assert pooled == single

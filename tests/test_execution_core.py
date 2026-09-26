@@ -243,3 +243,29 @@ def test_reprocessing_a_bar_is_idempotent_for_existing_orders():
     b = bar(100, 101, 99, 100, T0.replace(minute=1))
     assert c.process_bar(b) == [] and c.process_bar(b) == []
     assert len(c.view().open_orders) == 1
+
+
+# ── Market on close (PR-002) ─────────────────────────────────────────────────
+
+def test_moc_fills_at_last_close_and_cancels_its_stop():
+    c = core(); long_position(c)
+    c.submit([sub("s", "SELL", "STOP", stop=95.0, oco="b"), sub("m", "SELL", "MOC", oco="b")], T0)
+    assert fills(c.process_bar(bar(100, 101, 99, 100.5, T0.replace(minute=1)))) == []   # never intrabar
+    c.process_bar(bar(100.5, 102, 100, 101.7, T0.replace(hour=15, minute=59)))
+    r = c.end_session(T0.replace(hour=16))
+    assert fills(r) == [("m", 101.7)] and ("s", "CANCELLED") in [(x.client_order_id, x.status) for x in r]
+    assert c.position("SPY") == 0 and c.view().open_orders == ()
+
+
+def test_stop_before_close_cancels_the_moc():
+    c = core(); long_position(c)
+    c.submit([sub("s", "SELL", "STOP", stop=99.0, oco="b"), sub("m", "SELL", "MOC", oco="b")], T0)
+    assert fills(c.process_bar(bar(100, 100, 98, 98.5, T0.replace(minute=1)))) == [("s", 99.0)]
+    assert c.end_session(T0.replace(hour=16)) == []
+
+
+def test_moc_on_a_symbol_with_no_trades_expires():
+    c = core()
+    c.submit([sub("m", "BUY", "MOC")], T0)
+    r = c.end_session(T0.replace(hour=16))
+    assert [(x.status, x.reason) for x in r] == [("EXPIRED", "SESSION_CLOSE")]

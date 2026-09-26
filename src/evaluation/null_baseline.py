@@ -62,6 +62,7 @@ class TradeIn:
     entry_price: float
     stop_price: float       # initial stop (defines 1R)
     net_r: float | None = None   # the box's own realised net R, for reporting only
+    symbol: str = ""        # needed when bars for many symbols are passed (see run_null_gate)
 
 
 @dataclass
@@ -101,8 +102,13 @@ class _Day:
 
 
 def simulate_bracket(day: _Day, signal_ts: pd.Timestamp, side: str, stop_frac: float,
-                     session_end: time, target_r: float = 1.0) -> tuple[float, float, float] | None:
-    """Gross R of one bracket trade, plus (entry, stop). None if it cannot enter."""
+                     session_end: time, target_r: float | None = 1.0,
+                     exit: str = "session_end_open") -> tuple[float, float, float] | None:
+    """Gross R of one bracket trade, plus (entry, stop). None if it cannot enter.
+
+    target_r=None: no target. exit="session_end_open": market exit at the open
+    of the session_end minute (box #1 family). exit="close": market-on-close at
+    the day's last bar (box #2 family; session_end then only bars new entries)."""
     start = signal_ts + FIVE
     j0 = day.ts.searchsorted(start)
     if j0 >= len(day.ts) or day.ts[j0].time() >= session_end:
@@ -114,7 +120,7 @@ def simulate_bracket(day: _Day, signal_ts: pd.Timestamp, side: str, stop_frac: f
     entry = stop = None
     for j in range(j0, len(day.ts)):
         b = day.bar(j)
-        if entry is not None and day.ts[j].time() >= session_end:
+        if exit == "session_end_open" and entry is not None and day.ts[j].time() >= session_end:
             core.submit([OrderAction("SUBMIT", "x", day.symbol, "SELL" if long else "BUY",
                                      "MARKET", 1.0, oco_group="b", tag="eod")], b.timestamp)
         pending = core.process_bar(b)
@@ -125,58 +131,85 @@ def simulate_bracket(day: _Day, signal_ts: pd.Timestamp, side: str, stop_frac: f
             if r.tag == "entry":
                 entry = r.fill_price
                 stop = entry * (1 - stop_frac) if long else entry * (1 + stop_frac)
-                tgt = entry + target_r * (entry - stop) if long else entry - target_r * (stop - entry)
-                core.submit([OrderAction("SUBMIT", "s", day.symbol, "SELL" if long else "BUY",
-                                         "STOP", 1.0, stop_price=stop, oco_group="b", tag="stop"),
-                             OrderAction("SUBMIT", "t", day.symbol, "SELL" if long else "BUY",
-                                         "LIMIT", 1.0, price=tgt, oco_group="b", tag="target")],
-                            b.timestamp, after_price=entry)
+                legs = [OrderAction("SUBMIT", "s", day.symbol, "SELL" if long else "BUY",
+                                    "STOP", 1.0, stop_price=stop, oco_group="b", tag="stop")]
+                if target_r is not None:
+                    tgt = entry + target_r * (entry - stop) if long else entry - target_r * (stop - entry)
+                    legs.append(OrderAction("SUBMIT", "t", day.symbol, "SELL" if long else "BUY",
+                                            "LIMIT", 1.0, price=tgt, oco_group="b", tag="target"))
+                if exit == "close":
+                    legs.append(OrderAction("SUBMIT", "c", day.symbol, "SELL" if long else "BUY",
+                                            "MOC", 1.0, oco_group="b", tag="close"))
+                core.submit(legs, b.timestamp, after_price=entry)
                 pending += core.process_bar(b)
             else:
                 return ((r.fill_price - entry) / abs(entry - stop) * (1 if long else -1),
                         entry, stop)
     if entry is None:
         return None
+    if exit == "close":
+        for r in core.end_session(day.ts[-1].to_pydatetime()):
+            if r.status == "FILLED":
+                return ((r.fill_price - entry) / abs(entry - stop) * (1 if long else -1), entry, stop)
     return ((day.c[-1] - entry) / abs(entry - stop) * (1 if long else -1), entry, stop)
 
 
 # ── The gate ────────────────────────────────────────────────────────────────
 
-def run_null_gate(trades: Iterable[TradeIn], df_1m: pd.DataFrame, symbol: str,
+def run_null_gate(trades: Iterable[TradeIn], df_1m, symbol: str,
                   session_end: time, cost_fn: CostFn | None = None,
                   window_start: time | None = None, draws: int = 1000,
-                  alpha: float = 0.05, seed: int = 0) -> NullReport:
+                  alpha: float = 0.05, seed: int = 0, target_r: float | None = 1.0,
+                  exit: str = "session_end_open", n_candidates: int | None = None) -> NullReport:
+    """df_1m: one symbol's 1-min bars (DataFrame), or a dict {(symbol,
+    session_date): that stock-day's bars} to pool trades across many symbols
+    (then each TradeIn needs .symbol).
+    target_r / exit: the COMMON exit used for the box's trades and every
+    null alike (PR-002: target_r=None, exit="close"). n_candidates: sample this
+    many random times per trade from the window (seeded) instead of all of them."""
     """df_1m: capitalised OHLCV, tz-aware, the same sessions the box traded."""
     trades = list(trades)
     cost_fn = cost_fn or (lambda e, s, d: 0.0)
-    days = {str(d): _Day(symbol, g) for d, g in df_1m.groupby(df_1m.index.date)}
-    tz = df_1m.index.tz
+    if isinstance(df_1m, dict):
+        days = {k: _Day(k[0], g) for k, g in df_1m.items()}
+        tz = next(iter(df_1m.values())).index.tz
+        key = lambda t: (t.symbol, t.session_date)
+    else:
+        days = {str(d): _Day(symbol, g) for d, g in df_1m.groupby(df_1m.index.date)}
+        tz = df_1m.index.tz
+        key = lambda t: t.session_date
     if window_start is None:
         window_start = min(pd.Timestamp(t.signal_ts).time() for t in trades)
     notes: list[str] = []
+
+    def sim(day_, ts, side, frac):
+        return simulate_bracket(day_, ts, side, frac, session_end, target_r=target_r, exit=exit)
 
     def net(res, date_):
         return None if res is None else res[0] - cost_fn(res[1], res[2], date_)
 
     both, grids, sig_idx = [], [], []
     for t in trades:
-        day = days.get(t.session_date)
+        day = days.get(key(t))
         sig = pd.Timestamp(t.signal_ts)
         sig = sig.tz_localize(tz) if sig.tzinfo is None else sig.tz_convert(tz)
         frac = abs(t.entry_price - t.stop_price) / t.entry_price
         if day is None or frac <= 0:
             continue
-        lng = net(simulate_bracket(day, sig, "long", frac, session_end), t.session_date)
-        sht = net(simulate_bracket(day, sig, "short", frac, session_end), t.session_date)
+        lng = net(sim(day, sig, "long", frac), t.session_date)
+        sht = net(sim(day, sig, "short", frac), t.session_date)
         if lng is None or sht is None:
             continue
         grid = pd.date_range(pd.Timestamp.combine(sig.date(), window_start).tz_localize(tz),
                              pd.Timestamp.combine(sig.date(), session_end).tz_localize(tz) - FIVE * 2,
                              freq="5min")
+        if n_candidates is not None and len(grid) > n_candidates:
+            pick_rng = np.random.default_rng([seed, len(both)])
+            grid = grid[np.sort(pick_rng.choice(len(grid), n_candidates, replace=False))]
         rows = []                                   # (time, long R, short R) per candidate
         for g in grid:
-            a = net(simulate_bracket(day, g, "long", frac, session_end), t.session_date)
-            b = net(simulate_bracket(day, g, "short", frac, session_end), t.session_date)
+            a = net(sim(day, g, "long", frac), t.session_date)
+            b = net(sim(day, g, "short", frac), t.session_date)
             if a is not None and b is not None:
                 rows.append((g, a, b))
         if not rows:
