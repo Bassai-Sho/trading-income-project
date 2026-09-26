@@ -37,6 +37,8 @@ def test_classify_name(name, kind):
 DIRECTORY = """Nasdaq Traded|Symbol|Security Name|Listing Exchange|Market Category|ETF|Round Lot Size|Test Issue|Financial Status|CQS Symbol|NASDAQ Symbol|NextShares
 Y|AAA|Alpha Corp Common Stock|N| |N|100|N||AAA|AAA|N
 Y|FFF|Some Obscure Tracker|P| |Y|100|N||FFF|FFF|N
+Y|DSL|DOUBLELINE INCOME SOLUTIONS FUND|N| |N|100|N||DSL|DSL|N
+Y|VNO|Vornado Realty Trust|N| |N|100|N||VNO|VNO|N
 Y|TST|Test issue|Q| |N|100|Y||TST|TST|N
 File Creation Time: 0925202621:32|||||
 """
@@ -46,6 +48,8 @@ def _store(tmp_path):
     u = UniverseStore(str(tmp_path / "u.db"))
     assets = [("AAA", "Alpha Corp Common Stock", "NYSE", "active"),
               ("FFF", "Some Obscure Tracker", "ARCA", "active"),        # ETF only per directory
+              ("DSL", "DOUBLELINE INCOME SOLUTIONS FUND", "NYSE", "active"),   # closed-end fund, ETF flag N
+              ("VNO", "Vornado Realty Trust", "NYSE", "active"),             # a REIT: a real company
               ("OLD", "Old Industries Inc Common Stock", "NYSE", "inactive"),
               ("UPRO", "ProShares UltraPro S&P500", "ARCA", "inactive"),
               ("ZZZ", "Zeta Corp Common Stock", "NASDAQ", "active")]
@@ -60,7 +64,8 @@ def test_directory_flag_wins_for_current_listings_name_rules_otherwise(tmp_path)
     s.classify(load_directory(text=DIRECTORY))
     with sqlite3.connect(s.store.db_path) as c:
         k = dict(c.execute("SELECT symbol, kind || '/' || source FROM universe_class"))
-    assert k == {"AAA": "stock/directory", "FFF": "fund/directory", "OLD": "stock/name_rules",
+    assert k == {"AAA": "stock/directory", "FFF": "fund/directory", "DSL": "fund/directory",
+                 "VNO": "stock/directory", "OLD": "stock/name_rules",
                  "UPRO": "fund/name_rules", "ZZZ": "stock/name_rules"}
 
 

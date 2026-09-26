@@ -595,14 +595,19 @@ class MarketDataStore:
         ticker:    str,
         df:        pd.DataFrame,
         vix_daily: dict[str, float],
+        contiguous: bool = True,
     ) -> tuple[int, int]:
-        """Write bars to market_bars and compute session_context."""
+        """Write bars to market_bars and compute session_context.
+
+        contiguous=False: the sessions are NOT consecutive for this ticker (e.g.
+        the scattered stock-days picked by universe_select), so no prior-day
+        levels are carried: prev_close / gap_pct / PDH / PDL stay NULL."""
         bars_written     = 0
         sessions_written = 0
 
         trading_days = sorted(set(df.index.date))
         prev_close, prev_high, prev_low = None, None, None
-        if trading_days:
+        if trading_days and contiguous:
             # Seed from the last stored session before this chunk, so the first
             # session of each chunk still gets gap_pct / PDH / PDL.
             prev_close, prev_high, prev_low = self._prev_session_levels(
@@ -611,6 +616,8 @@ class MarketDataStore:
         for day in trading_days:
             day_str  = str(day)
             day_df   = df[df.index.date == day].copy()
+            if not contiguous:
+                prev_close = prev_high = prev_low = None
 
             # Regular session only: bars starting 09:30-15:59 (390 bars). A bar
             # labelled 16:00 covers 16:00-16:01, i.e. after-hours trading.

@@ -5,7 +5,9 @@ universe_select.py  (P2-125 — box #2 universe, stage 2)
 universe_store.py's daily eligibility:
 
   1. classify    each asset as stock / fund / noncommon.
-                 Current listings: Nasdaq Trader symbol directory ETF flag (exact).
+                 Current listings: Nasdaq Trader symbol directory ETF flag, PLUS
+                 the fund-name rules (the ETF flag is "N" for closed-end funds —
+                 DSL leaked into the first selection, 26 Sep 2026).
                  Everything else (delisted): name rules. Measured on the
                  directory's current listings (26 Sep 2026): precision 0.95,
                  recall 0.98; the misses are mostly closed-end funds, ETNs and
@@ -129,8 +131,10 @@ class UniverseSelector:
         for sym, name, status in assets.itertuples(index=False):
             if status == "active" and sym in dmap.index:
                 r = dmap.loc[sym]
-                kind = "fund" if r["etf"] == "Y" else (
-                    "noncommon" if _NONCOMMON.search(r["dir_name"] or "") else "stock")
+                # the ETF flag misses closed-end funds and other non-ETF funds
+                # (e.g. DSL, DoubleLine Income Solutions Fund), so name rules too
+                kind = ("fund" if r["etf"] == "Y" or is_fund_name(r["dir_name"]) else
+                        "noncommon" if _NONCOMMON.search(r["dir_name"] or "") else "stock")
                 rows.append((sym, kind, "directory", name))
             else:
                 rows.append((sym, classify_name(name), "name_rules", name))
