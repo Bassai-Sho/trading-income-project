@@ -77,7 +77,7 @@ _FUND_WORD = re.compile(r"\b(ETFs?|ETNs?|ETP|Exchange[- ]Traded|Fund|Portfolio|I
                         r"Strategy|Income|Treasury|Bond)\b", re.I)
 _GENERIC = re.compile(r"\b(ETFs?|ETNs?|ETP|Exchange[- ]Traded (Fund|Note)s?)\b|ADRhedged|UltraPro|"
                       r"\b(2X|3X|-1X|-2X|-3X)\b|\bLeveraged\b|\bInverse\b|\bIndex Fund\b|"
-                      r"\b(Closed[- ]End )?Fund\b(?!.*\b(Corp|Inc|Ltd|plc)\b)", re.I)
+                      r"\b(Closed[- ]End )?Funds?\b", re.I)          # "... Fund, Inc." is still a fund (CLM, DNP, KYN leaked)
 _PURE_ISSUER = re.compile(r"\b(ProShares|iShares|SPDR|Direxion)\b")
 _BRAND = re.compile(
     r"\b(Invesco|Vanguard|WisdomTree|VanEck|Global X|First Trust|Schwab|Xtrackers|Pacer|Defiance|"

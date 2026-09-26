@@ -26,6 +26,9 @@ from universe_store import UniverseStore
     ("Direxion Daily Semiconductor Bull 3X Shares", "fund"),
     ("iPath Bloomberg Commodity Index Total Return ETN", "fund"),
     ("abrdn Total Dynamic Dividend Fund Common Shares", "fund"),     # closed-end fund
+    ("Cornerstone Strategic Value Fund, Inc.", "fund"),              # 'Fund, Inc.' leaked once
+    ("DNP Select Income Fund Inc. Common Stock", "fund"),
+    ("Kayne Anderson Energy Infrastructure Fund, Inc.", "fund"),
     ("Ares Acquisition Corporation III Redeemable warrants, each whole warrant", "noncommon"),
     ("Ares Acquisition Corporation III Units, each consisting of one share", "noncommon"),
     ("Arbor Realty Trust 6.375% Series D Cumulative Redeemable Preferred Stock", "noncommon"),
