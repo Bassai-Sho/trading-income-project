@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time as _time
@@ -58,6 +59,25 @@ import pandas as pd
 log = logging.getLogger("universe_store")
 
 EXCHANGES = {"NYSE", "NASDAQ", "AMEX", "ARCA", "NYSEARCA", "BATS"}   # no OTC
+TICKER_RE = re.compile(r"^[A-Z][A-Z.]{0,7}$")        # real tickers: letters, optional class suffix (BRK.B)
+DELISTED_SUFFIX = "_DELISTED"
+
+
+def data_symbol(asset_symbol: str, known: set[str]) -> str | None:
+    """The symbol to request market data under, or None if unreachable.
+
+    Alpaca's asset list contains two kinds of placeholder (run of 26 Sep 2026):
+      * 'AET_DELISTED' — a delisted company renamed with a suffix. Its data is
+        requested under the original ticker ('AET') — but only if no other
+        listed asset uses that ticker now; otherwise the ticker belongs to a
+        different company and the old one is unreachable (documented gap).
+      * '0029900E0', '641ESC017', 'B002455' — identifier placeholders with no
+        ticker and no market data: skipped.
+    """
+    if asset_symbol.endswith(DELISTED_SUFFIX):
+        base = asset_symbol[: -len(DELISTED_SUFFIX)]
+        return base if TICKER_RE.match(base) and base not in known else None
+    return asset_symbol if TICKER_RE.match(asset_symbol) else None
 SEALED = date(2025, 1, 1)
 
 SCHEMA = """
@@ -72,6 +92,9 @@ CREATE TABLE IF NOT EXISTS universe_daily (
 CREATE INDEX IF NOT EXISTS idx_ud_date ON universe_daily(date);
 CREATE TABLE IF NOT EXISTS universe_progress (
     batch_key TEXT PRIMARY KEY, n_symbols INTEGER, n_rows INTEGER, done_at TEXT);
+CREATE TABLE IF NOT EXISTS universe_symbol_done (
+    symbol TEXT, start TEXT, "end" TEXT, n_rows INTEGER, note TEXT, done_at TEXT,
+    PRIMARY KEY (symbol, start, "end"));
 CREATE TABLE IF NOT EXISTS universe_eligibility (
     date TEXT, symbol TEXT, open REAL, adv14 REAL, atr14 REAL,
     PRIMARY KEY (date, symbol));
@@ -80,6 +103,12 @@ CREATE TABLE IF NOT EXISTS universe_eligibility (
 
 class FatalDownloadError(RuntimeError):
     pass
+
+
+class _InvalidSymbol(Exception):
+    def __init__(self, symbol: str):
+        super().__init__(symbol)
+        self.symbol = symbol
 
 
 def _now() -> str:
@@ -130,36 +159,79 @@ class UniverseStore:
 
     def download_daily(self, data_client, start: date, end: date, batch: int = 200,
                        pause: float = 0.3) -> dict:
-        """Raw + split-adjusted daily bars for every symbol, in batches; resumable
-        (a finished batch is recorded and skipped next time)."""
+        """Raw + split-adjusted daily bars for every reachable symbol, in batches.
+        Resumable PER SYMBOL: a symbol is recorded as done once its batch
+        succeeds (even with zero bars) and is skipped next time. One invalid
+        symbol no longer sinks its batch: it is dropped, recorded, and the rest
+        of the batch retried."""
         if end >= SEALED:
             end = date(2024, 12, 31)
             log.warning("end clamped to 2024-12-31 (sealed window)")
-        syms = self.symbols()
-        failed, total = [], 0
-        for i in range(0, len(syms), batch):
-            chunk = syms[i:i + batch]
-            key = f"daily:{start}:{end}:{chunk[0]}:{chunk[-1]}:{len(chunk)}"
-            with self._conn() as c:
-                if c.execute("SELECT 1 FROM universe_progress WHERE batch_key=?", (key,)).fetchone():
-                    continue
+        assets = self.symbols()
+        known = set(assets)
+        mapped = {a: data_symbol(a, known) for a in assets}
+        unreachable = sorted(a for a, d in mapped.items() if d is None)
+        with self._conn() as c:
+            done = {r[0] for r in c.execute(
+                'SELECT symbol FROM universe_symbol_done WHERE start=? AND "end"=?',
+                (str(start), str(end)))}
+            if c.execute("SELECT COUNT(*) FROM universe_progress").fetchone()[0]:
+                # batches finished by the previous (per-batch) version of this code
+                done |= {r[0] for r in c.execute("SELECT DISTINCT symbol FROM universe_daily")}
+        todo = [(a, d) for a, d in mapped.items() if d is not None and a not in done]
+        failed, invalid, total = [], [], 0
+        n_batches = -(-len(todo) // batch) if todo else 0
+        for bi, i in enumerate(range(0, len(todo), batch), 1):
+            chunk = todo[i:i + batch]
             try:
-                raw = self._fetch(data_client, chunk, start, end, "raw")
-                adj = self._fetch(data_client, chunk, start, end, "split")
+                raw, adj, bad = self._fetch_batch(data_client, chunk, start, end)
             except FatalDownloadError:
                 raise
             except Exception as e:                      # transient: record and continue
-                failed.append({"batch": key, "error": f"{type(e).__name__}: {e}"})
-                log.error("batch %s failed: %s", key, e)
+                failed.append({"batch": f"{chunk[0][0]}..{chunk[-1][0]}",
+                               "error": f"{type(e).__name__}: {e}"})
+                log.error("batch %d/%d failed: %s", bi, n_batches, e)
                 continue
+            invalid += bad
             n = self._store_daily(raw, adj)
             total += n
+            counts = raw.groupby("symbol").size().to_dict() if len(raw) else {}
             with self._conn() as c:
-                c.execute("INSERT OR REPLACE INTO universe_progress VALUES (?,?,?,?)",
-                          (key, len(chunk), n, _now()))
-            log.info("batch %d/%d: %d rows", i // batch + 1, -(-len(syms) // batch), n)
+                c.executemany(
+                    'INSERT OR REPLACE INTO universe_symbol_done VALUES (?,?,?,?,?,?)',
+                    [(a, str(start), str(end), int(counts.get(a, 0)),
+                      "invalid" if a in bad else "", _now()) for a, _ in chunk])
+            log.info("batch %d/%d: %d rows%s", bi, n_batches, n,
+                     f" ({len(bad)} invalid symbol(s) dropped)" if bad else "")
             _time.sleep(pause)
-        return {"symbols": len(syms), "rows": total, "failed_batches": failed}
+        return {"symbols": len(assets), "unreachable": len(unreachable),
+                "delisted_mapped": sum(1 for a, d in mapped.items()
+                                       if d and a.endswith(DELISTED_SUFFIX)),
+                "skipped_done": len(assets) - len(unreachable) - len(todo),
+                "fetched": len(todo), "rows": total, "invalid": invalid,
+                "failed_batches": failed}
+
+    def _fetch_batch(self, client, chunk, start, end):
+        """chunk: [(asset_symbol, data_symbol)]. Returns raw, adj (with the ASSET
+        symbol), and the asset symbols Alpaca rejected as invalid."""
+        by_data = {d: a for a, d in chunk}
+        bad: list[str] = []
+        while by_data:
+            try:
+                raw = self._fetch(client, list(by_data), start, end, "raw")
+                adj = self._fetch(client, list(by_data), start, end, "split")
+                break
+            except _InvalidSymbol as e:
+                if e.symbol not in by_data:
+                    raise
+                bad.append(by_data.pop(e.symbol))
+        else:
+            empty = pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
+            return empty, empty, bad
+        for df in (raw, adj):
+            if len(df):
+                df["symbol"] = df["symbol"].map(by_data)
+        return raw, adj, bad
 
     @staticmethod
     def _fetch(client, symbols, start, end, adjustment) -> pd.DataFrame:
@@ -178,6 +250,9 @@ class UniverseStore:
             code = getattr(e, "status_code", None)
             if code in (401, 403):
                 raise FatalDownloadError(f"Alpaca rejected the request (HTTP {code}): {e}") from e
+            m = re.search(r"invalid symbol:\s*([^\s\"}]+)", str(e))
+            if m:
+                raise _InvalidSymbol(m.group(1)) from e
             raise
         if df is None or len(df) == 0:
             return pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
@@ -199,14 +274,20 @@ class UniverseStore:
 
     def duplicate_report(self, min_days: int = 20) -> pd.DataFrame:
         """Symbol pairs sharing >= min_days identical (date, OHLCV) rows (the
-        same company under an old and a new symbol). Empty after deduplicate()."""
+        same company under an old and a new symbol). Empty after deduplicate().
+        Groups identical rows (one sort) instead of pairing every row with
+        every other row on the same date (the first version, quadratic: hours)."""
+        from collections import Counter
+        from itertools import combinations
         with self._conn() as c:
-            return pd.read_sql(
-                """SELECT a.symbol AS sym_a, b.symbol AS sym_b, COUNT(*) AS days
-                   FROM universe_daily a JOIN universe_daily b
-                     ON a.date=b.date AND a.symbol<b.symbol AND a.open=b.open AND a.high=b.high
-                    AND a.low=b.low AND a.close=b.close AND a.volume=b.volume
-                   GROUP BY 1,2 HAVING COUNT(*) >= ? ORDER BY days DESC""", c, params=(min_days,))
+            groups = c.execute(
+                """SELECT GROUP_CONCAT(symbol, '|') FROM universe_daily
+                   WHERE volume > 0
+                   GROUP BY date, open, high, low, close, volume HAVING COUNT(*) > 1""").fetchall()
+        pairs = Counter(p for (g,) in groups for p in combinations(sorted(g.split("|")), 2))
+        rows = [(a, b, n) for (a, b), n in pairs.items() if n >= min_days]
+        return (pd.DataFrame(rows, columns=["sym_a", "sym_b", "days"])
+                .sort_values("days", ascending=False, ignore_index=True))
 
     def deduplicate(self, min_days: int = 20) -> dict:
         """Remove the same company's rows appearing under two symbols. For each
@@ -316,11 +397,15 @@ if __name__ == "__main__":
         from alpaca.data.historical import StockHistoricalDataClient
         r = u.download_daily(StockHistoricalDataClient(k, s), date.fromisoformat(a.start),
                              date.fromisoformat(a.end))
-        print({x: r[x] for x in ("symbols", "rows")}, f"failed batches: {len(r['failed_batches'])}")
+        print({x: r[x] for x in ("symbols", "unreachable", "delisted_mapped", "skipped_done",
+                                 "fetched", "rows")},
+              f"invalid dropped: {len(r['invalid'])}, failed batches: {len(r['failed_batches'])}")
+        if r["invalid"]:
+            print("   invalid (first 20):", r["invalid"][:20])
         for f in r["failed_batches"][:10]:
             print("  ", f)
         if r["failed_batches"]:
-            print("Re-run the same command: finished batches are skipped.")
+            print("Re-run the same command: finished symbols are skipped.")
             sys.exit(1)
     if a.duplicates:
         d = u.duplicate_report()

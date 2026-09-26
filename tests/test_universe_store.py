@@ -60,16 +60,21 @@ def test_needs_a_full_window():
 # ── store / download (stubbed Alpaca) ──────────────────────────────────────────
 
 class _Client:
-    def __init__(self, fail_first=0, status=None):
-        self.calls, self.fail_first, self.status = [], fail_first, status
+    def __init__(self, fail_first=0, status=None, invalid=()):
+        self.calls, self.fail_first, self.status, self.invalid = [], fail_first, status, set(invalid)
 
     def get_stock_bars(self, req):
         self.calls.append(req)
+        bad = [s for s in req.symbol_or_symbols if s in self.invalid]
+        if bad:
+            from alpaca.common.exceptions import APIError
+            raise APIError('{"message":"invalid symbol: %s"}' % bad[0])
         if self.status:
             from alpaca.common.exceptions import APIError
-            e = APIError('{"message":"forbidden"}')
-            type(e).status_code = property(lambda s, c=self.status: c)
-            raise e
+
+            class _HTTPError(APIError):          # subclass: never mutate APIError itself
+                status_code = property(lambda s, c=self.status: c)
+            raise _HTTPError('{"message":"forbidden"}')
         if self.fail_first:
             self.fail_first -= 1
             raise ConnectionError("reset")
@@ -106,7 +111,7 @@ def test_otc_excluded_and_default_symbol_mapping_used(tmp_path, monkeypatch):
 
 def test_resume_skips_finished_batches_and_retries_failed(tmp_path, monkeypatch):
     monkeypatch.setattr(us._time, "sleep", lambda s: None)
-    u = _store(tmp_path, syms=[(f"S{i:02d}", "NYSE") for i in range(4)])
+    u = _store(tmp_path, syms=[(f"S{c}", "NYSE") for c in "ABCD"])
     r1 = u.download_daily(_Client(fail_first=1), date(2019, 1, 1), date(2019, 3, 31), batch=2)
     assert len(r1["failed_batches"]) == 1 and r1["rows"] == 80
     cl = _Client()
@@ -170,3 +175,58 @@ def test_dedupe_ignores_a_few_coincidental_identical_rows(tmp_path, monkeypatch)
         c.execute("UPDATE universe_daily SET volume=volume+1 WHERE symbol='BBB' AND date NOT IN "
                   "(SELECT date FROM universe_daily WHERE symbol='BBB' ORDER BY date LIMIT 5)")
     assert u.deduplicate()["pairs"] == 0
+
+
+# ── Placeholder symbols, invalid symbols, per-symbol resume (fix of 26 Sep) ──
+
+def test_data_symbol_mapping():
+    known = {"AET_DELISTED", "BRAC_DELISTED", "BRAC", "BRK.B", "0029900E0"}
+    assert us.data_symbol("AET_DELISTED", known) == "AET"          # ticker free: fetch as AET
+    assert us.data_symbol("BRAC_DELISTED", known) is None          # ticker reused: unreachable
+    assert us.data_symbol("BRK.B", known) == "BRK.B"
+    for placeholder in ("0029900E0", "641ESC017", "B002455", "Y11RGT027"):
+        assert us.data_symbol(placeholder, known) is None
+
+
+def test_delisted_fetched_under_base_ticker_stored_under_asset_symbol(tmp_path, monkeypatch):
+    monkeypatch.setattr(us._time, "sleep", lambda s: None)
+    u = _store(tmp_path, syms=(("AET_DELISTED", "NYSE"), ("0029900E0", "NYSE"), ("ZZZ", "NYSE")))
+    cl = _Client()
+    r = u.download_daily(cl, date(2019, 1, 1), date(2019, 3, 31))
+    assert r["unreachable"] == 1 and r["delisted_mapped"] == 1
+    assert set(cl.calls[0].symbol_or_symbols) == {"AET", "ZZZ"}
+    with sqlite3.connect(u.db_path) as c:
+        assert {x for (x,) in c.execute("SELECT DISTINCT symbol FROM universe_daily")} == {"AET_DELISTED", "ZZZ"}
+
+
+def test_one_invalid_symbol_no_longer_sinks_the_batch(tmp_path, monkeypatch):
+    monkeypatch.setattr(us._time, "sleep", lambda s: None)
+    u = _store(tmp_path, syms=[(f"S{c}", "NYSE") for c in "ABCDE"])
+    r = u.download_daily(_Client(invalid={"SC"}), date(2019, 1, 1), date(2019, 3, 31))
+    assert r["invalid"] == ["SC"] and not r["failed_batches"] and r["rows"] == 4 * 40
+
+
+def test_resume_is_per_symbol_and_honours_the_old_per_batch_progress(tmp_path, monkeypatch):
+    monkeypatch.setattr(us._time, "sleep", lambda s: None)
+    u = _store(tmp_path, syms=[(f"S{c}", "NYSE") for c in "ABCD"])
+    u.download_daily(_Client(), date(2019, 1, 1), date(2019, 3, 31))
+    cl = _Client()
+    assert u.download_daily(cl, date(2019, 1, 1), date(2019, 3, 31))["fetched"] == 0 and not cl.calls
+    # simulate the old version: rows + a per-batch progress row, no per-symbol records
+    with sqlite3.connect(u.db_path) as c:
+        c.execute("DELETE FROM universe_symbol_done")
+        c.execute("DELETE FROM universe_daily WHERE symbol IN ('SC','SD')")
+        c.execute("INSERT INTO universe_progress VALUES ('daily:old',2,80,'')")
+    cl = _Client()
+    r = u.download_daily(cl, date(2019, 1, 1), date(2019, 3, 31))
+    assert r["fetched"] == 2 and set(cl.calls[0].symbol_or_symbols) == {"SC", "SD"}
+
+
+def test_fast_duplicate_report_is_quick_and_exact(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(us._time, "sleep", lambda s: None)
+    u = _store(tmp_path, syms=[("S" + a + b, "NYSE") for a in "ABCDEFGHIJKLMNOPQRST" for b in "ABCDEFGHIJKLMNO"])
+    u.download_daily(_Client(), date(2019, 1, 1), date(2019, 3, 31), batch=300)
+    t0 = time.time()
+    d = u.duplicate_report(min_days=10)          # all 300 identical: 44,850 pairs
+    assert time.time() - t0 < 10 and len(d) == 300 * 299 // 2 and (d["days"] == 40).all()
