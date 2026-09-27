@@ -36,6 +36,7 @@ MAX_FOLLOW_ON_DEPTH = 8
 class RunResult:
     state: Any
     reports: list[ExecutionReport] = field(default_factory=list)
+    equity_by_day: dict = field(default_factory=dict)     # session date -> equity after the close
 
 
 def run_box(box, params, df_1m: pd.DataFrame, symbol: str,
@@ -43,13 +44,14 @@ def run_box(box, params, df_1m: pd.DataFrame, symbol: str,
             session_close=None, keep_reports: bool = False) -> RunResult:
     """df_1m: capitalised OHLCV, tz-aware America/New_York index, bars labelled
     by start. Only regular-session bars are expected (the data store's)."""
-    if box.timeframe_minutes != 5:
-        raise ValueError("runner currently builds 5-minute bars only")
+    if box.timeframe_minutes not in (1, 5):
+        raise ValueError("runner supports 1-minute and 5-minute boxes")
     core = ExecutionCore(account or AccountConfig(), fee_fn=fee_fn, session_close=session_close)
     state = box.init_state(params)
     log: list[ExecutionReport] = []
+    eq: dict = {}
     tf = timedelta(minutes=box.timeframe_minutes)
-    df5 = _to_5min(df_1m)
+    df5 = df_1m if box.timeframe_minutes == 1 else _to_5min(df_1m)   # the box's own bars
 
     def dispatch(reports: list[ExecutionReport], bar: Bar | None, depth: int = 0) -> None:
         nonlocal state
@@ -92,4 +94,5 @@ def run_box(box, params, df_1m: pd.DataFrame, symbol: str,
         if ts1.tz is not None and end.tzinfo is None:
             end = pd.Timestamp(end).tz_localize(ts1.tz).to_pydatetime()
         dispatch(core.end_session(end), None)
-    return RunResult(state, log)
+        eq[day] = core.equity()
+    return RunResult(state, log, eq)
