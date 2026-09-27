@@ -65,10 +65,60 @@ def test_gap_tail_report_end_to_end_on_synthetic_data(monkeypatch, tmp_path):
     assert out["n_days"] > 0
     pct = out["percentiles_of_leverage_scaled_adverse_excursion"]
     assert pct[50] <= pct[90] <= pct[95] <= pct[99] <= pct[100]     # percentiles must be monotone
-    assert len(out["worst_10_days"]) <= 10
+    assert len(out["worst_10_days_reconciliation"]) <= 10
+    for row in out["worst_10_days_reconciliation"]:
+        assert row["leverage"] > 0 and row["raw_excursion_pct"] >= 0
+        assert row["n_trade_fills"] is None or row["n_trade_fills"] >= 0
     assert "2018_volmageddon" in out["in_sample_analogues"]
     assert "2010-05-06" in out["caveat"] and "not examined" in out["caveat"]
+    assert out["n_missing_leverage_warmup"] > 0    # the 14-day lookback always excludes early days
+    assert "flat_overnight_citation" in out and len(out["flat_overnight_citation"]["tests"]) == 3
+    assert "metric_definition" in out and "direction-agnostic" in out["metric_definition"].lower()
     assert Path(out["path"]).exists()
+
+
+def test_direction_on_day_counts_fills_honestly_and_does_not_claim_a_side(monkeypatch, tmp_path):
+    """direction (long/short) is deliberately NOT reported -- two derivation
+    attempts were tried and found wrong by cross-checking against real data
+    (see the function's docstring). Only n_trade_fills, which IS reliably
+    derivable from run_box's existing API, is returned."""
+    df = noisy_days("2018-01-02", "2018-06-29", seed=8, px=250.0)
+    df = df[[session_close(d) is not None for d in df.index.date]]
+    days = sorted(set(df.index.date))
+    target = str(days[40])
+    out = gt.direction_on_day(df, {}, target, warmup_days=20)
+    assert "direction" not in out
+    assert out["n_trade_fills"] is not None and out["n_trade_fills"] >= 0
+
+
+def test_direction_on_day_handles_a_date_not_in_the_data():
+    df = noisy_days("2018-01-02", "2018-03-30", seed=8, px=250.0)
+    df = df[[session_close(d) is not None for d in df.index.date]]
+    out = gt.direction_on_day(df, {}, "2019-01-02")
+    assert out["n_trade_fills"] is None and "not in data" in out["note"]
+
+
+def test_direction_on_day_fill_count_matches_the_full_multi_year_run():
+    """Cross-check n_trade_fills (the one thing this function DOES claim)
+    against an independent, already-tested full continuous run -- this is
+    the real correctness bar, not just 'doesn't crash'."""
+    df = noisy_days("2019-01-02", "2019-06-28", seed=5, px=280.0)
+    df = df[[session_close(d) is not None for d in df.index.date]]
+    from boxes.noise_area_momentum import NoiseAreaMomentumBox, Params as BoxParams
+    from core.backtest_runner import run_box as _run_box
+    from core.execution_core import AccountConfig as _AC
+    import pr003_replication as pr
+    full = _run_box(NoiseAreaMomentumBox(), BoxParams(), df, "SPY", _AC(cash=100_000.0, leverage=None),
+                    fee_fn=pr.fee_fn("fidelity"), keep_reports=True)
+    by_day = {}
+    for r in full.reports:
+        if r.status == "FILLED" and r.tag == "trade":
+            by_day.setdefault(pd.Timestamp(r.timestamp).date(), 0)
+            by_day[pd.Timestamp(r.timestamp).date()] += 1
+    sample_dates = list(by_day.keys())[:5]
+    for d in sample_dates:
+        out = gt.direction_on_day(df, {}, str(d), warmup_days=20)
+        assert out["n_trade_fills"] == by_day[d], f"{d}: mismatch vs the full continuous run"
 
 
 def test_gap_tail_never_reads_sealed_data():
