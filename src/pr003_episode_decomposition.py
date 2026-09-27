@@ -210,15 +210,26 @@ def decompose(market_db: str, out_dir: Path) -> dict:
     # Seven-indicator survey: pass/fail per indicator (fixed criterion, set
     # before running), plus the K-of-N pass fraction -- never edited after
     # seeing results.
-    survey = {}
+    survey, survey_notes = {}, {}
     for col, b in result["buckets"].items():
         if isinstance(b, str):
             survey[col] = None
+            survey_notes[col] = "[MISSING] insufficient data over the full sample"
+            continue
+        n_in_episode = sum(v["n_days"] for v in b["in_episode"].values())
+        # A column can clear the FULL-SAMPLE 30-day minimum (used to fit
+        # terciles) while having almost no overlap with the episode itself --
+        # exactly what happened with hy_spread (BAMLH0A0HYM2 only starts
+        # partway into the window: 0 in-episode days, real run 27 Sep 2026).
+        # That must not count as an evaluated indicator either way.
+        if n_in_episode < 30:
+            survey[col] = None
+            survey_notes[col] = f"[MISSING] only {n_in_episode} in-episode days (need >= 30)"
             continue
         survey[col] = indicator_passes(b["in_episode"])
     evaluated = {k: v for k, v in survey.items() if v is not None}
-    result["survey"] = {"per_indicator": survey, "k_pass": sum(evaluated.values()),
-                        "n_evaluated": len(evaluated),
+    result["survey"] = {"per_indicator": survey, "notes": survey_notes,
+                        "k_pass": sum(evaluated.values()), "n_evaluated": len(evaluated),
                         "excluded_by_design": ["FEDFUNDS", "CPIAUCSL"]}
     try:
         result["commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
@@ -260,7 +271,10 @@ def show(r: dict) -> None:
         print(f"\n=== Seven-indicator survey (pass = high-tercile mean > 0 AND low-tercile mean < 0, "
              f"within the episode) ===")
         for name, passed in sv["per_indicator"].items():
-            label = "n/a [MISSING]" if passed is None else ("PASS" if passed else "fail")
+            if passed is None:
+                label = sv.get("notes", {}).get(name, "n/a [MISSING]")
+            else:
+                label = "PASS" if passed else "fail"
             print(f"  {name:<22} {label}")
         print(f"  excluded by design (pre-committed, not post-hoc): {sv['excluded_by_design']}")
         print(f"\n  K/N = {sv['k_pass']}/{sv['n_evaluated']} indicators corroborate the VIX-style direction")

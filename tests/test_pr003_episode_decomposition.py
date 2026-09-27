@@ -11,6 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pr003_episode_decomposition as ed
+from market_data_store import session_close
+from synthetic_bars import noisy_days
 
 
 def _daily(n=300, seed=0):
@@ -176,3 +178,55 @@ def test_survey_k_of_n_counts_only_evaluated_indicators():
         survey[col] = None if isinstance(b, str) else ed.indicator_passes(b["in_episode"])
     evaluated = {k: v for k, v in survey.items() if v is not None}
     assert sum(evaluated.values()) == 1 and len(evaluated) == 2   # 'c' excluded from N, not counted as fail
+
+
+def test_survey_excludes_an_indicator_with_zero_in_episode_coverage():
+    """Reproduces the real bug (28 Sep 2026): hy_spread cleared the
+    full-sample >=30-row minimum used to fit terciles, but had ZERO days
+    actually falling inside the episode (its FRED series starts partway
+    through the window). That must count as [MISSING] for the survey, not
+    as an evaluated 'fail' -- the denominator (N) must reflect real coverage."""
+    idx = pd.bdate_range("2016-01-04", periods=500)
+    net = pd.Series(np.random.default_rng(0).normal(0, 0.01, 500), index=idx)
+    ep_start, ep_end = idx[200], idx[300]
+    in_ep = (net.index >= ep_start) & (net.index <= ep_end)
+    # a "full sample" observable with plenty of rows, but NONE inside the episode
+    obs_col = pd.Series(np.nan, index=idx)
+    obs_col.iloc[:150] = np.random.default_rng(1).normal(0, 1, 150)     # all before the episode
+    obs_col.iloc[350:] = np.random.default_rng(2).normal(0, 1, 150)     # all after the episode
+    assert obs_col.notna().sum() >= 30                                   # clears the full-sample gate
+    b_in = ed.bucket_contribution(net, obs_col, in_ep)
+    n_in_episode = sum(v["n_days"] for v in b_in.values())
+    assert n_in_episode == 0                                             # confirms the bug's premise
+    # the survey construction logic itself (mirrors decompose()'s loop)
+    survey_col = None if n_in_episode < 30 else ed.indicator_passes(b_in)
+    assert survey_col is None    # must be excluded from N, never scored as a fail
+
+
+def test_decompose_itself_excludes_zero_coverage_indicator_from_survey(monkeypatch, tmp_path):
+    """Same regression, but calling the REAL decompose() end to end -- the
+    earlier test above only reproduced the intended logic inline; this one
+    exercises the actual function that produced the wrong K/N on real data."""
+    df = noisy_days("2018-01-02", "2019-12-31", seed=6, px=280.0)   # longer window: avoids a
+    df = df[[session_close(d) is not None for d in df.index.date]]  # degenerate zero-variance
+    ed.pr.load_spy = lambda db: df                                  # tercile column at this seed
+    ed.pr.load_dividends = lambda: {}
+    days = sorted(set(df.index.date))
+    ed.EPISODE = {"start": str(days[10]), "trough": str(days[20]), "end": str(days[40])}
+
+    def partial_coverage_loader(db, sid, s, e):
+        # only covers the LAST third of the window -- zero overlap with the episode above.
+        # A distinct seed per series_id: reusing one seed for all four FRED
+        # series made DGS10 and DGS2 come back IDENTICAL, so term_spread =
+        # d10 - d2 was trivially zero everywhere (a mock bug, not a real
+        # code issue) -- that degeneracy is what broke tercile binning.
+        idx = pd.to_datetime([str(d) for d in days[60:]])
+        rng = np.random.default_rng(abs(hash(sid)) % (2**31))
+        return pd.Series(rng.normal(20, 5, len(idx)), index=idx)
+
+    monkeypatch.setattr(ed, "load_fred_raw", partial_coverage_loader)
+    out = ed.decompose("unused.db", tmp_path)
+    for name in ("vix_level", "vix_change", "term_spread", "hy_spread"):
+        assert out["survey"]["per_indicator"][name] is None, name
+        assert "in-episode days" in out["survey"]["notes"][name]
+    assert out["survey"]["n_evaluated"] <= 3   # only the three price-derived observables remain evaluable
