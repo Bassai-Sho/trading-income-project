@@ -230,3 +230,51 @@ def test_decompose_itself_excludes_zero_coverage_indicator_from_survey(monkeypat
         assert out["survey"]["per_indicator"][name] is None, name
         assert "in-episode days" in out["survey"]["notes"][name]
     assert out["survey"]["n_evaluated"] <= 3   # only the three price-derived observables remain evaluable
+
+
+# ── Chance baseline (28 Sep 2026) ────────────────────────────────────────────
+
+def test_binomial_at_least_k_matches_hand_computed_values():
+    # P(X >= 3 | n=6, p=0.5) -- hand-computable: 1 - P(X<=2)
+    # P(X<=2) = C(6,0)*.5^6 + C(6,1)*.5^6 + C(6,2)*.5^6 = (1+6+15)/64 = 22/64
+    expected = 1 - 22 / 64
+    assert ed.binomial_at_least_k(6, 3, 0.5) == pytest.approx(expected)
+    assert ed.binomial_at_least_k(6, 0, 0.5) == pytest.approx(1.0)      # >= 0 is certain
+    assert ed.binomial_at_least_k(6, 7, 0.5) == pytest.approx(0.0)      # >= n+1 is impossible
+    assert ed.binomial_at_least_k(6, 6, 1.0) == pytest.approx(1.0)      # p=1: certain to hit max
+
+
+def test_binomial_at_least_k_decreases_in_k_and_increases_in_p():
+    assert ed.binomial_at_least_k(6, 5, 0.5) < ed.binomial_at_least_k(6, 3, 0.5)
+    assert ed.binomial_at_least_k(6, 3, 0.2) < ed.binomial_at_least_k(6, 3, 0.8)
+
+
+def test_random_indicator_pass_rate_uses_the_real_pipeline_not_a_shortcut():
+    """A random, meaningless indicator should pass the (high>0, low<0) test
+    a plausible middling fraction of the time by pure chance -- not near 0%
+    (the criterion isn't impossibly strict) and not near 100% (it isn't
+    trivially satisfied), and it must vary with a different seed (proof it
+    is actually drawing fresh random series each time, not reusing one)."""
+    idx = pd.bdate_range("2016-01-04", periods=1000)
+    rng = np.random.default_rng(0)
+    net_s = pd.Series(rng.normal(0, 0.01, 1000), index=idx)
+    in_ep = np.zeros(1000, dtype=bool); in_ep[200:400] = True
+    out_a = ed.random_indicator_pass_rate(net_s, in_ep, draws=500, seed=1)
+    out_b = ed.random_indicator_pass_rate(net_s, in_ep, draws=500, seed=2)
+    assert out_a["evaluated"] > 400                       # nearly every draw has full coverage
+    assert 0.05 < out_a["chance_pass_rate"] < 0.95
+    assert out_a["chance_pass_rate"] != out_b["chance_pass_rate"]   # genuinely different draws
+
+
+def test_chance_baseline_wired_into_decompose_output(monkeypatch, tmp_path):
+    df = noisy_days("2019-01-02", "2019-09-30", seed=6, px=280.0)
+    df = df[[session_close(d) is not None for d in df.index.date]]
+    ed.pr.load_spy = lambda db: df
+    ed.pr.load_dividends = lambda: {}
+    ed.load_fred_raw = lambda db, sid, s, e: None    # no FRED needed for this check
+    days = sorted(set(df.index.date))
+    ed.EPISODE = {"start": str(days[10]), "trough": str(days[30]), "end": str(days[80])}
+    out = ed.decompose("unused.db", tmp_path)
+    cb = out["chance_baseline"]
+    assert 0.0 <= cb["chance_pass_rate"] <= 1.0
+    assert cb["binomial_p_at_least_k_APPROX"] is None or 0.0 <= cb["binomial_p_at_least_k_APPROX"] <= 1.0

@@ -44,6 +44,16 @@ low-tercile mean daily return < 0 (the direction the paper's own VIX
 finding predicts). Report pass/fail per indicator and the K-of-N fraction.
 This is still pure diagnosis -- no threshold, no gate, no action decided.
 
+CHANCE BASELINE (28 Sep 2026): real result was K/N = 3/6. Fifty percent is
+ambiguous on its own -- the six indicators are not independent of each
+other, so a textbook binomial test on them would be the wrong tool. Instead:
+generate many purely random "indicators" (same length as the real series,
+run through the IDENTICAL tercile_labels/bucket_contribution/indicator_passes
+pipeline -- no separate logic), and measure how often a MEANINGLESS
+indicator passes this test on this episode by chance alone. That rate is
+directly comparable to 3/6, and a rough (indicators-independent-assumption)
+binomial comparison is reported alongside it, explicitly flagged [APPROX].
+
     python src/pr003_episode_decomposition.py
 """
 from __future__ import annotations
@@ -170,6 +180,34 @@ def sub_period_contribution(net: pd.Series, dates: pd.Index) -> list[dict]:
     return out
 
 
+def random_indicator_pass_rate(net_s: pd.Series, in_ep: np.ndarray, draws: int = 2000,
+                              seed: int = 0) -> dict:
+    """What fraction of MEANINGLESS random series would 'pass' this exact
+    test on this exact episode, by chance alone? Reuses tercile_labels /
+    bucket_contribution / indicator_passes verbatim -- no parallel logic."""
+    rng = np.random.default_rng(seed)
+    passed, evaluated = 0, 0
+    for _ in range(draws):
+        rand_obs = pd.Series(rng.normal(0, 1, len(net_s)), index=net_s.index)
+        b = bucket_contribution(net_s, rand_obs, in_ep)
+        if sum(v["n_days"] for v in b.values()) < 30:
+            continue
+        r = indicator_passes(b)
+        if r is not None:
+            evaluated += 1
+            passed += int(r)
+    rate = passed / evaluated if evaluated else float("nan")
+    return {"draws": draws, "evaluated": evaluated, "chance_pass_rate": rate}
+
+
+def binomial_at_least_k(n: int, k: int, p: float) -> float:
+    """P(X >= k) for X ~ Binomial(n, p). [APPROX]: assumes independence
+    across the n real indicators, which is not quite true here -- reported
+    as a rough comparison, not a rigorous p-value."""
+    from math import comb
+    return sum(comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1))
+
+
 def decompose(market_db: str, out_dir: Path) -> dict:
     df = pr.load_spy(market_db)
     assert df.index.max().date() <= pr.WINDOW[1], "sealed window must not be read"
@@ -231,6 +269,13 @@ def decompose(market_db: str, out_dir: Path) -> dict:
     result["survey"] = {"per_indicator": survey, "notes": survey_notes,
                         "k_pass": sum(evaluated.values()), "n_evaluated": len(evaluated),
                         "excluded_by_design": ["FEDFUNDS", "CPIAUCSL"]}
+
+    chance = random_indicator_pass_rate(net_s, in_ep)
+    k, n = result["survey"]["k_pass"], result["survey"]["n_evaluated"]
+    chance["binomial_p_at_least_k_APPROX"] = (
+        binomial_at_least_k(n, k, chance["chance_pass_rate"])
+        if not np.isnan(chance["chance_pass_rate"]) else None)
+    result["chance_baseline"] = chance
     try:
         result["commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
                                           text=True, timeout=5).stdout.strip()
@@ -266,6 +311,15 @@ def show(r: dict) -> None:
                 m = "—" if v["mean_net_r"] is None else f"{v['mean_net_r']:+.3%}"
                 print(f"      {lab:<5} n={v['n_days']:>4} ({v['share_of_days']:.0%})  "
                      f"sum {v['sum_net_r']:>+8.2%}  mean/day {m}")
+    cb = r.get("chance_baseline")
+    if cb:
+        print(f"\n=== Chance baseline: how often does a MEANINGLESS random indicator pass this "
+             f"exact test on this episode? ({cb['draws']} random draws) ===")
+        print(f"  chance pass rate: {cb['chance_pass_rate']:.1%}  ({cb['evaluated']}/{cb['draws']} evaluable draws)")
+        if cb["binomial_p_at_least_k_APPROX"] is not None:
+            print(f"  P(>= {r['survey']['k_pass']} of {r['survey']['n_evaluated']} real indicators pass "
+                 f"| chance alone) = {cb['binomial_p_at_least_k_APPROX']:.1%}  [APPROX -- assumes independence, "
+                 f"which the real indicators do not fully have]")
     sv = r.get("survey")
     if sv:
         print(f"\n=== Seven-indicator survey (pass = high-tercile mean > 0 AND low-tercile mean < 0, "
