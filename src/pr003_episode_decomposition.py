@@ -160,6 +160,14 @@ def tercile_labels(x: pd.Series) -> pd.Series:
 
 
 def bucket_contribution(net: pd.Series, obs: pd.Series, mask: np.ndarray) -> dict:
+    """Buckets are FULL-SAMPLE terciles (labelled 'low'/'mid'/'high' relative
+    to the whole 2016-2024 sample, NOT re-cut within the masked scope -- a
+    masked scope's own bucket sizes need not be equal thirds of itself).
+    n_missing accounts for masked days excluded because their observable was
+    NaN (warmup shift, or a genuine gap in the source data e.g. FRED) -- this
+    is reported explicitly rather than left as silent subtraction (round-3
+    cold-fork review, 28 Sep 2026: 1,112 episode days vs 1,073 accounted for
+    vix_level was real FRED data gaps, not a bug -- but needed stating)."""
     labels = tercile_labels(obs)                        # terciles from the FULL sample
     out = {}
     for lab in ("low", "mid", "high"):
@@ -168,7 +176,16 @@ def bucket_contribution(net: pd.Series, obs: pd.Series, mask: np.ndarray) -> dic
         out[lab] = {"n_days": n, "sum_net_r": float(net[sel].sum()) if n else 0.0,
                    "mean_net_r": float(net[sel].mean()) if n else None,
                    "share_of_days": n / max(1, int(mask.sum()))}
+    accounted = sum(v["n_days"] for v in out.values())
+    out["n_missing"] = int(mask.sum()) - accounted
     return out
+
+
+def _real_buckets(b: dict) -> dict:
+    """b, minus the 'n_missing' accounting entry -- the three actual
+    low/mid/high buckets. Every caller that loops over a bucket_contribution
+    result's buckets (not just displays n_missing) must go through this."""
+    return {k: v for k, v in b.items() if k != "n_missing"}
 
 
 def sub_period_contribution(net: pd.Series, dates: pd.Index) -> list[dict]:
@@ -177,6 +194,35 @@ def sub_period_contribution(net: pd.Series, dates: pd.Index) -> list[dict]:
     for q, g in net.groupby(dates.to_period("Q")):
         out.append({"quarter": str(q), "n_days": len(g), "sum_net_r": float(g.sum()),
                    "mean_net_r": float(g.mean()), "regime": diag._regime_of(diag._date_str(g.index[len(g) // 2]))})
+    return out
+
+
+def effective_leverage(daily: pd.DataFrame, lookback: int = 14, target_vol: float = 0.02,
+                       max_leverage: float = 4.0) -> pd.Series:
+    """Approximates box #3's own vol-target sizing formula
+    (min(max_leverage, target_vol / sigma_spy)) directly from daily closes --
+    NOT a rerun of the box, just its documented formula applied analytically.
+    Tests a mechanical alternative to any 'low vol -> bad signal' story: once
+    realised vol falls low enough, sizing hits the 4x cap and stops shrinking
+    further, so the very lowest-vol days could carry structurally maximal
+    leverage relative to their own risk, with no signal-quality claim needed
+    at all (added per round-3 cold-fork review, 28 Sep 2026)."""
+    vol = daily["close"].pct_change().rolling(lookback).std(ddof=1).shift(1)
+    return np.minimum(max_leverage, target_vol / vol)
+
+
+def leverage_cap_check(daily: pd.DataFrame, obs_col: pd.Series, in_ep: np.ndarray,
+                       cap_threshold: float = 3.9) -> dict:
+    """Mean effective leverage and the share of days AT the cap, by
+    full-sample tercile of obs_col, within the episode."""
+    lev = effective_leverage(daily).reindex(obs_col.index)
+    labels = tercile_labels(obs_col)
+    out = {}
+    for lab in ("low", "mid", "high"):
+        sel = in_ep & (labels.reindex(lev.index) == lab).to_numpy() & lev.notna().to_numpy()
+        n = int(sel.sum())
+        out[lab] = {"n_days": n, "mean_leverage": float(lev[sel].mean()) if n else None,
+                   "share_at_cap": float((lev[sel] >= cap_threshold).mean()) if n else None}
     return out
 
 
@@ -190,7 +236,7 @@ def random_indicator_pass_rate(net_s: pd.Series, in_ep: np.ndarray, draws: int =
     for _ in range(draws):
         rand_obs = pd.Series(rng.normal(0, 1, len(net_s)), index=net_s.index)
         b = bucket_contribution(net_s, rand_obs, in_ep)
-        if sum(v["n_days"] for v in b.values()) < 30:
+        if sum(v["n_days"] for v in _real_buckets(b).values()) < 30:
             continue
         r = indicator_passes(b)
         if r is not None:
@@ -198,6 +244,85 @@ def random_indicator_pass_rate(net_s: pd.Series, in_ep: np.ndarray, draws: int =
             passed += int(r)
     rate = passed / evaluated if evaluated else float("nan")
     return {"draws": draws, "evaluated": evaluated, "chance_pass_rate": rate}
+
+
+def common_shift_null(net_s: pd.Series, in_ep: np.ndarray, real_obs: dict[str, pd.Series],
+                      draws: int = 2000, seed: int = 0) -> dict:
+    """Round-3 cold-fork correction: the six real indicators are NOT mutually
+    independent (VIX level/change/prior-day range/overnight gap proxy one
+    volatility factor; term/HY spread a separate macro factor), so testing
+    against six INDEPENDENT random draws (random_indicator_pass_rate) likely
+    UNDERSTATES the true chance rate. Fix: a common-offset circular shift --
+    each draw picks ONE random offset and applies it to ALL SIX real series
+    together (np.roll). This preserves each series' own autocorrelation AND
+    the real cross-series correlation structure exactly, while destroying
+    their alignment with the (fixed) net-return series and episode dates --
+    exactly what a genuine chance mechanism should do. Reuses
+    tercile_labels/bucket_contribution/indicator_passes verbatim."""
+    rng = np.random.default_rng(seed)
+    cols = list(real_obs.keys())
+    arrays = {c: real_obs[c].reindex(net_s.index).to_numpy() for c in cols}
+    n = len(net_s)
+    k_pass_counts = []
+    for _ in range(draws):
+        k = 0
+        for c in cols:
+            offset = int(rng.integers(1, n))
+            shifted = pd.Series(np.roll(arrays[c], offset), index=net_s.index)
+            b = bucket_contribution(net_s, shifted, in_ep)
+            if sum(v["n_days"] for v in _real_buckets(b).values()) < 30:
+                continue
+            r = indicator_passes(b)
+            if r:
+                k += 1
+        k_pass_counts.append(k)
+    k_arr = np.array(k_pass_counts)
+    return {"draws": draws, "n_indicators": len(cols),
+           "mean_k_pass": float(k_arr.mean()),
+           "p_at_least_3_of_n": float((k_arr >= 3).mean())}
+
+
+def year_dummy_fork(net_s: pd.Series, obs_col: pd.Series, in_ep: np.ndarray,
+                    years: tuple = (2017, 2018, 2019, 2020)) -> dict:
+    """Separates P (a dead zone exists) from Q (low vol specifically caused
+    it) using data already in hand: does the low-vs-high VIX contrast hold
+    WITHIN each individual year of the episode, not just across years? If Q
+    is real it should survive a year control; if the pattern is really just
+    'this was a calm multi-year stretch', within-year contrasts (which hold
+    the calendar fixed) should be flat or inconsistent. Full-sample tercile
+    labels (fit once, as everywhere else) are reused, only the day-mask
+    changes per year."""
+    labels = tercile_labels(obs_col)
+    out = {}
+    for y in years:
+        year_mask = in_ep & (net_s.index.year == y)
+        n_year = int(year_mask.sum())
+        if n_year < 20:
+            out[y] = {"n_days": n_year, "note": "[MISSING] too few episode days this year"}
+            continue
+        within_year_vals = obs_col.reindex(net_s.index)[year_mask]
+        low_r = float(net_s[year_mask & (labels.reindex(net_s.index) == "low").to_numpy()].mean()) \
+            if (year_mask & (labels.reindex(net_s.index) == "low").to_numpy()).sum() else None
+        high_r = float(net_s[year_mask & (labels.reindex(net_s.index) == "high").to_numpy()].mean()) \
+            if (year_mask & (labels.reindex(net_s.index) == "high").to_numpy()).sum() else None
+        out[y] = {"n_days": n_year, "within_year_obs_std": float(within_year_vals.std()),
+                 "low_mean_net_r": low_r, "high_mean_net_r": high_r,
+                 "q_direction_holds": (low_r is not None and high_r is not None and low_r < high_r)}
+    informative = [y for y, v in out.items() if v.get("q_direction_holds") is not None]
+    supporting = [y for y in informative if out[y]["q_direction_holds"]]
+    return {"per_year": out, "informative_years": informative,
+           "years_supporting_q": supporting,
+           "fork_result": "Q survives year control" if len(supporting) >= max(2, len(informative) // 2 + 1)
+                          else "calendar/drift explains the pattern at least as well as Q"}
+
+
+def post_episode_bucket_check(net_s: pd.Series, obs_col: pd.Series, start: str, end: str) -> dict:
+    """Same full-sample tercile boundaries, applied OUTSIDE the episode that
+    defined them -- here, Jan 2023-Dec 2024. Not a clean statistical
+    hold-out (this window already informed Stage R/Refine/V), so weight as
+    corroboration only, per round-3 review."""
+    mask = (net_s.index >= pd.Timestamp(start)) & (net_s.index <= pd.Timestamp(end))
+    return bucket_contribution(net_s, obs_col, mask)
 
 
 def binomial_at_least_k(n: int, k: int, p: float) -> float:
@@ -254,7 +379,7 @@ def decompose(market_db: str, out_dir: Path) -> dict:
             survey[col] = None
             survey_notes[col] = "[MISSING] insufficient data over the full sample"
             continue
-        n_in_episode = sum(v["n_days"] for v in b["in_episode"].values())
+        n_in_episode = sum(v["n_days"] for v in _real_buckets(b["in_episode"]).values())
         # A column can clear the FULL-SAMPLE 30-day minimum (used to fit
         # terciles) while having almost no overlap with the episode itself --
         # exactly what happened with hy_spread (BAMLH0A0HYM2 only starts
@@ -276,6 +401,33 @@ def decompose(market_db: str, out_dir: Path) -> dict:
         binomial_at_least_k(n, k, chance["chance_pass_rate"])
         if not np.isnan(chance["chance_pass_rate"]) else None)
     result["chance_baseline"] = chance
+
+    # Cluster-aware chance baseline (round 3): only the columns actually
+    # evaluated in the survey, real series, common-offset shift.
+    real_series = {col: obs[col] for col in evaluated}
+    if len(real_series) >= 2:
+        result["chance_baseline_common_shift"] = common_shift_null(net_s, in_ep, real_series)
+    else:
+        result["chance_baseline_common_shift"] = None
+
+    # Year-dummy fork (round 3): only on vix_level, the strongest surviving
+    # candidate, and only if it was evaluable at all.
+    if "vix_level" in obs.columns and evaluated.get("vix_level") is not None:
+        result["year_fork"] = year_dummy_fork(net_s, obs["vix_level"], in_ep)
+    else:
+        result["year_fork"] = None
+
+    # Post-episode (2023-2024) check on the same indicators, corroboration only.
+    result["post_episode_2023_2024"] = {}
+    for col in evaluated:
+        result["post_episode_2023_2024"][col] = post_episode_bucket_check(
+            net_s, obs[col], "2023-01-01", "2024-12-31")
+
+    # Leverage-cap mechanical check, on vix_level if available.
+    if "vix_level" in obs.columns and evaluated.get("vix_level") is not None:
+        result["leverage_cap_check"] = leverage_cap_check(daily, obs["vix_level"], in_ep)
+    else:
+        result["leverage_cap_check"] = None
     try:
         result["commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
                                           text=True, timeout=5).stdout.strip()
@@ -306,8 +458,8 @@ def show(r: dict) -> None:
             continue
         print(f"\n  {col}:")
         for scope, buckets in b.items():
-            print(f"    {scope}:")
-            for lab, v in buckets.items():
+            print(f"    {scope}: (n_missing={buckets['n_missing']})")
+            for lab, v in _real_buckets(buckets).items():
                 m = "—" if v["mean_net_r"] is None else f"{v['mean_net_r']:+.3%}"
                 print(f"      {lab:<5} n={v['n_days']:>4} ({v['share_of_days']:.0%})  "
                      f"sum {v['sum_net_r']:>+8.2%}  mean/day {m}")
@@ -320,6 +472,47 @@ def show(r: dict) -> None:
             print(f"  P(>= {r['survey']['k_pass']} of {r['survey']['n_evaluated']} real indicators pass "
                  f"| chance alone) = {cb['binomial_p_at_least_k_APPROX']:.1%}  [APPROX -- assumes independence, "
                  f"which the real indicators do not fully have]")
+    csn = r.get("chance_baseline_common_shift")
+    if csn:
+        print(f"\n=== Cluster-aware chance baseline (common-offset shift, preserves cross-indicator "
+             f"correlation) ===")
+        print(f"  mean indicators passing per shifted draw: {csn['mean_k_pass']:.2f} of {csn['n_indicators']}")
+        print(f"  P(>= 3 of {csn['n_indicators']} pass | correlated chance): {csn['p_at_least_3_of_n']:.1%}")
+
+    yf = r.get("year_fork")
+    if yf:
+        print(f"\n=== Year-dummy fork (does the VIX contrast hold WITHIN each year, or only across years?) ===")
+        for y, v in yf["per_year"].items():
+            if "note" in v:
+                print(f"  {y}: {v['note']}")
+                continue
+            lo = "—" if v["low_mean_net_r"] is None else f"{v['low_mean_net_r']:+.3%}"
+            hi = "—" if v["high_mean_net_r"] is None else f"{v['high_mean_net_r']:+.3%}"
+            print(f"  {y}: n={v['n_days']:>3}  low {lo}  high {hi}  "
+                 f"within-year VIX std {v['within_year_obs_std']:.2f}  "
+                 f"Q holds: {v['q_direction_holds']}")
+        print(f"  informative years: {yf['informative_years']}, supporting Q: {yf['years_supporting_q']}")
+        print(f"  FORK RESULT: {yf['fork_result']}")
+
+    pe = r.get("post_episode_2023_2024")
+    if pe:
+        print(f"\n=== Post-episode check, Jan 2023-Dec 2024 (same tercile boundaries; "
+             f"corroboration only, NOT a clean hold-out) ===")
+        for col, b in pe.items():
+            rb = _real_buckets(b)
+            lo, hi = rb["low"]["mean_net_r"], rb["high"]["mean_net_r"]
+            lo_s = "—" if lo is None else f"{lo:+.3%}"
+            hi_s = "—" if hi is None else f"{hi:+.3%}"
+            print(f"  {col:<22} low {lo_s}  high {hi_s}  (n_missing={b['n_missing']})")
+
+    lc = r.get("leverage_cap_check")
+    if lc:
+        print(f"\n=== Leverage-cap mechanical check (by VIX tercile, within the episode) ===")
+        for lab, v in lc.items():
+            ml = "—" if v["mean_leverage"] is None else f"{v['mean_leverage']:.2f}x"
+            sc = "—" if v["share_at_cap"] is None else f"{v['share_at_cap']:.0%}"
+            print(f"  {lab:<5} n={v['n_days']:>4}  mean leverage {ml}  share at/near 4x cap {sc}")
+
     sv = r.get("survey")
     if sv:
         print(f"\n=== Seven-indicator survey (pass = high-tercile mean > 0 AND low-tercile mean < 0, "
