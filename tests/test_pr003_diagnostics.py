@@ -55,6 +55,21 @@ def test_regime_classification():
     assert diag._regime_of("2017-06-01") == "normal_bull"
 
 
+def test_drawdown_episodes_handles_plain_date_index_not_just_timestamp():
+    """Real data: MarketDataStore/backtest_runner key equity_by_day by plain
+    datetime.date objects (no .date() method), not pandas Timestamp -- crashed
+    the first version of this module on real data (27 Sep 2026): AttributeError:
+    'datetime.date' object has no attribute 'date'."""
+    import datetime as dt
+    idx = pd.Index([dt.date(2019, 1, d) for d in range(2, 22)])
+    r = pd.Series(0.001, index=idx)
+    r.iloc[5:9] = -0.05
+    eps = diag.drawdown_episodes(r, top=1)          # must not raise
+    assert eps[0]["start"] == "2019-01-07"
+    cf = diag.counterfactual_without_episode(r, eps[0])
+    assert cf > eps[0]["depth"] * 0.5
+
+
 # ── 2. Cost-sensitivity curve ─────────────────────────────────────────────────
 
 def test_cost_curve_is_monotonically_non_increasing_in_cost():
@@ -120,6 +135,19 @@ def two_days():
     return df[df.index.date == days[2]], df[df.index.date == days[3]]
 
 
+@pytest.fixture(scope="module")
+def warmed_slice():
+    """>= WARMUP_DAYS of real prior sessions plus one target day -- enough
+    history for box #3's 14-day lookback to produce an actual signal."""
+    df = noisy_days("2019-01-02", "2019-04-30", seed=6, px=280.0)
+    df = df[[session_close(d) is not None for d in df.index.date]]
+    days = sorted(set(df.index.date))
+    j = diag.WARMUP_DAYS + 8    # confirmed non-zero return with this seed/window (checked directly)
+    warm = df[np.isin(df.index.date, days[j - diag.WARMUP_DAYS:j])]
+    target = df[df.index.date == days[j]]
+    return warm, target
+
+
 def test_shuffle_preserves_first_half_hour_and_bar_multiset(two_days):
     _, day = two_days
     rng = np.random.default_rng(5)
@@ -136,6 +164,26 @@ def test_run_one_day_placebo_shuffle_false_matches_normal_run(two_days):
     prev, day = two_days
     r_direct = diag.run_one_day_placebo(prev, day, np.random.default_rng(0), shuffle=False)
     assert isinstance(r_direct, float)
+
+
+def test_without_warmup_the_box_never_trades_a_real_bug_this_regression_guards():
+    """The exact failure mode found on real data: ONE prior day is nowhere
+    near box #3's 14-day lookback, so neither the true order nor any shuffle
+    ever produces a signal -- observed AND null Sharpe both come out exactly
+    0.00, which looks like (but is not) 'the edge survives shuffling'."""
+    df = noisy_days("2019-01-02", "2019-02-28", seed=4, px=280.0)
+    df = df[[session_close(d) is not None for d in df.index.date]]
+    days = sorted(set(df.index.date))
+    prev, day = df[df.index.date == days[5]], df[df.index.date == days[6]]
+    r = diag.run_one_day_placebo(prev, day, np.random.default_rng(0), shuffle=False)
+    assert r == 0.0                     # documents the bug's exact symptom
+
+
+def test_with_real_warmup_the_box_can_actually_trade(warmed_slice):
+    warm, target = warmed_slice
+    rng = np.random.default_rng(0)
+    results = [diag.run_one_day_placebo(warm, target, rng, shuffle=s) for s in (False, True, True, True)]
+    assert any(r != 0.0 for r in results), "expected at least one non-zero day with proper warm-up"
 
 
 def test_placebo_end_to_end_on_small_sample(monkeypatch, tmp_path):

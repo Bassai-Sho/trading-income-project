@@ -48,6 +48,16 @@ from market_data_store import REGIMES                                 # noqa: E4
 
 log = logging.getLogger("pr003_diagnostics")
 HALF_HOUR = pd.Timedelta(minutes=30)
+WARMUP_DAYS = 20   # >= box #3's Params.lookback (14), real unshuffled history
+
+
+def _date_str(x) -> str:
+    """Index items may be pandas Timestamp (has .date()) OR plain
+    datetime.date (does not) -- the runner's equity_by_day/position_by_day
+    keys are plain date objects, which crashed the first version of this
+    module (27 Sep 2026, real-data run)."""
+    d = x.date() if hasattr(x, "date") and callable(getattr(x, "date")) else x
+    return str(d)
 
 
 def _get_final_variant_series(df: pd.DataFrame, divs: dict):
@@ -71,14 +81,14 @@ def drawdown_episodes(net: pd.Series, top: int = 5) -> list[dict]:
         elif v >= 0 and in_dd:
             seg = dd.iloc[start_idx:i]
             trough = seg.idxmin()
-            episodes.append({"start": str(seg.index[0].date()), "trough": str(trough.date()),
-                             "end": str(d.date()), "depth": float(seg.min()),
+            episodes.append({"start": _date_str(seg.index[0]), "trough": _date_str(trough),
+                             "end": _date_str(d), "depth": float(seg.min()),
                              "n_days": len(seg)})
             in_dd = False
     if in_dd:
         seg = dd.iloc[start_idx:]
         trough = seg.idxmin()
-        episodes.append({"start": str(seg.index[0].date()), "trough": str(trough.date()),
+        episodes.append({"start": _date_str(seg.index[0]), "trough": _date_str(trough),
                          "end": "ongoing", "depth": float(seg.min()), "n_days": len(seg)})
     return sorted(episodes, key=lambda e: e["depth"])[:top]
 
@@ -95,9 +105,10 @@ def counterfactual_without_episode(net: pd.Series, ep: dict) -> float:
     """Max drawdown of the SAME series with this episode's days zeroed out —
     answers 'how much of the excess drawdown is this one episode alone?'."""
     masked = net.copy()
-    mask = (masked.index >= pd.Timestamp(ep["start"])) & (masked.index <= pd.Timestamp(
-        ep["end"] if ep["end"] != "ongoing" else masked.index[-1]))
-    masked[mask] = 0.0
+    idx_str = pd.Index([_date_str(x) for x in masked.index])
+    end = ep["end"] if ep["end"] != "ongoing" else idx_str[-1]
+    mask = (idx_str >= ep["start"]) & (idx_str <= end)
+    masked[np.asarray(mask)] = 0.0
     eq = (1 + masked).cumprod()
     return float((eq / eq.cummax() - 1).min())
 
@@ -218,10 +229,16 @@ def shuffle_day_blocks(day_bars: pd.DataFrame, rng: np.random.Generator) -> pd.D
     return pd.DataFrame(values.to_numpy(), columns=values.columns, index=idx)
 
 
-def run_one_day_placebo(prev_day_bars: pd.DataFrame, day_bars: pd.DataFrame, rng,
+def run_one_day_placebo(warmup_bars: pd.DataFrame, day_bars: pd.DataFrame, rng,
                         shuffle: bool) -> float:
+    """warmup_bars: >= WARMUP_DAYS of REAL, unshuffled prior sessions -- box #3
+    needs Params.lookback (14) days of history before its band/sizing produce
+    any signal at all. The first version of this function fed only ONE prior
+    day, so neither the true order nor any shuffle ever traded (observed and
+    null Sharpe both came out exactly 0.00 on real data, 27 Sep 2026): that
+    was an untraded strategy, not a null result about shuffling."""
     target = shuffle_day_blocks(day_bars, rng) if shuffle else day_bars
-    two = pd.concat([prev_day_bars, target])
+    two = pd.concat([warmup_bars, target])
     res = run_box(NoiseAreaMomentumBox(), Params(sizing="vol_target"), two, "SPY",
                   AccountConfig(cash=pr.AUM0, leverage=None), fee_fn=mes_fee_fn())
     eq = pd.Series(res.equity_by_day).sort_index()
@@ -230,21 +247,24 @@ def run_one_day_placebo(prev_day_bars: pd.DataFrame, day_bars: pd.DataFrame, rng
     return float(eq.iloc[-1] / eq.iloc[-2] - 1)
 
 
-def intraday_shuffle_placebo(market_db: str, out_dir: Path, n_days: int = 200,
-                             draws: int = 30, seed: int = 0) -> dict:
+def intraday_shuffle_placebo(market_db: str, out_dir: Path, n_days: int = 60,
+                             draws: int = 20, seed: int = 0,
+                             warmup_days: int = WARMUP_DAYS) -> dict:
     df = pr.load_spy(market_db)
     assert df.index.max().date() <= pr.WINDOW[1], "sealed window must not be read"
     days = sorted(set(df.index.date))
     rng = np.random.default_rng(seed)
-    sample = sorted(rng.choice(days[1:], size=min(n_days, len(days) - 1), replace=False))
+    eligible = days[warmup_days:]                        # need warmup_days of real history first
+    sample = sorted(rng.choice(eligible, size=min(n_days, len(eligible)), replace=False))
     actual, shuffled = [], np.zeros((draws, len(sample)))
     for i, d in enumerate(sample):
-        prev = days[days.index(d) - 1]
-        pb, db = df[df.index.date == prev], df[df.index.date == d]
-        actual.append(run_one_day_placebo(pb, db, rng, shuffle=False))
+        j = days.index(d)
+        warm = df[np.isin(df.index.date, days[j - warmup_days:j])]
+        db = df[df.index.date == d]
+        actual.append(run_one_day_placebo(warm, db, rng, shuffle=False))
         for k in range(draws):
-            shuffled[k, i] = run_one_day_placebo(pb, db, rng, shuffle=True)
-        if (i + 1) % 25 == 0:
+            shuffled[k, i] = run_one_day_placebo(warm, db, rng, shuffle=True)
+        if (i + 1) % 10 == 0:
             log.info("placebo %d/%d sampled days", i + 1, len(sample))
     actual = np.array(actual)
     obs_sharpe = float(actual.mean() / actual.std(ddof=1) * np.sqrt(252)) if actual.std(ddof=1) > 0 else 0.0
@@ -252,7 +272,7 @@ def intraday_shuffle_placebo(market_db: str, out_dir: Path, n_days: int = 200,
                              if shuffled[k].std(ddof=1) > 0 else 0.0 for k in range(draws)])
     p = (1 + int((null_sharpes >= obs_sharpe).sum())) / (1 + draws)
     out = {"run_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-          "n_days": len(sample), "draws": draws, "observed_sharpe": obs_sharpe,
+          "n_days": len(sample), "draws": draws, "warmup_days": warmup_days, "observed_sharpe": obs_sharpe,
           "null_sharpe_mean": float(null_sharpes.mean()), "null_sharpe_p95": float(np.percentile(null_sharpes, 95)),
           "p_value": p, "edge_survives_shuffle": p >= 0.05}
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -283,8 +303,9 @@ if __name__ == "__main__":
     a.add_argument("--drawdown", action="store_true")
     a.add_argument("--cost-curve", action="store_true")
     a.add_argument("--placebo", action="store_true")
-    a.add_argument("--days", type=int, default=200)
-    a.add_argument("--draws", type=int, default=30)
+    a.add_argument("--days", type=int, default=60)
+    a.add_argument("--draws", type=int, default=20)
+    a.add_argument("--warmup-days", type=int, default=WARMUP_DAYS)
     args = a.parse_args()
     out_dir = Path("DATA/pr003")
     if args.drawdown:
@@ -292,8 +313,8 @@ if __name__ == "__main__":
     if args.cost_curve:
         show_cost_curve(cost_sensitivity_curve(args.db, out_dir))
     if args.placebo:
-        show_placebo(intraday_shuffle_placebo(args.db, out_dir, args.days, args.draws))
+        show_placebo(intraday_shuffle_placebo(args.db, out_dir, args.days, args.draws, warmup_days=args.warmup_days))
     if not any((args.drawdown, args.cost_curve, args.placebo)):
         show_drawdown(drawdown_attribution(args.db, out_dir))
         show_cost_curve(cost_sensitivity_curve(args.db, out_dir))
-        show_placebo(intraday_shuffle_placebo(args.db, out_dir, args.days, args.draws))
+        show_placebo(intraday_shuffle_placebo(args.db, out_dir, args.days, args.draws, warmup_days=args.warmup_days))
