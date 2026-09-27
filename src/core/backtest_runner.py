@@ -37,6 +37,7 @@ class RunResult:
     state: Any
     reports: list[ExecutionReport] = field(default_factory=list)
     equity_by_day: dict = field(default_factory=dict)     # session date -> equity after the close
+    position_by_day: dict = field(default_factory=dict)   # session date -> position after the close
 
 
 def run_box(box, params, df_1m: pd.DataFrame, symbol: str,
@@ -50,6 +51,7 @@ def run_box(box, params, df_1m: pd.DataFrame, symbol: str,
     state = box.init_state(params)
     log: list[ExecutionReport] = []
     eq: dict = {}
+    pos: dict = {}
     tf = timedelta(minutes=box.timeframe_minutes)
     df5 = df_1m if box.timeframe_minutes == 1 else _to_5min(df_1m)   # the box's own bars
 
@@ -95,4 +97,5 @@ def run_box(box, params, df_1m: pd.DataFrame, symbol: str,
             end = pd.Timestamp(end).tz_localize(ts1.tz).to_pydatetime()
         dispatch(core.end_session(end), None)
         eq[day] = core.equity()
-    return RunResult(state, log, eq)
+        pos[day] = core.position(symbol)
+    return RunResult(state, log, eq, pos)
