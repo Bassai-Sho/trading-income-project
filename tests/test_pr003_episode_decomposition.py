@@ -104,3 +104,75 @@ def test_missing_vix_reported_not_substituted(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
     v = ed.load_vix("unused.db", "2016-01-01", "2024-12-31")
     assert v is None       # must report [MISSING], never silently fall back to a substitute
+
+
+# ── Seven-indicator survey (28 Sep 2026) ─────────────────────────────────────
+
+def test_indicator_passes_requires_both_directions():
+    hi_pos_lo_neg = {"high": {"mean_net_r": 0.001}, "low": {"mean_net_r": -0.001}}
+    hi_pos_lo_pos = {"high": {"mean_net_r": 0.001}, "low": {"mean_net_r": 0.001}}
+    hi_neg_lo_neg = {"high": {"mean_net_r": -0.001}, "low": {"mean_net_r": -0.001}}
+    assert ed.indicator_passes(hi_pos_lo_neg) is True
+    assert ed.indicator_passes(hi_pos_lo_pos) is False
+    assert ed.indicator_passes(hi_neg_lo_neg) is False
+
+
+def test_indicator_passes_none_when_a_bucket_is_empty():
+    assert ed.indicator_passes({"high": {"mean_net_r": None}, "low": {"mean_net_r": -0.001}}) is None
+
+
+def test_vix_change_is_the_diff_of_vix_shifted_one_extra_day(monkeypatch):
+    rows = [{"date": d, "value": v} for d, v in
+           zip(pd.bdate_range("2019-01-02", periods=10).strftime("%Y-%m-%d"),
+               [15, 16, 14, 20, 19, 18, 17, 30, 25, 22])]
+    class FakeStore:
+        def __init__(self, db): pass
+        def get_series(self, series_id, start, end): return rows
+    monkeypatch.setattr(ed, "load_fred_raw", lambda db, sid, s, e: (
+        pd.Series({r["date"]: r["value"] for r in rows}, dtype=float).pipe(
+            lambda x: x.set_axis(pd.to_datetime(x.index)).sort_index())))
+    ch = ed.load_vix_change("unused.db", "2019-01-01", "2019-01-20")
+    raw = ed.load_fred_raw("unused.db", "VIXCLS", "2019-01-01", "2019-01-20")
+    # ch[d] must equal raw[d-1] - raw[d-2] (twice-shifted diff)
+    assert ch.iloc[3] == pytest.approx(raw.iloc[2] - raw.iloc[1])   # ch[i] = raw[i-1] - raw[i-2]
+
+
+def test_term_spread_is_10y_minus_2y_shifted(monkeypatch):
+    idx = pd.bdate_range("2019-01-02", periods=10)
+    d10 = pd.Series(2.5, index=idx)
+    d2 = pd.Series(2.0, index=idx)
+    def fake_raw(db, sid, s, e):
+        return d10 if sid == "DGS10" else d2 if sid == "DGS2" else None
+    monkeypatch.setattr(ed, "load_fred_raw", fake_raw)
+    spread = ed.load_term_spread("unused.db", "2019-01-01", "2019-01-20")
+    assert spread.iloc[5] == pytest.approx(0.5)   # 2.5 - 2.0
+    assert pd.isna(spread.iloc[0])                 # shifted: no day before the first
+
+
+def test_term_spread_missing_when_either_leg_missing(monkeypatch):
+    monkeypatch.setattr(ed, "load_fred_raw", lambda db, sid, s, e: None if sid == "DGS2" else
+                        pd.Series([1.0], index=pd.bdate_range("2019-01-02", periods=1)))
+    assert ed.load_term_spread("unused.db", "2019-01-01", "2019-01-20") is None
+
+
+def test_survey_excludes_fed_funds_and_cpi_by_design():
+    """The four loader functions actually used by the survey menu never
+    fetch these two series ids -- the disclosure STRING in decompose()'s
+    output is a separate, legitimate mention and is not what this checks."""
+    import inspect
+    loaders_src = "".join(inspect.getsource(f) for f in
+                          (ed.load_vix, ed.load_vix_change, ed.load_term_spread, ed.load_hy_spread))
+    assert "FEDFUNDS" not in loaders_src and "CPIAUCSL" not in loaders_src
+
+
+def test_survey_k_of_n_counts_only_evaluated_indicators():
+    buckets = {
+        "a": {"in_episode": {"high": {"mean_net_r": 0.001}, "low": {"mean_net_r": -0.001}}},
+        "b": {"in_episode": {"high": {"mean_net_r": -0.001}, "low": {"mean_net_r": -0.001}}},
+        "c": "[MISSING] insufficient data",
+    }
+    survey = {}
+    for col, b in buckets.items():
+        survey[col] = None if isinstance(b, str) else ed.indicator_passes(b["in_episode"])
+    evaluated = {k: v for k, v in survey.items() if v is not None}
+    assert sum(evaluated.values()) == 1 and len(evaluated) == 2   # 'c' excluded from N, not counted as fail
