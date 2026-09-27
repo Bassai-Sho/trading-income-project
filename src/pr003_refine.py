@@ -77,6 +77,16 @@ def run_variant(df: pd.DataFrame, divs: dict, lookback: int, vm: float,
     return r, cost
 
 
+def _tuple_keys_to_str(o):
+    """JSON has no tuple keys (a grid variant like (14, 1.0, 30)); stringify
+    them recursively so a run's full result is always saveable."""
+    if isinstance(o, dict):
+        return {(str(k) if isinstance(k, tuple) else k): _tuple_keys_to_str(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_tuple_keys_to_str(v) for v in o]
+    return o
+
+
 def run(market_db: str, out_dir: Path = Path("DATA/pr003")) -> dict:
     df = pr.load_spy(market_db)
     assert df.index.max().date() <= pr.WINDOW[1], "sealed window must not be read"
@@ -103,7 +113,7 @@ def run(market_db: str, out_dir: Path = Path("DATA/pr003")) -> dict:
         out["commit"] = None
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"refine_{out['run_at'].replace(':', '')}.json"
-    path.write_text(json.dumps(out, indent=2, default=str))
+    path.write_text(json.dumps(_tuple_keys_to_str(out), indent=2, default=str))
     out["path"] = str(path)
     return out
 

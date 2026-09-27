@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import json
 from dataclasses import dataclass, field
 
 import pr003_refine as rf
@@ -104,6 +105,41 @@ def test_adoption_rule_requires_beating_the_published_variant(monkeypatch, tmp_p
     monkeypatch.setattr(rf.pr, "load_dividends", lambda: {})
     out = rf.run("unused.db", out_dir=tmp_path)
     assert not out["adopt_refinement"] and out["final_variant"] == (14, 1.0, 30)
+
+
+def test_run_is_json_serialisable_with_tuple_keyed_fields(monkeypatch, tmp_path):
+    """Reproduces the real 48-variant crash: GridReport.plateau_neighbours is
+    keyed by variant tuples like (14, 1.0, 30), which json.dumps rejects as
+    dict keys. The small fixture's default report never had this field
+    populated, so the first version of this test suite missed it."""
+    small = Grid({"lookback": (7, 14, 28), "vm": (1.0,), "trade_every_min": (30,)})
+    monkeypatch.setattr(rf, "GRID", small)
+    monkeypatch.setattr(rf, "PUBLISHED", (14, 1.0, 30))
+
+    @dataclass
+    class FakeRep:
+        best: tuple = (14, 1.0, 30)
+        best_mean_daily_r: float = 0.0002
+        gates: dict = field(default_factory=lambda: {"dsr": True, "pbo": True,
+                                                      "walk_forward": True, "plateau": True,
+                                                      "cost_stress": True})
+        plateau_neighbours: dict = field(default_factory=lambda: {(7, 1.0, 30): 0.0001,
+                                                                   (28, 1.0, 30): 0.0001})
+
+    monkeypatch.setattr(rf, "evaluate_grid", lambda *a, **k: FakeRep())
+
+    def fake_run_variant(df, divs, lb, vm, iv):
+        idx = pd.bdate_range("2019-01-02", periods=30)
+        return pd.Series(0.0002, index=idx), pd.Series(0.0001, index=idx)
+
+    monkeypatch.setattr(rf, "run_variant", fake_run_variant)
+    monkeypatch.setattr(rf.pr, "load_spy", lambda db: pd.DataFrame(
+        {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [1.0]},
+        index=pd.DatetimeIndex([rf.pr.WINDOW[0]])))
+    monkeypatch.setattr(rf.pr, "load_dividends", lambda: {})
+    out = rf.run("unused.db", out_dir=tmp_path)                 # must not raise
+    saved = json.loads(Path(out["path"]).read_text())
+    assert saved["report"]["plateau_neighbours"] == {"(7, 1.0, 30)": 0.0001, "(28, 1.0, 30)": 0.0001}
 
 
 def test_never_reads_sealed_data():
