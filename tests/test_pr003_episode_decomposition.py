@@ -412,21 +412,69 @@ def test_year_dummy_fork_detects_within_year_pattern():
 
 def test_year_dummy_fork_result_reflects_the_majority_of_informative_years():
     """fork_result itself must actually depend on the per-year outcomes, not
-    just report a fixed string -- construct a case where Q holds in 0 of 3
-    informative years and confirm the aggregate says so, not 'Q survives'."""
-    idx = pd.bdate_range("2018-01-02", "2020-12-31")
+    just report a fixed string -- construct a case where Q holds in 0 of 4
+    informative years (enough years for the sign test to actually reach
+    significance) and confirm the aggregate says so, not 'Q survives'."""
+    idx = pd.bdate_range("2017-01-02", "2020-12-31")
     rng = np.random.default_rng(11)
     obs_col = pd.Series(rng.normal(0, 1, len(idx)), index=idx)
     net_s = pd.Series(0.0, index=idx)                          # NO planted pattern anywhere
     # force every year's low bucket to OUTPERFORM high (the anti-Q direction)
-    for y in (2018, 2019, 2020):
+    for y in (2017, 2018, 2019, 2020):
         ymask = idx.year == y
         net_s[ymask & (obs_col < 0)] = 0.02
         net_s[ymask & (obs_col > 0)] = -0.02
+    in_ep = idx.year.isin([2017, 2018, 2019, 2020])
+    out = ed.year_dummy_fork(net_s, obs_col, np.asarray(in_ep), years=(2017, 2018, 2019, 2020))
+    assert out["years_supporting_q"] == []
+    assert out["fork_result"] == "calendar/drift explains the pattern better than Q"
+
+
+def test_year_dummy_fork_result_is_inconclusive_with_too_few_informative_years():
+    """The real-data regression this bug was found in: 2 of 3 informative
+    years supporting Q has a sign-test p of exactly 0.5 -- no power either
+    way -- and must be reported as inconclusive, not as a clean verdict for
+    or against Q. (The pre-fix code miscounted an uninformative year as
+    opposing and called this case a clean rejection of Q.)"""
+    idx = pd.bdate_range("2018-01-02", "2020-12-31")
+    rng = np.random.default_rng(13)
+    obs_col = pd.Series(rng.normal(0, 1, len(idx)), index=idx)
+    net_s = pd.Series(0.0, index=idx)
+    y2018 = idx.year == 2018; y2019 = idx.year == 2019; y2020 = idx.year == 2020
+    net_s[y2018 & (obs_col < 0)] = -0.02; net_s[y2018 & (obs_col > 0)] = 0.02   # 2018 supports Q
+    net_s[y2019 & (obs_col < 0)] = 0.02; net_s[y2019 & (obs_col > 0)] = -0.02   # 2019 opposes Q
+    net_s[y2020 & (obs_col < 0)] = -0.02; net_s[y2020 & (obs_col > 0)] = 0.02   # 2020 supports Q
     in_ep = idx.year.isin([2018, 2019, 2020])
     out = ed.year_dummy_fork(net_s, obs_col, np.asarray(in_ep), years=(2018, 2019, 2020))
-    assert out["years_supporting_q"] == []
-    assert out["fork_result"] == "calendar/drift explains the pattern at least as well as Q"
+    assert out["years_supporting_q"] == [2018, 2020] and len(out["informative_years"]) == 3
+    assert out["sign_test_p_at_least_k_of_n"] == pytest.approx(0.5)
+    assert out["fork_result"] == "inconclusive -- too few informative years to have real power either way"
+
+
+def test_year_dummy_fork_excludes_a_year_with_an_empty_tercile_bucket():
+    """Reproduces the exact real-data bug (28 Sep 2026): 2017 had n=251
+    episode days -- plenty -- but ALL of them fell in the full-sample
+    low/mid tercile, so the 'high' bucket was empty. That year must be
+    excluded from informative_years entirely, not scored as 'Q holds: False'
+    just because high_r came back None."""
+    idx = pd.bdate_range("2017-01-02", "2017-12-29")
+    net_s = pd.Series(np.random.default_rng(20).normal(0, 0.001, len(idx)), index=idx)
+    # obs_col's FULL-SAMPLE terciles are fit elsewhere; here every 2017 value
+    # sits below the (externally fixed) tercile boundary implied by a much
+    # wider full-sample range -- simulate by using values that are all "low"
+    # relative to tercile_labels fit on a wider synthetic full sample passed
+    # in separately.
+    wide_idx = pd.bdate_range("2016-01-04", "2020-12-31")
+    wide_obs = pd.Series(np.random.default_rng(21).uniform(0, 100, len(wide_idx)), index=wide_idx)
+    wide_obs.loc[idx] = -1000.0                                # 2017: far below the rest, by DATE
+    wide_net = pd.Series(0.0, index=wide_idx)
+    wide_net.loc[idx] = net_s.to_numpy()
+    in_ep = np.ones(len(wide_idx), dtype=bool)
+    out = ed.year_dummy_fork(wide_net, wide_obs, in_ep, years=(2017,))
+    assert out["per_year"][2017]["n_days"] == len(idx)          # plenty of days...
+    assert out["per_year"][2017]["high_mean_net_r"] is None     # ...but the high bucket is empty
+    assert out["per_year"][2017]["q_direction_holds"] is None   # must be None, not False
+    assert 2017 not in out["informative_years"]                 # and excluded from the count
 
 
 def test_year_dummy_fork_flags_years_with_too_few_days():

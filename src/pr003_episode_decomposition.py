@@ -307,13 +307,41 @@ def year_dummy_fork(net_s: pd.Series, obs_col: pd.Series, in_ep: np.ndarray,
             if (year_mask & (labels.reindex(net_s.index) == "high").to_numpy()).sum() else None
         out[y] = {"n_days": n_year, "within_year_obs_std": float(within_year_vals.std()),
                  "low_mean_net_r": low_r, "high_mean_net_r": high_r,
-                 "q_direction_holds": (low_r is not None and high_r is not None and low_r < high_r)}
+                 # None (not False) when either bucket is empty -- a year with
+                 # no high-tercile days measures NOTHING, and must be excluded
+                 # from "informative", not scored as opposing evidence. The
+                 # original version here always returned a bool, so 2017's
+                 # empty high bucket silently scored as "Q holds: False" and
+                 # padded the against-Q count (found by external review, 28
+                 # Sep 2026 -- see the Notion log for this item).
+                 "q_direction_holds": None if (low_r is None or high_r is None) else (low_r < high_r)}
     informative = [y for y, v in out.items() if v.get("q_direction_holds") is not None]
     supporting = [y for y in informative if out[y]["q_direction_holds"]]
+    n, k = len(informative), len(supporting)
+    # With this few genuinely informative years, a plain majority vote has
+    # essentially no power to distinguish "Q survives" from a coin flip --
+    # e.g. n=3, k=2 gives a sign-test P(>=k|p=0.5) of exactly 0.50 (found by
+    # external review, 28 Sep 2026, after the FIRST version of this function
+    # miscounted an uninformative year as opposing and called that a clean
+    # rejection). Report the sign-test probability explicitly and classify
+    # honestly into three outcomes, not two.
+    # Symmetric two-sided sign test: p_high asks "is k unusually HIGH"
+    # (evidence FOR Q); p_low asks "is k unusually LOW" (evidence AGAINST Q,
+    # i.e. that (n-k) opposing years is itself an unlikely coin-flip outcome).
+    p_high = binomial_at_least_k(n, k, 0.5) if n > 0 else None
+    p_low = binomial_at_least_k(n, n - k, 0.5) if n > 0 else None
+    sign_test_p = p_high
+    if n < 2:
+        fork_result = "insufficient informative years to test"
+    elif k > n / 2 and p_high <= 0.10:
+        fork_result = "Q survives year control"
+    elif k < n / 2 and p_low <= 0.10:
+        fork_result = "calendar/drift explains the pattern better than Q"
+    else:
+        fork_result = "inconclusive -- too few informative years to have real power either way"
     return {"per_year": out, "informative_years": informative,
-           "years_supporting_q": supporting,
-           "fork_result": "Q survives year control" if len(supporting) >= max(2, len(informative) // 2 + 1)
-                          else "calendar/drift explains the pattern at least as well as Q"}
+           "years_supporting_q": supporting, "sign_test_p_at_least_k_of_n": sign_test_p,
+           "fork_result": fork_result}
 
 
 def post_episode_bucket_check(net_s: pd.Series, obs_col: pd.Series, start: str, end: str) -> dict:
@@ -492,6 +520,9 @@ def show(r: dict) -> None:
                  f"within-year VIX std {v['within_year_obs_std']:.2f}  "
                  f"Q holds: {v['q_direction_holds']}")
         print(f"  informative years: {yf['informative_years']}, supporting Q: {yf['years_supporting_q']}")
+        stp = yf["sign_test_p_at_least_k_of_n"]
+        print(f"  sign-test P(>= observed | coin flip): {stp:.2f}" if stp is not None else
+             "  sign-test: not computable")
         print(f"  FORK RESULT: {yf['fork_result']}")
 
     pe = r.get("post_episode_2023_2024")
