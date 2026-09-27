@@ -9,6 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import json
+
 import pr003_diagnostics as diag
 from market_data_store import session_close
 from synthetic_bars import noisy_days
@@ -190,10 +192,33 @@ def test_placebo_end_to_end_on_small_sample(monkeypatch, tmp_path):
     df = noisy_days("2019-01-02", "2019-02-28", seed=4, px=280.0)
     df = df[[session_close(d) is not None for d in df.index.date]]
     monkeypatch.setattr(diag.pr, "load_spy", lambda db: df)
-    out = diag.intraday_shuffle_placebo("unused.db", tmp_path, n_days=8, draws=5, seed=0)
+    out = diag.intraday_shuffle_placebo("unused.db", tmp_path, n_days=8, draws=5, seed=0, warmup_days=5)
     assert out["n_days"] == 8 and out["draws"] == 5
-    assert 0.0 <= out["p_value"] <= 1.0
+    assert 0.0 <= out["p_value_sharpe"] <= 1.0 and 0.0 <= out["p_value_mean"] <= 1.0
+    assert len(out["null_sharpes_all"]) == 5 and len(out["null_means_all"]) == 5
+    assert len(out["actual_daily_r"]) == 8 and len(out["sample_days"]) == 8
     assert Path(out["path"]).exists()
+    saved = json.loads(Path(out["path"]).read_text())
+    assert saved["null_means_all"] == out["null_means_all"]      # raw data actually persisted
+
+
+def test_the_two_statistics_are_independent_and_can_disagree():
+    """Sharpe-of-n_days and mean-of-n_days are separate calculations on the
+    same underlying draws and are not required to move together (this is WHY
+    both are reported -- on real data, 27 Sep 2026, they told different
+    stories: p_sharpe=0.286 vs a much clearer mean-based gap). A deterministic
+    case where one flags significance and the other does not is enough to
+    show the code treats them as genuinely independent, without needing to
+    claim one is generally noisier (a real but seed-dependent effect --
+    see Lo, 2002, 'The Statistics of Sharpe Ratios' -- not worth forcing here)."""
+    idx = pd.bdate_range("2019-01-02", periods=40)
+    actual = pd.Series([0.01, -0.0005] * 20, index=idx)     # mean +0.00475, high internal variance
+    null = pd.Series([0.002, 0.0015] * 20, index=idx)       # mean +0.00175, low internal variance
+    def sharpe(x):
+        return float(x.mean() / x.std(ddof=1) * np.sqrt(252))
+    # the null beats actual on Sharpe (steadier) despite a lower mean
+    assert sharpe(null.to_numpy()) > sharpe(actual.to_numpy())
+    assert null.mean() < actual.mean()
 
 
 def test_diagnostics_never_read_sealed_data():

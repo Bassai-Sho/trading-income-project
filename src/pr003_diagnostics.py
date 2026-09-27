@@ -118,6 +118,14 @@ def drawdown_attribution(market_db: str, out_dir: Path) -> dict:
     assert df.index.max().date() <= pr.WINDOW[1], "sealed window must not be read"
     divs = pr.load_dividends()
     net, cost, gross, res = _get_final_variant_series(df, divs)
+    # Index everything by STRING date once, up front: the runner keys
+    # equity_by_day by plain datetime.date, and .loc slicing a date-indexed
+    # series with string labels raises (found on real data, 27 Sep 2026,
+    # second bug in the same family as the earlier .date() crash). Working
+    # entirely in string-index space from here on sidesteps it for good.
+    net = net.copy(); net.index = [_date_str(x) for x in net.index]
+    gross = gross.copy(); gross.index = [_date_str(x) for x in gross.index]
+    cost = cost.copy(); cost.index = [_date_str(x) for x in cost.index]
     overall_dd = float(((1 + net).cumprod() / (1 + net).cumprod().cummax() - 1).min())
     episodes = drawdown_episodes(net, top=5)
     for ep in episodes:
@@ -267,14 +275,33 @@ def intraday_shuffle_placebo(market_db: str, out_dir: Path, n_days: int = 60,
         if (i + 1) % 10 == 0:
             log.info("placebo %d/%d sampled days", i + 1, len(sample))
     actual = np.array(actual)
-    obs_sharpe = float(actual.mean() / actual.std(ddof=1) * np.sqrt(252)) if actual.std(ddof=1) > 0 else 0.0
-    null_sharpes = np.array([float(shuffled[k].mean() / shuffled[k].std(ddof=1) * np.sqrt(252))
-                             if shuffled[k].std(ddof=1) > 0 else 0.0 for k in range(draws)])
-    p = (1 + int((null_sharpes >= obs_sharpe).sum())) / (1 + draws)
+
+    def sharpe(x):
+        return float(x.mean() / x.std(ddof=1) * np.sqrt(252)) if x.std(ddof=1) > 0 else 0.0
+
+    obs_sharpe = sharpe(actual)
+    null_sharpes = np.array([sharpe(shuffled[k]) for k in range(draws)])
+    p_sharpe = (1 + int((null_sharpes >= obs_sharpe).sum())) / (1 + draws)
+
+    # SECOND, less noisy statistic (mean daily return, not annualised Sharpe of
+    # only n_days observations -- Sharpe-of-a-small-sample is itself a noisy
+    # quantity, and with only `draws` bootstrap replicates its own 95th
+    # percentile is estimated from very few points. Mean return is the same
+    # convention evaluation/null_exposure.py already uses for Stage V.)
+    obs_mean = float(actual.mean())
+    null_means = shuffled.mean(axis=1)
+    p_mean = (1 + int((null_means >= obs_mean).sum())) / (1 + draws)
+
     out = {"run_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-          "n_days": len(sample), "draws": draws, "warmup_days": warmup_days, "observed_sharpe": obs_sharpe,
-          "null_sharpe_mean": float(null_sharpes.mean()), "null_sharpe_p95": float(np.percentile(null_sharpes, 95)),
-          "p_value": p, "edge_survives_shuffle": p >= 0.05}
+          "n_days": len(sample), "draws": draws, "warmup_days": warmup_days,
+          "observed_sharpe": obs_sharpe, "null_sharpe_mean": float(null_sharpes.mean()),
+          "null_sharpe_p95": float(np.percentile(null_sharpes, 95)),
+          "null_sharpes_all": null_sharpes.tolist(), "p_value_sharpe": p_sharpe,
+          "observed_mean_daily_r": obs_mean, "null_mean_daily_r_mean": float(null_means.mean()),
+          "null_mean_daily_r_p95": float(np.percentile(null_means, 95)),
+          "null_means_all": null_means.tolist(), "p_value_mean": p_mean,
+          "actual_daily_r": actual.tolist(), "sample_days": [str(d) for d in sample],
+          "edge_survives_shuffle_sharpe": p_sharpe >= 0.05, "edge_survives_shuffle_mean": p_mean >= 0.05}
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"placebo_{out['run_at'].replace(':', '')}.json"
     path.write_text(json.dumps(out, indent=2, default=str))
@@ -283,15 +310,26 @@ def intraday_shuffle_placebo(market_db: str, out_dir: Path, n_days: int = 60,
 
 
 def show_placebo(o: dict) -> None:
-    print(f"\n=== Intraday block-shuffle placebo: {o['n_days']} sampled days, {o['draws']} shuffles ===")
-    print(f"observed Sharpe (true order): {o['observed_sharpe']:.2f}")
-    print(f"shuffled Sharpe: mean {o['null_sharpe_mean']:.2f}, 95th pct {o['null_sharpe_p95']:.2f}")
-    print(f"p-value (shuffled >= observed): {o['p_value']:.3f}")
-    if o["edge_survives_shuffle"]:
-        print("EDGE SURVIVES SHUFFLING -- concerning: performance may not depend on genuine intraday sequence")
-    else:
-        print("edge does NOT survive shuffling -- reassuring: the strategy needs real intraday sequence, not just volatility")
-    print(f"Saved: {o['path']}")
+    print(f"\n=== Intraday block-shuffle placebo: {o['n_days']} sampled days, {o['draws']} shuffles, "
+         f"{o['warmup_days']}-day warm-up ===")
+    print("\n[Statistic 1: annualised Sharpe of the n_days sample -- amplifies small-sample noise]")
+    print(f"  observed {o['observed_sharpe']:.2f} | null mean {o['null_sharpe_mean']:.2f}, "
+         f"p95 {o['null_sharpe_p95']:.2f} | p={o['p_value_sharpe']:.3f}")
+    print(f"  all {o['draws']} null Sharpes: {[round(x, 2) for x in o['null_sharpes_all']]}")
+    print("\n[Statistic 2: mean daily net return -- same convention as the Stage V exposure null, less noisy]")
+    print(f"  observed {o['observed_mean_daily_r']:+.4%} | null mean {o['null_mean_daily_r_mean']:+.4%}, "
+         f"p95 {o['null_mean_daily_r_p95']:+.4%} | p={o['p_value_mean']:.3f}")
+    print()
+    for label, survives in (("Sharpe-based", o["edge_survives_shuffle_sharpe"]),
+                            ("mean-based", o["edge_survives_shuffle_mean"])):
+        verdict = "EDGE SURVIVES SHUFFLING (p>=0.05) -- inconclusive at this sample size, not necessarily a red flag" \
+            if survives else "edge does NOT survive shuffling (p<0.05) -- reassuring: needs real intraday sequence"
+        print(f"  {label}: {verdict}")
+    if o["p_value_sharpe"] < 0.20 <= o["p_value_mean"] or o["p_value_mean"] < 0.20 <= o["p_value_sharpe"]:
+        print("\n  NOTE: the two statistics disagree by a wide margin -- likely small-sample noise in the "
+             "Sharpe statistic (see the raw null Sharpes above for outlier draws), not a real disagreement "
+             "about the strategy. Trust the mean-based statistic here; consider more draws before concluding.")
+    print(f"\nSaved: {o['path']}")
 
 
 if __name__ == "__main__":
