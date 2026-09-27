@@ -58,14 +58,17 @@ PUBLISHED: tuple = (14, 1.0, 30)
 PRIOR_TRIALS = 18
 
 
-def run_variant(df: pd.DataFrame, divs: dict, lookback: int, vm: float,
-                interval: int) -> tuple[pd.Series, pd.Series]:
-    """Daily net return and daily cost-as-fraction-of-prior-equity for one variant."""
-    p = Params(lookback=lookback, vm=vm, trade_every_min=interval,
-              sizing="vol_target", dividends=divs)
+def run_variant_full(df: pd.DataFrame, divs: dict, lookback: int, vm: float, interval: int,
+                     fee_fn=None, sizing: str = "vol_target"):
+    """Runs box #3 once; returns (net_return, cost_frac, gross_frac, res) per
+    day, all as fractions of the PRIOR day's equity. gross = net + cost, so
+    callers needing only net/cost (grid evaluation) or only gross/cost (the
+    exposure null) can use whichever pair they need without re-running."""
+    p = Params(lookback=lookback, vm=vm, trade_every_min=interval, sizing=sizing, dividends=divs)
+    fee_fn = fee_fn or pr.fee_fn("viability")
     res = run_box(NoiseAreaMomentumBox(), p, df, "SPY", AccountConfig(cash=pr.AUM0, leverage=None),
-                  fee_fn=pr.fee_fn("viability"), keep_reports=True)
-    r = pr.daily_returns(res.equity_by_day)
+                  fee_fn=fee_fn, keep_reports=True)
+    net = pr.daily_returns(res.equity_by_day)
     eq_prev = pd.Series(res.equity_by_day).sort_index().shift(1).fillna(pr.AUM0)
     fees = {}
     for rep in res.reports:
@@ -73,8 +76,16 @@ def run_variant(df: pd.DataFrame, divs: dict, lookback: int, vm: float,
             d = pd.Timestamp(rep.timestamp).date()
             fees[d] = fees.get(d, 0.0) + rep.fee
     cost = pd.Series({d: fees.get(pd.Timestamp(d).date(), 0.0) / eq_prev.get(d, pr.AUM0)
-                      for d in r.index})
-    return r, cost
+                      for d in net.index})
+    gross = net + cost
+    return net, cost, gross, res
+
+
+def run_variant(df: pd.DataFrame, divs: dict, lookback: int, vm: float,
+                interval: int) -> tuple[pd.Series, pd.Series]:
+    """Daily net return and daily cost-as-fraction-of-prior-equity for one variant."""
+    net, cost, _, _ = run_variant_full(df, divs, lookback, vm, interval)
+    return net, cost
 
 
 def _tuple_keys_to_str(o):
