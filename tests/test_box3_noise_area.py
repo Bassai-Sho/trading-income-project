@@ -112,3 +112,42 @@ def test_replication_scoring_against_the_paper_table():
     assert e["monthly_corr"] == pytest.approx(1.0) and all(e["gates"].values())
     noise = pm * -1                                    # inverted -> must fail
     assert not pr.evaluate(noise, pm)["gates"]["corr"]
+
+
+# ── Regression: the half-day bug found on real data (27 Sep 2026) ────────────
+
+def _half_day_last_minute_breakout():
+    hist = noisy_days("2019-10-28", "2019-11-27", seed=12, px=300.0)
+    hist = hist[[session_close(d) is not None for d in hist.index.date]]
+    last = float(hist["Close"].iloc[-1])
+    idx = pd.date_range("2019-11-29 09:30", periods=210, freq="1min", tz=NY)   # 13:00 close
+    px = np.full(210, last)
+    half = pd.DataFrame({"Open": px, "High": px + 0.01, "Low": px - 0.01, "Close": px,
+                         "Volume": 1000.0}, index=idx)
+    half.iloc[-1] = [last, last * 1.25, last - 0.01, last * 1.25, 1000.0]     # big jump in the 12:59 bar
+    return pd.concat([hist, half])
+
+
+def test_no_decision_at_a_half_day_close_and_flat_every_night():
+    """Before the fix, the 13:00 'check' on a half-day sent a market order that
+    could never fill while its market-on-close exit did — leaving a position
+    that was carried forever (real SPY from 2018-07-03)."""
+    res = _run(_half_day_last_minute_breakout())
+    assert all(q == 0 for q in res.position_by_day.values())
+    late = [r for r in res.reports if pd.Timestamp(r.timestamp).date() == pd.Timestamp("2019-11-29").date()
+            and r.tag == "trade"]
+    assert late == []
+
+
+def test_every_day_ends_flat_on_noisy_data(data):
+    res = _run(data)
+    assert all(q == 0 for q in res.position_by_day.values())
+
+
+def test_fail_closed_if_not_flat_at_the_open():
+    from core.interfaces import PositionView
+    box = NoiseAreaMomentumBox()
+    view = CoreView(datetime(2019, 3, 12), 1e5, 1e5, 1e5,
+                    positions={"SPY": PositionView("SPY", 100.0, 99.0, 0.0)})
+    with pytest.raises(RuntimeError, match="not flat"):
+        box.on_bar(_bar("2019-03-12 09:30", 100, 100, 100, 100.0), State(day=None), Params(), view)

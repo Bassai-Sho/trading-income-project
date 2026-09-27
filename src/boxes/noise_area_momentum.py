@@ -37,6 +37,7 @@ from typing import Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.interfaces import Bar, CoreView, ExecutionReport, OrderAction   # noqa: E402
+from market_data_store import session_close                              # noqa: E402
 
 OPEN = time(9, 30)
 ONE = timedelta(minutes=1)
@@ -139,6 +140,11 @@ class NoiseAreaMomentumBox:
         if s.open_px is None:
             if t < OPEN:
                 return s, []
+            held = view.positions.get(bar.symbol)
+            if held is not None and held.qty != 0:
+                # fail closed: this box is flat overnight by construction
+                raise RuntimeError(f"noise_area_momentum: not flat at the {d} open "
+                                   f"({held.qty:+.0f} {bar.symbol}); state has drifted")
             prev = s.prev_close
             div = p.dividends.get(str(d), 0.0)
             prev_adj = prev - div if prev is not None else None
@@ -161,7 +167,10 @@ class NoiseAreaMomentumBox:
         s = replace(s, today_moves=s.today_moves + ((idx, abs(bar.close / s.open_px - 1)),))
         sigma = self._sigma(s, p, idx)
         check_time = (bar.timestamp + ONE).time()
-        if sigma is None or s.shares <= 0 or s.cum_v <= 0 or check_time >= time(16, 0):
+        close_t = session_close(d) or time(16, 0)
+        # no decision AT or after the close: an order there could never fill
+        # (half-days close at 13:00 — the bug found on real data, 27 Sep 2026)
+        if sigma is None or s.shares <= 0 or s.cum_v <= 0 or check_time >= close_t:
             return s, []
         upper = s.ref_price * (1 + p.vm * sigma)
         lower = s.lo_base * (1 - p.vm * sigma)
