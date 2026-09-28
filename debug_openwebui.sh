@@ -11,7 +11,11 @@ MODEL_PATH="$HOME/models/qwen3.8-27b-int4"
 MODEL_ID="qwen3.8:27b"
 PORT_MODEL=8000
 PORT_WEBUI=8080
-EMAIL="adamsharpe1707@gmail.com"
+EMAIL="${WEBUI_EMAIL:-}"
+[ -n "$EMAIL" ] || read -r -p "Open WebUI login email: " EMAIL \
+    || { echo "Set WEBUI_EMAIL (no terminal to prompt on)." >&2; exit 1; }
+# per-run random debug key unless WEBUI_SECRET_KEY is already set (no literal secret in the repo)
+DEBUG_SECRET_KEY="${WEBUI_SECRET_KEY:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 
 TS=$(date +%Y%m%d_%H%M%S)
 LOGDIR="/tmp/debug_$TS"
@@ -92,7 +96,7 @@ ENABLE_TAGS_GENERATION=false \
 ENABLE_FOLLOW_UP_GENERATION=false \
 ENABLE_ORJSON=false \
 ENABLE_WEBSOCKET_SUPPORT=false \
-WEBUI_SECRET_KEY=trading-income-debug-key \
+WEBUI_SECRET_KEY="$DEBUG_SECRET_KEY" \
 AIOHTTP_CLIENT_TIMEOUT=600 \
 AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT=600 \
 OPENAI_API_BASE_URLS="http://127.0.0.1:$PORT_MODEL/v1" \

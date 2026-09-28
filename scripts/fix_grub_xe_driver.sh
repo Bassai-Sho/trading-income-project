@@ -5,7 +5,7 @@
 # xe driver supports native preemption and does not have this watchdog limit.
 #
 # Reference: OpenVINO Issue #36260, #36404
-# System: adam-NUC14RVH-B, Intel Core Ultra Meteor Lake, Arc 140V iGPU
+# System: NUC14RVH-B, Intel Core Ultra Meteor Lake, Arc 140V iGPU
 # ============================================================================
 set -e
 

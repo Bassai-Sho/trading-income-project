@@ -45,3 +45,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# local personal terms enforced by src/pii_scan.py (never commit)
+.pii_denylist

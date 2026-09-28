@@ -7,7 +7,7 @@ to Chainlit. `curl http://localhost:8000/health` still returns OK but the model 
 stuck in a CPU spin loop.
 
 ## Environment
-- **Node:** adam-NUC14RVH-B, Intel Meteor Lake, Arc 140V iGPU
+- **Node:** NUC14RVH-B, Intel Meteor Lake, Arc 140V iGPU
 - **OS:** Ubuntu 24.04, Python 3.12
 - **OpenVINO:** 2026.5.0.0 dev nightly
 - **Model:** Qwen3.8-27B-int4, VLMPipeline
