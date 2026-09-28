@@ -71,6 +71,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+import seal
+
 log = logging.getLogger("market_data_store")
 
 # Which Alpaca feed to download. Free (Basic) accounts may query the SIP feed
@@ -271,12 +273,46 @@ class MarketDataStore:
     Thread-safe for read. Write should be single-process.
     """
 
-    def __init__(self, db_path: str = "DATA/market_data.db") -> None:
+    def __init__(self, db_path: str = "DATA/market_data.db", sealed: bool = True) -> None:
+        """sealed=True (DEFAULT, fail-closed): a RESEARCH store. Refuses to read or
+        write any range ending on/after seal.SEAL_START (2025-01-01) unless the
+        seal is deliberately unlocked. sealed=False: a LIVE store for forward /
+        paper-trading data, not subject to the seal -- but only for a store that
+        was created as live (or is empty); a store already marked 'research'
+        cannot be reopened unsealed (that would defeat the seal)."""
         self.db_path = db_path
+        self.sealed = sealed
         dirname = os.path.dirname(self.db_path)
         if dirname:
             os.makedirs(dirname, exist_ok=True)
         self._init_schema()
+        self._claim_role()
+
+    def _claim_role(self) -> None:
+        role = self._get_setting("role")
+        if self.sealed:
+            if role is None:
+                self._set_setting("role", "research")
+            return
+        if seal.is_unlocked():
+            return
+        if role == "research":
+            raise seal.SealedDataError(
+                f"{self.db_path} is a sealed RESEARCH store and cannot be opened unsealed. "
+                f"Use a separate live store for forward data.")
+        if role is None:
+            with self._conn() as c:
+                has_data = c.execute("SELECT 1 FROM market_bars LIMIT 1").fetchone()
+            if has_data:
+                raise seal.SealedDataError(
+                    f"{self.db_path} holds data but was never marked live; refusing to open "
+                    f"it unsealed. Migrate post-seal rows with src/seal_migrate.py.")
+            self._set_setting("role", "live")
+
+    def _guard(self, end, what: str) -> None:
+        """Sealed (research) stores may not touch dates on/after the seal."""
+        if self.sealed:
+            seal.check(end, f"MarketDataStore.{what}")
 
     def _conn(self) -> sqlite3.Connection:
         c = sqlite3.connect(self.db_path, timeout=10)
@@ -533,6 +569,7 @@ class MarketDataStore:
 
         vix_daily: {date_str: vix_close} — fetched separately from yfinance.
         """
+        self._guard(end, "download_and_store")
         feed = (feed or DEFAULT_FEED).lower()
         adjustment = (adjustment or DEFAULT_ADJUSTMENT).lower()
         stored = self.stored_adjustment(ticker)
@@ -835,6 +872,7 @@ class MarketDataStore:
         self, ticker: str, session_date: str, bar_interval: str = "1m"
     ) -> pd.DataFrame:
         """Retrieve all bars for one trading session."""
+        self._guard(session_date, "get_session_bars")
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT ts,open,high,low,close,volume,vwap FROM market_bars "
@@ -852,6 +890,7 @@ class MarketDataStore:
         return df
 
     def get_session_context(self, ticker: str, session_date: str) -> dict | None:
+        self._guard(session_date, "get_session_context")
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM session_context WHERE ticker=? AND session_date=?",
@@ -864,6 +903,7 @@ class MarketDataStore:
         quality_ok_only: bool = False,
     ) -> list[str]:
         """List session dates in range. quality_ok_only=True excludes bad sessions."""
+        self._guard(end, "get_date_range")
         if quality_ok_only:
             with self._conn() as conn:
                 rows = conn.execute(
@@ -884,6 +924,7 @@ class MarketDataStore:
         self, ticker: str, start: date, end: date, bar_interval: str = "1m"
     ) -> pd.DataFrame:
         """Retrieve all bars in a date range (for multi-day analysis)."""
+        self._guard(end, "get_bars_range")
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT ts,open,high,low,close,volume,vwap FROM market_bars "
@@ -1009,6 +1050,7 @@ class MarketDataStore:
 
     def update(self, ticker: str) -> dict:
         """Add new bars since the last stored date."""
+        self._guard(date.today(), "update")
         with self._conn() as conn:
             latest = conn.execute(
                 "SELECT MAX(ts_date) FROM market_bars WHERE ticker=?", (ticker,)
@@ -1066,6 +1108,9 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Historical market data store")
     p.add_argument("--download",       action="store_true")
     p.add_argument("--update",         action="store_true")
+    p.add_argument("--live",           action="store_true",
+                   help="open --db as a LIVE store (forward/paper data, not subject to the "
+                        "2025+ research seal). Refused for a store marked 'research'.")
     p.add_argument("--status",         action="store_true")
     p.add_argument("--validate",       action="store_true")
     p.add_argument("--regime-analysis",action="store_true")
@@ -1088,7 +1133,7 @@ if __name__ == "__main__":
                    help="Re-run quality checks on stored bars for --tickers (no network)")
     args = p.parse_args()
 
-    store = MarketDataStore(args.db)
+    store = MarketDataStore(args.db, sealed=not args.live)
 
     if args.check:
         d = date.fromisoformat(args.check_date)

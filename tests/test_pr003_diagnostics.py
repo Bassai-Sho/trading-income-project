@@ -202,24 +202,6 @@ def test_placebo_end_to_end_on_small_sample(monkeypatch, tmp_path):
     assert saved["null_means_all"] == out["null_means_all"]      # raw data actually persisted
 
 
-def test_the_two_statistics_are_independent_and_can_disagree():
-    """Sharpe-of-n_days and mean-of-n_days are separate calculations on the
-    same underlying draws and are not required to move together (this is WHY
-    both are reported -- on real data, 27 Sep 2026, they told different
-    stories: p_sharpe=0.286 vs a much clearer mean-based gap). A deterministic
-    case where one flags significance and the other does not is enough to
-    show the code treats them as genuinely independent, without needing to
-    claim one is generally noisier (a real but seed-dependent effect --
-    see Lo, 2002, 'The Statistics of Sharpe Ratios' -- not worth forcing here)."""
-    idx = pd.bdate_range("2019-01-02", periods=40)
-    actual = pd.Series([0.01, -0.0005] * 20, index=idx)     # mean +0.00475, high internal variance
-    null = pd.Series([0.002, 0.0015] * 20, index=idx)       # mean +0.00175, low internal variance
-    def sharpe(x):
-        return float(x.mean() / x.std(ddof=1) * np.sqrt(252))
-    # the null beats actual on Sharpe (steadier) despite a lower mean
-    assert sharpe(null.to_numpy()) > sharpe(actual.to_numpy())
-    assert null.mean() < actual.mean()
-
 
 def test_diagnostics_never_read_sealed_data():
     assert diag.pr.WINDOW[1].year == 2024 and diag.pr.WINDOW[1].month == 12

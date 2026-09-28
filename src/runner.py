@@ -329,15 +329,20 @@ def launch_fred_update(db: str = "DATA/market_data.db") -> None:
         log.warning('FRED update failed: %s', e)
 
 
-def launch_store_update(ticker: str = "SPY", store_db: str = "DATA/market_data.db") -> None:
-    """Update the SQLite market data store with yesterday's bars (called daily at 16:30 EST)."""
+def launch_store_update(ticker: str = "SPY", store_db: str = "DATA/live_market_data.db") -> None:
+    """Update the LIVE market data store with yesterday's bars (called daily at 16:30 EST).
+
+    Writes to the LIVE store, NOT the research store: DATA/market_data.db is sealed
+    from 2025-01-01 (src/seal.py). Until 28 Sep 2026 this appended post-2024 SPY bars
+    into the research table; the store now refuses that, and forward data accumulates
+    here instead, unsealed, for paper trading."""
     try:
         log.info('▶ market_data_store: updating %s...', ticker)
         result = subprocess.run(
             [sys.executable, '-c',
              f"import sys; sys.path.insert(0,'{HERE}'); "
              f"from market_data_store import MarketDataStore; "
-             f"s = MarketDataStore('{store_db}'); r = s.update('{ticker}'); "
+             f"s = MarketDataStore('{store_db}', sealed=False); r = s.update('{ticker}'); "
              f"print('Store update:', r)"],
             capture_output=True, text=True, timeout=120
         )

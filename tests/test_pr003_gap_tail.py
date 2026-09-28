@@ -25,16 +25,6 @@ def test_worst_intraday_excursion_picks_the_larger_side():
     assert out.iloc[2] == pytest.approx(0.08)      # up move (100->108) far bigger than down
 
 
-def test_leverage_scaling_is_applied_not_skipped():
-    """The whole point of this check: excursion x leverage, not raw
-    excursion. A day with 2x the leverage of another but identical raw
-    excursion must show 2x the scaled figure."""
-    idx = pd.bdate_range("2019-01-02", periods=2)
-    excursion = pd.Series([0.01, 0.01], index=idx)          # identical raw excursion
-    lev = pd.Series([1.0, 2.0], index=idx)                  # different leverage
-    scaled = (excursion * lev).dropna()
-    assert scaled.iloc[1] == pytest.approx(2 * scaled.iloc[0])
-
 
 def test_gap_tail_report_actually_applies_leverage_not_just_the_concept(monkeypatch, tmp_path):
     """The prior test only proved the ARITHMETIC concept in isolation, not
