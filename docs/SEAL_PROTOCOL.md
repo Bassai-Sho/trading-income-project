@@ -53,6 +53,17 @@ set an environment variable, edit `seal.py`, or open the SQLite file directly. I
 script or a session from casually reading the window; it does not stop a determined person.
 The window also cannot un-know what anyone already knows about 2025-26 market history.
 
+## Forward data: what the live store's update does (fixed 28 Sep 2026)
+
+* It fetches only **complete sessions** (exchange close, early closes honoured, plus 16 minutes),
+  so a half-finished day is never stored and then skipped. Run at any time, it stops at the last
+  complete session.
+* A SIP request never **ends** inside the last 16 minutes. Before this, every update asked for
+  bars through the end of today, which Alpaca rejects (HTTP 403 "subscription does not permit
+  querying recent SIP data") on a plan without real-time SIP. The runner discarded that error,
+  so nothing said so.
+* The runner now logs a failing update's exit code and error, and allows 10 minutes (was 2).
+
 ## Commands
 
 ```bash

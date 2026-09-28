@@ -67,6 +67,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -183,6 +184,44 @@ def session_close(d: date):
 def expected_bars(close_t) -> int:
     """1-min bars from 09:30 up to (not including) the close."""
     return (close_t.hour * 60 + close_t.minute) - (9 * 60 + 30)
+
+
+# ---------------------------------------------------------------------------
+# Forward-data window (28 Sep 2026)
+# ---------------------------------------------------------------------------
+# Alpaca only serves SIP history that is >= ~15 minutes old on a subscription
+# without real-time SIP. update() used to ask for bars through the END OF TODAY,
+# which is always later than "now", so EVERY update was rejected with
+# HTTP 403 "subscription does not permit querying recent SIP data" -- and the
+# runner discarded the error, so nothing ever said so. Two fixes live here:
+#   * a SIP request never ends inside the last SIP_DELAY (16 min = 15 + margin);
+#   * update() only ever asks for COMPLETE sessions (close + SIP_DELAY has
+#     passed), so a half-finished day can never be stored and then skipped.
+
+SIP_DELAY = timedelta(minutes=16)
+_ET = ZoneInfo("America/New_York")
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now (module-level so tests can pin the clock)."""
+    return datetime.now(timezone.utc)
+
+
+def last_complete_session(now: datetime | None = None) -> date:
+    """Most recent session whose bars are complete AND old enough to query:
+    its exchange close (early closes honoured) plus SIP_DELAY has passed."""
+    now = now or _utcnow()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    et = now.astimezone(_ET)
+    d = et.date()
+    for _ in range(14):
+        close_t = session_close(d)
+        if close_t is not None:
+            if et >= datetime.combine(d, close_t, tzinfo=_ET) + SIP_DELAY:
+                return d
+        d -= timedelta(days=1)
+    raise RuntimeError(f"no completed session found within 14 days of {now}")
 
 
 # ---------------------------------------------------------------------------
@@ -403,12 +442,19 @@ class MarketDataStore:
             )
         feed = (feed or DEFAULT_FEED).lower()
         adjustment = (adjustment or DEFAULT_ADJUSTMENT).lower()
+        start_dt = datetime.combine(start, datetime.min.time())
+        end_dt   = datetime.combine(end, datetime.max.time())
+        if feed == "sip":
+            # naive datetimes are sent as UTC. See the SIP_DELAY note above.
+            end_dt = min(end_dt, _utcnow().replace(tzinfo=None) - SIP_DELAY)
+        if end_dt <= start_dt:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
         client = StockHistoricalDataClient(api_key, secret_key)
         req    = StockBarsRequest(
             symbol_or_symbols=ticker,
             timeframe=TimeFrame(1, TimeFrameUnit.Minute),
-            start=datetime.combine(start, datetime.min.time()),
-            end=datetime.combine(end, datetime.max.time()),
+            start=start_dt,
+            end=end_dt,
             adjustment=Adjustment(adjustment),
             feed=DataFeed(feed),
         )
@@ -1048,8 +1094,9 @@ class MarketDataStore:
 
     # ── Update (daily runner call) ─────────────────────────────────────────────
 
-    def update(self, ticker: str) -> dict:
-        """Add new bars since the last stored date."""
+    def update(self, ticker: str, now: datetime | None = None) -> dict:
+        """Add new bars since the last stored date, up to the last COMPLETE session
+        (never a half-finished day; see the forward-data note above)."""
         self._guard(date.today(), "update")
         with self._conn() as conn:
             latest = conn.execute(
@@ -1058,11 +1105,11 @@ class MarketDataStore:
         if latest is None:
             return {"error": "No data for ticker. Run --download first."}
         latest_date = date.fromisoformat(latest)
-        today       = date.today()
-        if latest_date >= today:
+        end_date    = last_complete_session(now)
+        if latest_date >= end_date:
             return {"message": "Already up to date", "latest": str(latest_date)}
-        vix = self._fetch_vix_daily(latest_date, today)
-        result = self.download_and_store(ticker, latest_date + timedelta(days=1), today, vix)
+        vix = self._fetch_vix_daily(latest_date, end_date)
+        result = self.download_and_store(ticker, latest_date + timedelta(days=1), end_date, vix)
         return result
 
 

@@ -329,6 +329,9 @@ def launch_fred_update(db: str = "DATA/market_data.db") -> None:
         log.warning('FRED update failed: %s', e)
 
 
+STORE_UPDATE_TIMEOUT_S = 600     # was 120: a multi-week catch-up download can exceed 2 minutes
+
+
 def launch_store_update(ticker: str = "SPY", store_db: str = "DATA/live_market_data.db") -> None:
     """Update the LIVE market data store with yesterday's bars (called daily at 16:30 EST).
 
@@ -344,10 +347,15 @@ def launch_store_update(ticker: str = "SPY", store_db: str = "DATA/live_market_d
              f"from market_data_store import MarketDataStore; "
              f"s = MarketDataStore('{store_db}', sealed=False); r = s.update('{ticker}'); "
              f"print('Store update:', r)"],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, timeout=STORE_UPDATE_TIMEOUT_S
         )
         if result.stdout:
             log.info('store_update: %s', result.stdout.strip())
+        # The child's exit code and stderr were previously discarded, so a failing update
+        # (e.g. HTTP 403 on recent SIP data) left no trace at all (found 28 Sep 2026).
+        if result.returncode != 0:
+            log.warning('store_update FAILED (exit %s): %s', result.returncode,
+                        (result.stderr or '').strip()[-500:])
     except Exception as e:
         log.warning('Store update failed: %s', e)
 
