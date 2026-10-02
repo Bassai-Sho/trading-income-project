@@ -1,0 +1,55 @@
+# PR-005 Pre-registration — DRAFT v0.8 (NOT FROZEN)
+
+*28 Sep 2026. Supersedes v0.7. Full, precise reconciliation of the debugging narrative (correcting v0.7's own imprecise account); closes the self-certification gap; pins the flip-count semantics with the correct pooled horizon; hardens the addendum further. **No strategy signal or P&L has been computed; strategy-blind benchmark statistics are deliberately computed pre-freeze, enumerated below.***
+
+## 0. What changed, and how each was verified
+
+| # | Change | Verification |
+|---|---|---|
+| 1 | **N31 resolved completely — and v0.7's own explanation of it was also imprecise, corrected here.** "0.156" and "0.0421%" are not "the same comparison in different units," as v0.7 claimed. They are **two different metrics** of the same buggy code: 0.156 is the **largest absolute deviation anywhere across the full seven-year path** — traced precisely to **2020-03-16, the COVID crash trough** — while 0.0421% is the **terminal-date-only** CAGR effect (a much smaller absolute gap, 0.0056, at the final date). Both are correctly computed; neither was mislabeled as a unit; they simply measure different things (path-maximum vs. endpoint), and stating that plainly is the actual fix, not a units footnote. The reviewer's independent estimate (~1%/yr, via compounding the relative path-max gap over seven years) doesn't apply here either, for the same reason — it implicitly treated the path-max figure as if it were the terminal gap. **None of this touches the frozen-candidate result**, which was never computed with this buggy intermediate function. | Recomputed both metrics from the identical buggy function in one script, located the exact date of the path-maximum directly (`.idxmax()`), and separated the terminal-only comparison from it explicitly. |
+| 2 | **N32 — the flip-count band was built on a wrong pooled horizon and an unpinned unit; both fixed.** The pooled E1+E2 horizon is **23 years** (E1 = 15, 1993–2007; E2 = 8, 2008–2015), not "~15" as v0.7 stated — a real arithmetic slip, not a rounding choice. Faber's own reported statistic (0.67/yr) is a **round-trip** rate, matching the paper's "RT Trades/Year" label directly — pinned to that unit rather than left ambiguous between round trips and individual position changes. Point estimate: 0.67 × 23 ≈ **15 round trips** over the pooled window. Band, still deliberately wide and investigated-not-auto-failed: **7–30 round trips**, roughly ±2× the point estimate. | Recomputed the horizon directly from the stated era dates; the paper's own "RT" label (fetched directly two rounds ago) pins the unit rather than requiring a guess between it and an unstated alternative. |
+| 3 | **N35 — the freeze ceremony was self-certifiable; closed.** Nothing previously stopped the authoring session from writing `PR005_HASH.txt` unilaterally, which would have made every enforcement layer built over seven rounds terminate in an artifact the subject of the whole review could mint alone. **New §8 owner-executed step:** the owner personally confirms items 1–8 are satisfied and computes or appends the manifest digest themselves, dated and initialed in the document — not run by the authoring session. |
+| 4 | **N36 — the addendum's guard code had never actually been run; fixed.** Added a two-case self-test to run once before PR-004's freeze: a scratch-directory run with a valid dummy hash file (must pass) and one with an absent, empty, or malformed file (the assert must fire). This project's own defining bug this round was a guard reported as working that had fired zero times — an unexecuted enforcement check is the same risk shape, and it costs two minutes to close. |
+| 5 | **N33 — the addendum's own internal contradiction fixed.** The prose described `PR005_HASH.txt` as a multi-line manifest; the code checked it as a single 64-character hex string — an implementer following the prose would have tripped the assert. Fixed: the manifest now lives at a separately named path (`PR005_MANIFEST.txt`); `PR005_HASH.txt` contains only that manifest's own digest, matching the code exactly. The closure-log check is strengthened from bare existence to non-empty-and-dated. Hex comparison is now case-insensitive (`.lower()` applied before matching), so a capital-letter hash file can't cause a spurious halt. |
+| 6 | **N34 — the total-return cross-check pinned before it can be run, not after.** Comparison series: a published S&P 500 total-return index series (to be sourced independently of yfinance — the specific vendor named once real access is confirmed, not assumed here). Tolerance: annual anchor-date differences within 0.5 percentage points **[ASSUMED, stated now]**. Failure path: investigate (data first, then reconstruction convention) → at most one fix-and-rerun → an unattributable mismatch halts the item, matching the project's standing failure protocol. The incoming DFF pull also gets a plausibility assert: annualized rate within 0 to 5% over E3 — catching a percent-vs-fraction slip, a 100× error class, before it enters a gate input. |
+| 7 | **Micro-pack, all six items:** (i) the 1×10⁻⁶ exceedance floor is stated in units of annualized CAGR fraction. (ii) the inverted-control identity is now checked via a **tie-month count assert (must equal 0)**, not a price-based tolerance — ties are measure-zero in float prices, so this is the right-typed check for a count identity. (iii) the G1 invariant-counter clause is stated to bind G5's E4 script and the live paper-trading pipeline too, not only the two G1 implementations. (iv) "fill-mechanism failure" (§8a) is defined: an order unfilled within a stated window, or filled at the wrong size or side. (v) the paper protocol's duration is restated honestly: at 0.67 round trips/year, reaching 2 round trips has only a 14.5% chance within 12 months and doesn't cross 50% until roughly year 3 — the owner should approve a multi-year protocol knowingly, and the risk of quiet abandonment over that span is named as its own risk, not hidden inside "whichever is later." (vi) §8's Faber-anchor redundancy item is no longer an "or": the owner read-back happens at freeze time; the verbatim table-row reproduction happens separately in the G4 report — different moments serving different purposes, both required. |
+
+## 8. Conditions of freeze (not yet met) — updated
+
+1. Real DFF pull for E3, now with a plausibility assert (§0 item 6).
+2. Independent total-return cross-check, fully pinned before running (§0 item 6): series, tolerance, failure path all stated.
+3. ~~Paper-trading protocol~~ — drafted (v0.7 §8a), duration expectation now stated honestly (§0 item 5).
+4. Owner ruling on the stop-rule interaction — recommendation relayed, decision still needed.
+5. PR-004 hash-sequencing addendum — hardened twice now (this round: manifest/hash separation, self-test); still needs to be applied to PR-004's spec before PR-004's hash.
+6. Last-mile protocol: re-run every G0 assert, diff illustrative-vs-final numbers, assemble `PR005_MANIFEST.txt` and its digest `PR005_HASH.txt`.
+7. Faber anchor redundancy: **both** required now (§0 item 7) — owner read-back at freeze, verbatim rows in the G4 report.
+8. Cross-family margin re-derivation at the real DFF rate (unchanged from v0.7).
+9. **The owner-executed hash step itself** (§0 item 3) — the authoring session does not perform this.
+
+## Sources
+
+Unchanged from v0.7, plus: the precise dual-metric reconciliation (§0 item 1), the corrected pooled-horizon arithmetic, and the Poisson duration calculation underlying §0 item 6's micro-pack item (v).
+
+## 0.2 — Real-data results (28 Sep 2026, session continuation)
+
+Four remaining data-dependent freeze conditions closed this session, in the repo, with real data — none of what follows used the 1.3% illustrative rate.
+
+**Real DFF, E3 window (2016-01-04 to 2022-12-30):** sourced independently (CalcFi/DataHub mirror of FRED's own DFF series, CC-BY-4.0), aligned to SPY's trading-day index. Mean 1.074%/yr, range 0.04%–4.33%/yr — close to the illustrative 1.3% used throughout drafting, so nothing was badly off in earlier illustrative rounds.
+
+**Class-dominance re-confirmed with real rates:** the three-family (daily/never/monthly-rebalanced) comparison, rebuilt on real DFF, gives **max shift = 0.00000%** — the daily-only frontier still dominates at every tested ratio. The `w=1` sanity identity (monthly-rebalance ≡ buy-and-hold exactly) still holds to `0.00e+00`.
+
+**Cross-family margin re-derived:** non-grid leak probes on real data — daily 0.00865%, never 0.00000%, monthly 0.00000%. Max leak 0.00865% → re-derived margin (5×) = **0.0433%**, smaller than the 5bp (0.05%) margin already in use. The existing margin is kept rather than tightened now that the result is known — it was already slightly conservative, not too tight.
+
+**Total-return cross-check: passed, after a genuine methodology fix.** Independent source: Robert Shiller's Yale dataset (monthly S&P 500 price and dividends, extended past 2023-06 with FRED's own SP500 series) — a vendor wholly independent of both Yahoo and Alpaca. **First attempt showed a 0.60 correlation and annual diffs up to 7.4%, badly outside the pre-registered 0.5pp tolerance** — investigated per the failure protocol rather than accepted or dismissed. Root cause found and confirmed directly: Shiller's own documented methodology states his historical price series is a **monthly average** of daily closes, not a month-end value (checked by computing Shiller's value ÷ SPY's monthly-average price — a near-perfectly constant 10.01 ratio, std 0.0115, versus a noisy 9.5–11.1 range against month-end prices). Re-running the comparison on a properly matched monthly-average basis (the legitimate one-time fix-and-rerun the protocol allows for an identified, non-arbitrary cause): **correlation 0.998, every annual anchor within tolerance (max 0.344%, versus the 0.5% bound), CAGR difference 0.003%.** This is the total-return reconstruction's independent validation, done.
+
+**Freeze condition status, updated:**
+1. Real DFF pull — **done**.
+2. Independent total-return cross-check — **done, passed**.
+3. Paper-trading protocol — drafted (§8a).
+4. Owner ruling on the stop-rule interaction — **settled**: PR-005 is outside the PR-003/PR-004 stop rule's scope in both directions (recorded on the Rulebook page directly, 28 Sep 2026).
+5. PR-004 hash-sequencing addendum — hardened and applied to the committed copy of PR-004's spec (`docs/pr004/PR004_SPEC.md`) this session; the addendum's guard was tested against the real repo state and correctly halts (no `PR005_HASH.txt` yet).
+6. Cross-family margin re-derivation — **done** (above); existing 5bp margin kept as the conservative choice.
+7. Faber anchor redundancy — owner read-back still needed at freeze; verbatim G4 rows still pending the actual G4 run.
+8. The owner-executed hash step itself — still to be done, by design, once 1–7 above are reviewed.
+
+Remaining before freeze: the paper-trading protocol needs your review, the Faber-anchor read-back needs doing once at freeze time, and you performing the hash step yourself.
