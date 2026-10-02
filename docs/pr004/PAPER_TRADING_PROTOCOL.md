@@ -1,31 +1,46 @@
-# PR-004 Paper Trading Protocol — DRAFT v0.2 (NOT ACTIVE)
+# PR-004 Paper Trading Protocol — v0.3, CONSOLIDATED (NOT ACTIVE)
 
-*29 Sep 2026. Supersedes v0.1. Small fixes; the design itself was already sound.*
+*2 Oct 2026. This is the full standalone text, consolidated from v0.1 and v0.2 (29 Sep). The previously committed v0.2 carried §1–4 "unchanged from v0.1" by reference; both are preserved in `docs/pr004/history/`. It is aligned with PR-004 spec v0.7 §8, which now resolves the stop-rule question v0.2 left open, and it adds the pipeline-only window (state S2). Nothing here overrides the spec. Where they differ, the spec governs.*
 
-## 0. What changed from v0.1
+## 0. Activation
 
-| # | Change |
-|---|---|
-| 1 | **§5's self-contradicting sentence fixed.** "Once it exists and is populated (it already is…)" read oddly in an operational document — restated plainly as: the live store already exists and is populated, 2025-01-02 through 2026-09-25 (matching PR-003's protocol's description of the same store exactly, after that one was corrected too). |
-| 2 | **Slippage kill criterion pinned to the model, not a flat number.** "3× the assumed cost" was ambiguous between a flat 6bp bar and the spec's own regime-conditional model (2bps normal days, 3× after a >2σ prior-day move). Now explicit: the trigger is 3× whatever the model-implied cost was for that specific fill, not a single flat threshold — a normal-day fill at 4bps should not silently sit below a flat 6bp bar that was never the intended comparison. |
-| 3 | **Feed-gap kill criterion added**, matching PR-003's set — PR-004's v0.1 kill list didn't have one, and there's no reason it should be more permissive than PR-003's on basic data integrity. |
-| 4 | **The 10-round-trip floor's purpose stated explicitly.** It's the sample size the slippage check needs to be meaningful — the signal-vs-frozen-script divergence check (item 2 above notwithstanding) accrues daily regardless of trade count and doesn't wait on it. |
-| 5 | **§6's framing softened.** "Exists the moment PR-004 clears its gates" oversold readiness — §5 (unchanged in substance) still leaves sizing and vehicle undecided for this strategy specifically, so clearing PR-004's own gates makes this protocol relevant, not immediately runnable. |
-| 6 | **The activation-bar asymmetry against PR-005 named, not silently carried.** PR-004 proceeds on "not CONTRADICTED" (which includes INCONCLUSIVE); PR-005 was deliberately tightened to require CONFIRMED specifically. I'm not resolving which is right here — PR-004's decision rule is a property of its own frozen spec, not something this protocol document should override — but leaving the difference unstated risked it looking like an accident rather than a choice made (or not yet properly examined) in the spec itself. Worth your attention at PR-004's own sign-off, not here. |
-| 7 | **Noted, not resolved here:** the broader question of whether the stop rule's own Sharpe/corr/drawdown bar applies on top of PR-004's internal decision rule, or whether passing PR-004's own gates *is* what counts toward the stop rule — raised in PR-003's protocol (§9 there), and it affects this protocol's own §0 item 2 (which currently just says "PR-004 clearing G0–G2 and not being CONTRADICTED" without addressing the stop rule's separate numeric bar). Needs resolving once, for both strategies together, not twice. |
+This protocol activates only in states **S1** (full window) or **S2** (pipeline-only window) of the spec's consequence table (§8.2). Both states execute at joint-verdict determination (§8.6). In states S3 and S4, and whenever the project's joint stop has fired, no window starts. If the spec's b̂12 ≥ 0 fallback applies, the owner's documented review comes first. Clearing PR-004's gates makes this protocol *relevant*, not immediately *runnable*: sizing and vehicle are still undecided (§5).
 
-## 1–4. [Unchanged from v0.1]
+## 1. Purpose
 
-Purpose, duration, kill criteria (with item 3's addition above), data source.
+At ~3.8 round trips a year (49 trades over 1995–2007, 30 over 2008–2015), paper performance cannot support a judgment in any reasonable window. Computed directly: reaching 20 trades has under a 2% chance within 3 years; reaching 10 has under 1% within one year and roughly 70% within three. **The purpose is operational validation only:** fill mechanics, signal-computation correctness against the frozen spec, and realized slippage against the cost model. Performance is non-evidential and must not be read as confirming or contradicting H1.
 
-## 5. Sizing and vehicle
+## 2. Duration
 
-Unchanged: no risk-policy memo exists yet for this strategy, and building one on a strategy that hasn't passed its own gates would be premature.
+- **S1 (full window):** 12 months minimum, or 10 completed round trips, whichever is later. The 10-round-trip floor exists to give the slippage check a meaningful sample. At ~3.8 a year it implies roughly 2.5–3 years, a multi-year commitment with real risk of quiet abandonment, stated here so it's approved knowingly.
+- **S2 (pipeline-only):** a fixed 12-month hard stop. No round-trip leg, and no early termination for "success" (spec §8.5).
+- **Both:** a running window halts if the project's joint stop fires (spec §8.6 d).
 
-## 6. Relationship to the stop rule
+## 3. Kill criteria (operational only)
 
-Unchanged in substance from v0.1 — no scope ambiguity like PR-003's (PR-004 is unambiguously named in the box) — but see item 7 above: the *numeric bar itself*, not PR-004's presence in the box, is the open question, and it's shared with PR-003.
+- Realized slippage exceeds **3× the model-implied cost for that specific fill** (2 bps per side on normal days; 3× that after a prior-day move above 2σ) on 2 or more fills. This is not a flat threshold.
+- Any day on which the paper-traded signal diverges from what the frozen rule's own script computes for that day. This check accrues daily and does not wait on trade count.
+- A fill-mechanism failure: an order unfilled within a stated window, or filled at the wrong size or side.
+- A data-feed gap or an unexpected fetch failure, matching PR-003's set.
+
+**Prohibited:** any performance-based continuation, kill or admission decision during the window. **Firewall (spec §8.5):** paper P&L is recorded as data and never narrated in any decision log, summary, tracker note or report. A quiet year with few or no trades is the expected outcome and must not be read as good or bad.
+
+## 4. Data source
+
+The live store, `DATA/live_market_data.db`, which already exists and is populated continuously from 2025-01-02 (through at least 2026-09-25 at last check). Never the sealed research store.
+
+## 5. Sizing, vehicle and cost model
+
+No risk-policy memo exists for PR-004. Sizing and vehicle are undecided and must be decided before a window starts, not switched mid-window. The paper engine logs costs under the spec's Mode F, the mode pinned for the stop bar, so slippage checks compare like with like.
+
+## 6. Shared components (state S2's reason to exist)
+
+The S2 window exists to validate machinery that PR-005 will reuse: daily SPY bar ingestion from the live store, the XNYS calendar, close-of-day signals, next-open order generation and fill recording, ex-dividend handling, and per-fill cost logging. These must be the same imported modules PR-005 will use, not copies (spec §8.5). The one-way guard applies: PR-005's admission may not cite this window.
+
+## 7. Relationship to the stop rule
+
+Resolved by spec v0.7 §8.4–8.6. PR-004's per-strategy stop bar is computed at G4 with pinned windows and Mode F. Its result selects S1 or S2. The joint stop overrides both.
 
 ## Sources
 
-Unchanged from v0.1, plus PR-003 protocol v0.2 (the store-description and kill-criteria harmonization, and §9's cross-cutting stop-rule question, both authored there and referenced here rather than duplicated).
+PR-004 spec v0.7 (`docs/pr004/PR004_SPEC.md`); this protocol's v0.1 and v0.2 (in `docs/pr004/history/`); PR-005 spec §8a, the original source of the operational-only discipline.

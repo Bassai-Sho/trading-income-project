@@ -1,6 +1,8 @@
-# PR-004 Pre-registration — v0.6, CONSOLIDATED STANDALONE TEXT (NOT FROZEN)
+# PR-004 Pre-registration — v0.7 (NOT FROZEN)
 
-*Consolidated 2 Oct 2026 from the full draft chain v0.1 → v0.2 → v0.3 → v0.3.1 → v0.4 → v0.5 → v0.5.1 → v0.6 (all 28 Sep 2026). Earlier committed text (commit 3ba087c) was the v0.6 change-document only: it carried §1–§5 and §9 forward "by reference" to drafts that were never in the repository. This file states every section in full so that the hash, when taken, covers the actual rules. **No rule, threshold, gate or decision rule has been changed in consolidating.** Where the chain contained a stale or contradictory sentence, the later version's explicit supersession is applied and the point is logged in `docs/pr004/CONSOLIDATION_NOTES.md` for the owner to confirm before freeze. The full recovered drafts are preserved verbatim in `docs/pr004/history/`. **Nothing has been run.***
+*v0.7, 2 Oct 2026: §8 rewritten for the economic-hurdle decision (consequence table, per-strategy stop bar, pipeline-only branch, ordering, interpretation locks, computation whitelist, provenance log); stop-bar step added to §7; one weak point added. Everything else is unchanged from v0.6-consolidated.*
+
+*v0.6 consolidated 2 Oct 2026 from the full draft chain v0.1 → v0.2 → v0.3 → v0.3.1 → v0.4 → v0.5 → v0.5.1 → v0.6 (all 28 Sep 2026). Earlier committed text (commit 3ba087c) was the v0.6 change-document only: it carried §1–§5 and §9 forward "by reference" to drafts that were never in the repository. This file states every section in full so that the hash, when taken, covers the actual rules. **No rule, threshold, gate or decision rule has been changed in consolidating.** Where the chain contained a stale or contradictory sentence, the later version's explicit supersession is applied and the point is logged in `docs/pr004/CONSOLIDATION_NOTES.md` for the owner to confirm before freeze. The full recovered drafts are preserved verbatim in `docs/pr004/history/`. **Nothing has been run.***
 
 ## 0. Process
 
@@ -138,18 +140,102 @@ INCONCLUSIVE  otherwise
 - **G2 Mechanism (H1), primary endpoint,** as pinned in §6.2–6.3, on E3. Also reported on E1 and E2 for decay context, and as a bucket table (RSI < 5, 5–10, 10–30, 30–70, > 70) with an episode-level bootstrap CI.
 - **G3 Nulls**, evaluated only if E3 has ≥ 30 entries (otherwise "not evaluable — power"): sign-flip (a coding check only); vol-matched random entry; down-move-matched random entry, drawn from above-SMA200 days.
 - **G4 Economic report** (not gated), on **E1+E2+E3** (E4 reported separately, never merged): net CAGR, vol, Sharpe, Jensen alpha with CI, max drawdown, time in market, both cost modes; the **blend test at 25% / 50% / 100% sleeve allocation** into a 100% SPY book; long-book loss on SPY's 20 worst days and short-book loss on its 20 worst up-days (V3 only); the mean close→next-open "gap wedge" on entry days; top-3-episode share of P&L (labelled "episode-dependent" above 60%); year table with trade counts; volatility-tercile and long/short breakdowns; every day on which the ±15% winsorization bound actually clipped a value; the full trade list as an audit appendix.
+- **Stop-bar evaluation (§8.4),** computed at G4 time from the G1b-validated implementation, with numbers recorded.
 - **G7 (E4, once):** a single named, hashed script; report only, in the frozen template.
 
 **Verdict categories:** CONFIRMED / CONTRADICTED / INCONCLUSIVE (power), as defined in §6.3, with the MDE stated alongside whichever applies.
 
-## 8. Conditions of freeze, and the decision rule
+## 8. Conditions of freeze, the decision rule, and consequences
 
-1. **Owner sign-off** on this wording — **awaiting answer:** *"The mechanism gate blocks proceeding to paper trading if E3's effect is significantly weaker than the published era's. This includes a completely dead effect, but only if it's measured precisely enough — the printed MDE tells you in advance whether that will hold. It also includes a real, still-statistically-significant effect that has merely halved or more — and whether that halved-but-real case is blocked also depends on how precisely it is measured, not only on its size; the MDE is computed from 1995–2015 data as a preview of E3's expected precision, so treat it as a good-faith estimate, not a guarantee. If you would rather proceed on a decayed-but-real effect regardless of this gate, that is a legitimate choice, and it should be recorded here as a stated exception, not left as a silent gap. Separately: if the published-era comparison itself turns out not to have the expected sign, the gate cannot judge decay at all, and the decision falls to replication (H0) plus your own direct review of the descriptive results — not an automatic proceed."* This sign-off also covers the Sharpe-vs-buy-and-hold hurdle being a report (G4), not a gate — a reinterpretation of Rulebook rule (b) for this item.
-2. **PR-005 hashed before the G2 session runs — enforced as a hard precondition, not a reminder.** Before the G2 session runs, its setup step must verify that `docs/PR005_HASH.txt` exists, is non-empty, and — case-insensitively — is exactly 64 hexadecimal characters, **or** that a logged, non-empty, dated closure record exists at `docs/PR005_CLOSURE.txt`. If neither holds, the session halts and does not run. Implementation and a self-test live in `docs/PR004_hash_precondition_addendum.md`; the check was run against a valid and an invalid case before being relied on. A human checklist line duplicates it as a second enforcement layer: *before running G2, confirm `docs/PR005_HASH.txt` exists and is well-formed, or that `docs/PR005_CLOSURE.txt` exists and is dated.*
-3. **Source archived before G1b is coded — done, both halves.** Local copy at `docs/sources/marwood_rsi2_2016.md` (verbatim load-bearing quotes and the comment-thread correction in §0.1), git-tracked. Wayback snapshot live at `web.archive.org/web/20260928211054/https://stocksoftresearch.com/rsi-2-trading-strategy/`, triggered by the owner and cross-checked line-by-line against the local copy with no discrepancy (28 Sep 2026).
-4. This document's hash recorded at commit time, once 1–3 are satisfied.
+*§8 rewritten 2 Oct 2026 after a D-A-C cycle and three external review rounds on the economic-hurdle question. Every decision below was taken by the owner. The record of how it was reached is §8.9.*
 
-**Decision rule:** proceed to forward paper trading iff H0 holds and the H1 verdict is not CONTRADICTED — **except** in §6.3's b̂12 ≥ 0 fallback (undefined published-era comparison), where H0 alone is not sufficient: that branch additionally requires the owner's documented review of G2's descriptive output before proceeding. G4's economics and E4 do **not** gate this decision — a stated, learning-first choice recorded before freeze. **Paper trading here validates operations and detects gross failure; it cannot statistically confirm the edge** (at ~4 trades a year that takes decades). The paper-trading protocol is `docs/pr004/PAPER_TRADING_PROTOCOL.md`.
+### 8.1 Conditions of freeze
+
+1. **Owner sign-off, executed as the freeze itself.** Performing the hash (condition 4) *is* the owner's sign-off. It ratifies: (a) the mechanism-gate wording below; (b) the economic-hurdle placement in §8.3, including v0.2's previously unsigned demotion of the Sharpe-vs-buy-and-hold gate; and (c) the consequence machinery in §8.2–8.7. The freeze carries the provenance log (§8.9).
+   *Mechanism-gate wording:* "The mechanism gate blocks proceeding to paper trading if E3's effect is significantly weaker than the published era's. This includes a completely dead effect, but only if it's measured precisely enough — the printed MDE tells you in advance whether that will hold. It also includes a real, still-statistically-significant effect that has merely halved or more — and whether that halved-but-real case is blocked also depends on how precisely it is measured, not only on its size; the MDE is computed from 1995–2015 data as a preview of E3's expected precision, so treat it as a good-faith estimate, not a guarantee. If the published-era comparison itself turns out not to have the expected sign, the gate cannot judge decay at all, and the decision falls to replication (H0) plus the owner's own direct review of the descriptive results — not an automatic proceed."
+2. **PR-005 hashed before the G2 session runs — enforced as a hard precondition, not a reminder.** Before the G2 session runs, its setup step must verify that `docs/PR005_HASH.txt` exists, is non-empty, and — case-insensitively — is exactly 64 hexadecimal characters, **or** that a logged, non-empty, dated closure record exists at `docs/PR005_CLOSURE.txt`. If neither holds, the session halts and does not run. Implementation and self-test: `docs/PR004_hash_precondition_addendum.md`. A human checklist line duplicates it as a second enforcement layer.
+3. **Source archived before G1b is coded — done, both halves** (`docs/sources/marwood_rsi2_2016.md`; `web.archive.org/web/20260928211054/https://stocksoftresearch.com/rsi-2-trading-strategy/`, cross-checked line-by-line, 28 Sep 2026).
+4. **The owner-executed hash step.** Once 1–3 are satisfied, the owner personally computes and records this document's hash, dated and initialed. The authoring session does not perform this step.
+
+### 8.2 Decision rule and consequence table
+
+Every outcome maps to exactly one state:
+
+| State | Condition | Consequence |
+|---|---|---|
+| **S1** | G1b PASS; H1 verdict not CONTRADICTED; per-strategy stop bar (§8.4) PASS | Full paper-trading window per `docs/pr004/PAPER_TRADING_PROTOCOL.md` |
+| **S2** | G1b PASS; H1 verdict not CONTRADICTED; stop bar computed and FAIL | **Pipeline-only window** (§8.5): 12 months, operational-only, if the reuse case holds; otherwise no window |
+| **S3** | G1b does not PASS (after the G1b failure protocol is exhausted) | **Definitional stop-bar FAIL.** No window of any kind. The attribution class (implementation / data or source / indeterminate) is recorded. The failure is final for this item: post-freeze code changes are barred, and any re-attempt is a new hashed item carrying this failure history. No stop-bar statistic is ever computed from code that failed replication. |
+| **S4** | G1b PASS; H1 verdict CONTRADICTED | No window. The stop bar is still computed (the code is validated) and recorded. |
+
+In the b̂12 ≥ 0 fallback (§6.3), S1 and S2 additionally require the owner's documented review of G2's descriptive output before any window starts. Every state records both the mechanism verdict and the stop-bar verdict, with numbers (§8.6 e). Which verdict "defines" the study is not chosen after the fact. **Paper trading validates operations and detects gross failure; it cannot statistically confirm the edge** (~3.8 round trips a year).
+
+### 8.3 Economic-hurdle placement (decision of 2 Oct 2026)
+
+"Net Sharpe ≥ buy-and-hold SPY's Sharpe" is **reported in G4, not a gate** on entry to paper trading. Economic judgment is made per strategy by the project stop bar (§8.4), with the consequences in §8.2.
+
+**Class rule.** This placement applies to every low-exposure strategy, defined as expected time in market ≤ 25%. At that exposure, standalone Sharpe parity with the benchmark would require in-market days with at least 2× the benchmark's Sharpe (1/√f ≥ 2). The rule binds future candidates regardless of their published economics.
+
+**Why: the option space was searched, not avoided.**
+- A standalone gate tests *replacement* of SPY, which no one has proposed. On v0.1's own 2008–2022 window, SPY's Sharpe is 0.485, so that gate needs ≈ 1.98 annualized Sharpe on in-market days. The stop bar needs ≈ 2.04. Same hurdle height within 3%; different legs; different lane.
+- Add-to-the-book (marginal or blend) tests are not skill tests. For a rule in the market a fraction f of days, its correlation with SPY is √f, and a zero-skill rule sits exactly on the marginal-improvement bar. On synthetic data: correlation 0.244 vs √0.06 = 0.245; zero-skill Sharpe 0.137 vs bar 0.136.
+- Skill is tested where power can be built, by G2's conditioned regression and G3's matched nulls. No economic gate for this class is both a skill test and non-redundant with them.
+
+**Passive-benchmark reporting (conditional, per the Rulebook rule "net return must clear a passive-benchmark hurdle before being credited as edge").** If G4's blend test does not show an improvement in the net Sharpe of the 100% SPY book, the report states that PR-004 is "not proven as edge against a passive benchmark." In every state, no PR-004 performance is credited as edge before capital is committed. The live-capital decision needs its own pre-registered gate.
+
+### 8.4 The per-strategy stop bar for PR-004 (pins)
+
+Computed at G4, from the implementation validated by G1b, and recorded with numbers:
+- **Returns:** Stage V (next-open fills), **cost Mode F**, fixed 1× notional; daily excess return over DFF (act/360); Sharpe annualized by √252.
+- **In-sample (IS):** 1995-01-01 to 2015-12-31 (E1+E2). **Out-of-sample (OOS):** 2016-01-01 to 2022-12-31 (E3). E4 is not used.
+- **PASS iff all of:** Sharpe_IS ≥ 0.5; Sharpe_OOS ≥ 0.5; Sharpe_OOS ≥ 0.5 × Sharpe_IS ("OOS ≥ half of IS", read as walk-forward efficiency, per the Rulebook rule "WFE = OOS Sharpe / IS Sharpe ≥ 0.50" and `src/evaluation/robustness.py`); correlation of daily returns with SPY daily total returns ≤ 0.3 over 1995–2022; maximum drawdown ≤ 15% over 1995–2022.
+- This mapping uses no data beyond what G1b and G2 already open. Disclosure: the correlation leg is satisfied structurally by any rule in the market ~6% of days (correlation ≈ √f ≈ 0.245). It is logged as a Rulebook issue and does not count as evidence.
+
+### 8.5 Pipeline-only window (state S2) and the reuse case
+
+- **Shared components (spec level; the code does not yet exist):** daily SPY bar ingestion from the live store; XNYS trading calendar; close-of-day signal computation; next-open order generation and fill recording; ex-dividend handling; per-fill model-implied cost logging. **Build requirement:** PR-004 and PR-005 import shared modules for these, not copies.
+- **Beneficiary:** PR-005 (T1 monthly, V2 daily), which also executes at the next open. At ≈ 0.67 round trips a year it generates ≈ 1.3 next-open fill events a year and cannot self-validate that machinery in any reasonable window. PR-004 generates ≈ 7.6.
+- **One-way justification guard:** PR-004's window is justified by PR-005's pre-registered existence. PR-005's admission to paper trading may not cite PR-004's window, and PR-004's window discharges none of PR-005's own validation duties.
+- **Contingency:** the reuse value is realized only if a reusing item is admitted. If, when S2 executes, PR-005 has a recorded closure (a final verdict other than value-CONFIRMED, or `docs/PR005_CLOSURE.txt`), the reuse case is void and S2 becomes **no window**. If the joint stop fires, a running window halts (§8.6 d).
+- **Duration:** a fixed 12-month hard stop. No round-trip leg. No early termination for "success". The only early exits are the operational kill criteria in the paper protocol and the joint-stop halt.
+- **Firewall:** paper P&L is recorded as data and is never narrated in any decision log, summary, tracker note or report. No continuation, kill or admission decision may cite it.
+
+### 8.6 Ordering, and what "research stops" means
+
+The project stop rule (Rulebook, 26 Sep 2026) fires when PR-003 and PR-004 both fail its bar.
+- **Execution point:** per-strategy consequences (S1–S4) execute at joint-verdict determination, meaning once both PR-003's and PR-004's stop-bar verdicts are recorded, computed or definitional. PR-003's own stop-bar evaluation is outside this document but is a dependency of this ordering.
+- **Precedence:** if both FAIL, the joint stop overrides every per-strategy consequence.
+- **"Research stops" means:**
+  - (a) Frozen items run to completion, including each strategy's stop-bar evaluation. Completion means reaching a recorded verdict, computed or definitional.
+  - (b) The joint stop fires only when both verdicts exist and both are FAIL. The 8-week time-box is not a deadline that voids unfinished evaluations.
+  - (c) No new items start, including re-specifications, parameter variants and follow-on studies of stopped strategies.
+  - (d) No paper windows start, and already-started non-evidential windows halt.
+  - (e) Recording means numbers plus verdicts, never verdicts alone.
+  - (f) Restart requires a new written charter, not a resumption.
+- PR-005 sits outside the stop rule (Rulebook amendment, 28 Sep 2026). As a frozen item it is still subject to (a) and (d) if the joint stop fires.
+
+### 8.7 Interpretation locks
+
+- **MDE:** recorded as a limitation. It triggers no design change after freeze, whatever its size.
+- **INCONCLUSIVE** means "unproven, not confirmed". It never means "confirmed by default".
+- **E3 carries three pre-registered readings:** G2 (mechanism), the stop bar's OOS leg, and G4 (economics, era E1+E2+E3). All three are recorded. None is selected after the fact as "the" verdict.
+
+### 8.8 Pre-freeze computation whitelist
+
+- **Permitted before freeze:** benchmark and metadata statistics that do not touch PR-004's signal, plus synthetic-data checks.
+- **Performed (all on 2 Oct 2026):**
+  - SPY buy-and-hold daily excess Sharpe over FRED DFF, computed from yfinance SPY total returns: 1995–2007 0.521; 2008–2015 0.382; 1995–2015 0.458; 2016–2022 0.624; 2008–2022 0.485.
+  - Synthetic RSI(2) seeding check.
+  - Synthetic √f correlation and zero-skill marginal-Sharpe simulation.
+- **Forbidden:** anything that computes PR-004's signal, positions, returns or statistics on real data.
+
+### 8.9 Provenance log (facts only; causation not asserted)
+
+- **27 Sep 2026:** the Rulebook adopts "net return must clear a passive-benchmark hurdle before being credited as edge."
+- **28 Sep, v0.1:** G4 is a gate: net Sharpe ≥ buy-and-hold on 2008–2022, and max drawdown no worse. v0.1's sources include a self-published backtest — a different source and a different rule variant — saying the rule "loses to buy-and-hold on raw return". v0.1's own red-team packet (Q8) asks whether that hurdle is sensible for a low-exposure rule.
+- **28 Sep, v0.2:** the gate is demoted to a report on the reviewer's √exposure argument. The same revision introduces the replicated source's figures (2008–2015: ~1.35%/yr, −13.19% max drawdown). The demotion was flagged as needing the owner's sign-off, which was never given before 2 Oct.
+- **No version was ever hashed.**
+- **2 Oct 2026:** decided after a D-A-C cycle (options A–D, then A vs B) and three external review rounds. The rounds established symmetric outcome-awareness on both options, the zero-skill property of marginal tests, the threshold convergence (1.98 vs 2.04), and a gap closure: as previously written, a per-strategy stop-bar FAIL with PR-003 passing triggered nothing and left the full window open. Every consequence in §8.2 therefore tightens the prior operative default.
 
 ## 9. Multiple testing
 
@@ -164,7 +250,8 @@ Single primary endpoint (G2 on E3); no correction needed within it. Family: P1 (
 5. The 2008 book itself is unread; the rule comes from a secondary source (archived).
 6. Same-author risk on the two G1 implementations, mitigated by the manual audit and by G1b being the real interpretation check.
 7. G1b's sizing and dividend-adjustment conventions are unstated in the source; return and drawdown are therefore descriptive only.
-8. Capacity: paper-trading scale is not a capacity constraint; revisit only if any live deployment beyond paper is ever considered.
+8. The stop bar's correlation leg is satisfied structurally at this exposure (§8.4); it carries no evidential weight.
+9. Capacity: paper-trading scale is not a capacity constraint; revisit only if any live deployment beyond paper is ever considered.
 
 ## 11. Effort
 

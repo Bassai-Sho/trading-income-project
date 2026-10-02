@@ -17,3 +17,7 @@ The committed `PR004_SPEC.md` (commit 3ba087c) was the v0.6 change-document. Its
 5. **No owner-executed hash step in PR-004's spec.** The handover says you must personally perform PR-004's final hash. PR-005 v0.8 wrote that into its own spec (§8 item 8), but PR-004's spec only says "hash recorded at commit time". **Not added; the owner decides whether to mirror PR-005's wording.**
 6. **A placeholder would freeze as a placeholder.** Mode S's "2.0% is a placeholder until the provider's published terms are sourced". Mode S is report-only, so this doesn't affect any gate, but freezing a placeholder is worth a deliberate yes.
 7. **Condition 1 is still "awaiting answer"**, as in v0.6.
+
+## Update, 2 Oct 2026 (spec v0.7)
+
+Item 6 is resolved. The economic-hurdle question was decided by the owner after a D-A-C cycle and three external review rounds; see spec §8.3 and the provenance log in §8.9. The freeze itself now constitutes the owner's sign-off (§8.1). The paper-trading protocol had the same by-reference defect: its v0.2 carried §1–4 "unchanged from v0.1", and v0.1 was never committed. It is now consolidated as v0.3, with v0.1 recovered verbatim into `history/`.

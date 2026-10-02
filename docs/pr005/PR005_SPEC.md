@@ -122,7 +122,7 @@ Three declared trials (T1, V2, V3); no deflated Sharpe — a single primary endp
 
 ## 11. Relationship to PR-004
 
-Pre-registered and to be hashed **before PR-004's G2 mechanism session runs**, enforced mechanically by PR-004's own spec (§8, condition 2) and its addendum (`docs/PR004_hash_precondition_addendum.md`), including a release valve (`docs/PR005_CLOSURE.txt`) so an abandoned PR-005 cannot deadlock PR-004. This item's design does not depend on PR-004's outcome.
+Pre-registered and to be hashed **before PR-004's G2 mechanism session runs**, enforced mechanically by PR-004's own spec (§8.1, condition 2) and its addendum (`docs/PR004_hash_precondition_addendum.md`), including a release valve (`docs/PR005_CLOSURE.txt`) so an abandoned PR-005 cannot deadlock PR-004. This item's design does not depend on PR-004's outcome. PR-004 §8.5 adds a one-way guard: PR-005's admission to paper trading may not cite PR-004's pipeline-only window, and that window discharges none of PR-005's own validation duties.
 
 ## 12. Effort
 
