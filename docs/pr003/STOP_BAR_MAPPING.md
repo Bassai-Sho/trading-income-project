@@ -1,6 +1,6 @@
-# PR-003 — Per-strategy stop-bar mapping (v0.1, NOT FROZEN)
+# PR-003 — Per-strategy stop-bar mapping (v0.2, NOT FROZEN)
 
-*3 Oct 2026. Decisions D1–D3 and the pre-write package were taken by the owner after a D-A-C pass and two external cold-fork rounds; this file records them. It is the PR-003 counterpart of `docs/pr004/PR004_SPEC.md` §8.4 and §8.6, and it must be consistent with them. **No computation on the sealed window (2025+) has been performed or viewed.** Nothing here has been hashed. The owner performs the freeze step (§12); the authoring session does not.*
+*3 Oct 2026. Decisions D1–D3 and the pre-write package were taken by the owner after a D-A-C pass and two external cold-fork rounds; this file records them. It is the PR-003 counterpart of `docs/pr004/PR004_SPEC.md` §8.4 and §8.6, and it must be consistent with them. **No computation on the sealed window (2025+) has been performed or viewed.** Nothing here has been hashed. The sealed read follows `docs/SEAL_PROTOCOL.md` steps 1–6, in which only the owner sets the unlock; the authoring session never does. v0.2 (3 Oct) removes procedural items that duplicated the seal protocol and records the consequence and rationale decisions.*
 
 ## 1. The bar and the readings pinned
 
@@ -23,7 +23,7 @@ Stop rule (Rulebook, adopted 26 Sep 2026, text unedited): *Pass = daily Sharpe �
 - **In-sample (IS):** 2016-01-04 to 2024-12-31, the Stage V window. Recorded: Sharpe 0.80, vol 14.4%, CAGR +11.0%, max DD −39.5% at full sizing, MDD/vol 2.75, corr −0.08. Those are the only IS inputs, and they are already in the record.
 - **Out-of-sample (OOS), binding:** the sealed window, 2025-01-02 to the cutoff in §3, read **once**. It is the only data the paper's authors never saw.
 - **2023–24** may be reported only as labelled non-evidentiary history. It cannot be the stop-bar OOS leg: that window was superseded as a hold-out on 27 Sep, has been analysed repeatedly, lies partly inside the paper's own sample, and its returns are on record.
-- **Approval clause.** Approval to open the sealed window is conditional on the mechanical checks in Appendix B only. It must be signed and dated before any stop-bar arithmetic on 2023–24 is produced (§12).
+- **Unlock.** Opening the sealed window follows `docs/SEAL_PROTOCOL.md` steps 1–6 unchanged (risk-policy decisions first; the final analysis script, with the pass criteria below, committed before the unlock; a cold-fork review of the decision to unlock; only the investor sets the unlock phrase). The pass criteria in that script are the stop-bar legs in this file, so there is a single set. No split of the stop-bar numbers on 2023–24 is computed before the read.
 
 ## 3. Cutoff (decision D3)
 
@@ -34,7 +34,7 @@ The OOS window ends at the **last complete session on or before 2026-09-30** (21
 ## 4. Pre-read pins that do not depend on the outcome
 
 - Code frozen at a tagged commit; cost model frozen (§1); the paper engine's connection string points at the live store only, never the research store.
-- The sizing decision (§5) is hashed before the read and cannot be changed afterwards.
+- The sizing decision (§5) is committed before the read, with its hash recorded in the step-2 script commit, and cannot be changed afterwards.
 - Store continuity through the cutoff is verified, metadata only (session counts against the exchange calendar, no P&L).
 
 ## 5. Max-drawdown leg (decision D2): a logged deliberate override
@@ -58,10 +58,10 @@ Even the paper's own ratio gives 17.5% at a 10% target. The pre-run record alrea
 
 **Vehicle feasibility (a fact bearing on whether this leg can pass).** At the paper account size in the owner's private risk memo, one MES contract is ≈ 3× effective leverage against ≈ 4× for full sizing (index level and FX assumed in the memo). That is ≈ 74% of full sizing, i.e. a scaled drawdown of ≈ −29%. The pass region (≤ 37.9% of full sizing) is reachable only with a vehicle that allows finer sizing. The vehicle decision therefore determines this leg's verdict, and it must be made on its own merits and hashed before the read.
 
-**Owner rationale (outcome-independent grounds)** — **[OWNER: confirm or replace, in your own words, before hashing]**. Candidate grounds drawn from pre-run text: (a) the 27 Sep freeze separates research gates from deployment, with sizing decided last from account-level tolerance; (b) the stop rule's own live-trading clause ties 15% to "account drawdown".
+**Owner rationale (adopted 3 Oct 2026):** *The stop rule's own live-trading clause ties 15% to account drawdown, and the 27 Sep freeze set deployment sizing from account tolerance after research. I'm evaluating the drawdown leg at the sizing I'll actually deploy, knowing Stage V's unsized figure fails it.*
 
 **Safeguards.**
-1. The sizing fraction and vehicle are decided and hashed before the seal opens; they are not tunable after the read.
+1. The sizing fraction and vehicle are decided and committed before the seal opens; they are not tunable after the read.
 2. The override and the sizing decision are committed together and are dated.
 3. Prospective symmetric rule: for any future strategy evaluated against this stop bar, the drawdown leg is evaluated at a sizing fixed and hashed before its OOS read.
 4. The counterfactual above (FAIL under pre-run-fixed referents) is carried into the verdict report.
@@ -71,7 +71,7 @@ Even the paper's own ratio gives 17.5% at a 10% target. The pre-run record alrea
 
 One read serves three evaluations: the stop-bar legs, PR-003's own sealed test, and the pre-registered bucket-contrast check. **The stop-bar legs decide.** The other two are recorded non-decisionally for the stop bar. The read runs once, at the frozen commit, on the frozen cost model and data, and its output is hashed.
 
-**Procedural-failure path.** If a hash does not reconcile or a data gap exceeds §3, the **frozen repair procedure** runs once: (1) re-run the same code at the same tagged commit on the same input snapshot and compare the output hash; (2) if inputs differ from the pre-read manifest, restore them from the pre-read backup; (3) no code, parameter or cost edits are allowed. If the result still cannot be reconciled, the read is **INVALID: a definitional stop-bar FAIL, with the cause recorded** (implementation, data, indeterminate). The item can then only be re-attempted as a new hashed item carrying this history.
+**Procedural-failure path.** If a hash does not reconcile or a data gap exceeds §3, the **frozen repair procedure** runs once: (1) re-run the same code at the same commit on the same inputs and compare the output hash; (2) if the inputs' hash differs from the one recorded in the step-2 commit, re-fetch them; (3) no code, parameter or cost edits are allowed. If the result still cannot be reconciled, the read is **INVALID: a definitional stop-bar FAIL, with the cause recorded** (implementation, data, indeterminate). The item can then only be re-attempted as a new hashed item carrying this history.
 
 ## 7. Error rates, acknowledged in writing before the read
 
@@ -79,13 +79,13 @@ A stop rule built on ~21 months of OOS data and a 15-year-old Sharpe bar is nois
 
 - **PR-003's OOS leg (Sharpe ≥ 0.5, 21 months).** A true Sharpe of 0.8 passes ~64% of the time (so it is stopped ~36% of the time); true 1.0 ~71%; true 0.5 ~50%; true 0 ~25%.
 - **PR-004's legs (IS 21 years, OOS 7 years, all three Sharpe legs).** In-market Sharpe 1.0 passes ~3%; 2.0 ~24%; 2.2 ~30%; 3.0 ~58%. PR-004's own legs, not PR-003's drawdown leg, dominate the joint device's false-stop channel.
-- The owner accepts that the device may stop a sound program and continue an unsound one.
+- The owner accepts that the device may stop a sound program and continue an unsound one (accepted 3 Oct 2026 by adopting the package).
 
 ## 8. Ordering and consequences
 
 PR-003's stop-bar verdict is recorded as PASS, FAIL or INVALID (= definitional FAIL) at the read. Per PR-004 spec §8.6, per-strategy consequences execute at joint-verdict determination, the joint stop fires only when both verdicts exist and both are FAIL, and "research stops" has the six clauses (a)–(f) written there.
 
-**OPEN before the read:** the consequence of a PR-003-only stop-bar FAIL (PR-004 not failing). Under the stop rule's text it triggers nothing. PR-004's version of this gap was closed in spec §8.2. PR-003's has not been decided.
+**PR-003-only stop-bar FAIL (owner decision, 3 Oct 2026): PR-003 proceeds under its normal paper-trading protocol, unchanged.** This matches the stop rule's text, under which a single-strategy FAIL triggers nothing. It differs from PR-004, where the owner set a stop-bar FAIL to lead to a 12-month operational-only window or no window (spec §8.2). The verdict and its numbers are still recorded and still count toward the joint determination.
 
 ## 9. Wording issues logged (not amended)
 
@@ -102,19 +102,13 @@ After any stop, research restarts only through a new pre-registration with a new
 - **26–27 Sep:** a structured decision cycle named the 15% a "deployment rule bundled into a research gate", replaced PR-003's fixed 15% research gate with a volatility-relative guardrail (no number frozen), and stated that the time-box and stop-if-both-fail rule "stand unchanged". Deployment: tolerance sets the vol target; live halt at 1.5× expected max DD.
 - **27 Sep:** the first PR-003 code commit is `f1a4fd6` at 07:22 UTC; Stage R's result file is 07:45 UTC; Stage V ran at 12:28 UTC with max DD −39.5%. The amendment prose lives only in the tracker, with no dated Rulebook row. The stop rule's own text was never edited.
 - **28 Sep:** the owner's drawdown tolerance and capital were first received (held privately).
-- **3 Oct 2026:** D1–D3 and the package were decided. The record shows the pre-run-fixed referents fail, and the owner chose the override in §5.
+- **3 Oct 2026:** D1–D3 and the package were decided. The record shows the pre-run-fixed referents fail, and the owner chose the override in §5. The owner also adopted the rationale in §5 and decided that a PR-003-only stop-bar FAIL leaves its normal paper protocol unchanged (§8).
 
-## 12. Owner actions before the read
+## 12. Before the read
 
-1. Complete the override rationale in §5 (owner's words).
-2. Decide sizing fraction and vehicle; commit `docs/pr003/SIZING_DECISION.md` (Appendix A).
-3. Decide the PR-003-only FAIL consequence (§8).
-4. Locate or pin PR-003's own sealed-test pass criteria; they are not restated here and the stop-bar legs do not depend on them.
-5. Review the [ASSUMED] threshold in §3.
-6. Assemble `docs/pr003/PRE_READ_MANIFEST.txt`: SHA-256 of this file, the sizing decision, the frozen cost-model config, the tagged commit id, and the live-store segment's bar hash.
-7. Sign and date the acknowledgement (§7) and the approval clause (§2) **before any 2023–24 stop-bar arithmetic**:
-   - Acknowledged: ______ date: ______
-   - Approval (mechanical checks only): ______ date: ______
+1. Decide sizing fraction and vehicle (they are step 1 of `docs/SEAL_PROTOCOL.md`), and commit `docs/pr003/SIZING_DECISION.md` (Appendix A).
+2. Follow `docs/SEAL_PROTOCOL.md` steps 2–6.
+3. Do not compute any 2023–24 split of the stop-bar numbers.
 
 ## Appendix A — `docs/pr003/SIZING_DECISION.md` template (no personal figures)
 
@@ -122,13 +116,6 @@ After any stop, research restarts only through a new pre-registration with a new
 Sizing fraction of full system sizing: [OWNER]
 Vehicle: [OWNER: MES | spread bet | other]
 Granularity rule: [integer MES contracts | fractional]
-Decided on: [date]   Hash recorded in PRE_READ_MANIFEST.txt: [yes]
+Decided on: [date]
 Capital used for granularity: held in the owner's private memo (not committed)
 ```
-
-## Appendix B — mechanical checks (approval is gated on these only)
-
-1. Store continuity through the cutoff: complete sessions match the exchange calendar (metadata only).
-2. The tagged commit, cost-model config, sizing decision and this file are all hashed in the manifest.
-3. The paper engine's connection string is the live store; the research store is untouched.
-4. No stop-bar arithmetic on 2023–24 exists yet.
