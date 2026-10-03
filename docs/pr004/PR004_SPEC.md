@@ -203,7 +203,7 @@ Computed at G4, from the implementation validated by G1b, and recorded with numb
 ### 8.6 Ordering, and what "research stops" means
 
 The project stop rule (Rulebook, 26 Sep 2026) fires when PR-003 and PR-004 both fail its bar.
-- **Execution point:** per-strategy consequences (S1–S4) execute at joint-verdict determination, meaning once both PR-003's and PR-004's stop-bar verdicts are recorded, computed or definitional. PR-003's own stop-bar evaluation is outside this document but is a dependency of this ordering.
+- **Execution point:** per-strategy consequences (S1–S4) execute at joint-verdict determination, meaning once both PR-003's and PR-004's stop-bar verdicts are recorded, computed or definitional. PR-003's stop-bar mapping is in `docs/pr003/STOP_BAR_MAPPING.md` and is a dependency of this ordering.
 - **Precedence:** if both FAIL, the joint stop overrides every per-strategy consequence.
 - **"Research stops" means:**
   - (a) Frozen items run to completion, including each strategy's stop-bar evaluation. Completion means reaching a recorded verdict, computed or definitional.

@@ -64,6 +64,8 @@ Implemented from day one (unchanged from v0.1), now with the mechanics-only pre-
 
 ## 8. Relationship to the stop rule — reframed, no assistant recommendation
 
+**UPDATE 3 Oct 2026 — the stop-bar mapping is settled in `docs/pr003/STOP_BAR_MAPPING.md`.** The owner decided: sealed 2025+ is the binding OOS (cutoff 2026-09-30); the 15% drawdown leg is evaluated at the deployed sizing as a **logged deliberate override** with safeguards (not a clarification), the pre-run-fixed referents all failing is carried into the verdict report; plus the pre-write package. Options 1–3 below are kept as the record of what was considered. One item remains open there: the consequence of a PR-003-only stop-bar FAIL.
+
 **Timeline, checked rather than asserted:**
 - The stop rule (P2-129/DAC-WORTH-01) is a formally adopted, dated Rulebook entry: 26 Sep 2026.
 - Stage V ran 27 Sep 2026, 12:28 UTC — a full calendar day later.
